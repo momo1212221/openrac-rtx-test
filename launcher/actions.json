@@ -449,12 +449,12 @@
           "--levels-dir",
           "{root}/assets/port/rac1/pal",
           "--output-dir",
-          "{data}/probes/pal",
+          "{data}/probes-rtx/pal",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/pal",
+        "output": "{data}/probes-rtx/pal",
         "cwd": ".",
         "platforms": [
           "linux",
@@ -1191,12 +1191,12 @@
           "--levels-dir",
           "{root}/assets/port/rac1/ntsc",
           "--output-dir",
-          "{data}/probes/ntsc",
+          "{data}/probes-rtx/ntsc",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/ntsc",
+        "output": "{data}/probes-rtx/ntsc",
         "cwd": ".",
         "platforms": [
           "linux",
@@ -1964,12 +1964,12 @@
           "--levels-dir",
           "{root}/assets/port/rac1/pal1",
           "--output-dir",
-          "{data}/probes/pal1",
+          "{data}/probes-rtx/pal1",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/pal1",
+        "output": "{data}/probes-rtx/pal1",
         "cwd": ".",
         "platforms": [
           "linux",
@@ -2483,12 +2483,12 @@
           "--levels-dir",
           "{root}/assets/port/rac1/jp",
           "--output-dir",
-          "{data}/probes/jp",
+          "{data}/probes-rtx/jp",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/jp",
+        "output": "{data}/probes-rtx/jp",
         "cwd": ".",
         "platforms": [
           "linux",
@@ -2970,12 +2970,12 @@
           "--levels-dir",
           "{root}/assets/port/rac2/ntsc",
           "--output-dir",
-          "{data}/probes/ntsc",
+          "{data}/probes-rtx/ntsc",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/ntsc",
+        "output": "{data}/probes-rtx/ntsc",
         "cwd": ".",
         "platforms": [
           "linux",
@@ -3469,12 +3469,12 @@
           "--levels-dir",
           "{root}/assets/port/rac2/pal",
           "--output-dir",
-          "{data}/probes/pal",
+          "{data}/probes-rtx/pal",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/pal",
+        "output": "{data}/probes-rtx/pal",
         "cwd": ".",
         "platforms": [
           "linux",
@@ -3968,12 +3968,12 @@
           "--levels-dir",
           "{root}/assets/port/rac2/ntsc2",
           "--output-dir",
-          "{data}/probes/ntsc2",
+          "{data}/probes-rtx/ntsc2",
           "--jobs",
           "0",
           "--update"
         ],
-        "output": "{data}/probes/ntsc2",
+        "output": "{data}/probes-rtx/ntsc2",
         "cwd": ".",
         "platforms": [
           "linux",

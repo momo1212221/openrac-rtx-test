@@ -52,8 +52,10 @@ pub fn supported(game: &str, version: &str) -> bool {
 }
 
 /// Where a version's probe bakes are kept: `<data>/probes/<version>`.
+/// The RTX test build keeps its bakes apart from other builds' (probes/): a bake is valid only
+/// for the code that made it, so two builds sharing one folder would reject each other's.
 pub fn probes_dir(data: &Path, version: &str) -> PathBuf {
-    data.join("probes").join(version)
+    data.join("probes-rtx").join(version)
 }
 
 fn spec(key: &str, name: &str, kind: &str, default: Value, description: &str) -> SettingSpec {
@@ -457,7 +459,7 @@ mod tests {
         let (env, args) = play_additions("enhanced_rendering = 1\n", data, "pal").unwrap();
         assert_eq!(env, vec![("OPENRAC_GL_API".to_string(), "vulkan".to_string())]);
         // Joined, not spelled out: Windows joins with a backslash.
-        let probes = data.join("probes").join("pal");
+        let probes = data.join("probes-rtx").join("pal");
         assert_eq!(args, vec!["--probes".to_string(), probes.display().to_string()]);
     }
 

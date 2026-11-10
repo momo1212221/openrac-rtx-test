@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! assets/port/<game>/<version>/       <data>/port/<version>/       the game's levels      Levels
-//! <data>/probes/<version>/                                         enhanced lighting      Levels
+//! <data>/probes-rtx/<version>/                                       enhanced lighting      Levels
 //! assets/levels/<game>/<version>/     <data>/levels/<version>/     Godot projects         Editor
 //! <data>/exports/                                                  models and textures    Editor
 //! assets/packed/<game>/<version>/     <data>/packed/<version>/     packed levels          Editor + edits
@@ -200,7 +200,7 @@ impl Layout {
         match part {
             Part::GameLevels => {
                 let port = self.assets_of("port");
-                let mut out = vec![self.data.join("probes").join(v)];
+                let mut out = vec![self.data.join("probes-rtx").join(v)];
                 out.extend(leftovers(&port));
                 out.insert(0, port);
                 out
@@ -378,8 +378,8 @@ mod tests {
                 write(&root.join(rel), n);
             }
             for (rel, n) in [
-                ("probes/pal/level_00.bin", 40),
-                ("probes/ntsc/level_00.bin", 1),
+                ("probes-rtx/pal/level_00.bin", 40),
+                ("probes-rtx/ntsc/level_00.bin", 1),
                 ("exports/level_00-textures/a.png", 20),
                 ("overrides/packs/mine/openrac-mod.json", 3),
                 ("overrides/overrides.json", 3),
@@ -440,7 +440,7 @@ mod tests {
             checkout.folders(Part::GameLevels),
             vec![
                 w.root.join("assets/port/rac1/pal"),
-                data.join("probes").join("pal"),
+                data.join("probes-rtx").join("pal"),
                 w.root.join("assets/port/rac1").join(".pal-abc123"),
             ]
         );
@@ -487,13 +487,13 @@ mod tests {
         let left = w.left();
         assert!(!left.iter().any(|f| f.starts_with("OpenRAC/assets/port/rac1/pal/")), "{left:?}");
         assert!(!left.iter().any(|f| f.contains("/.pal-")), "{left:?}");
-        assert!(!left.iter().any(|f| f.contains("probes/pal/")), "{left:?}");
+        assert!(!left.iter().any(|f| f.contains("probes-rtx/pal/")), "{left:?}");
         // The other disc's, the projects, the packs, the exports and everything of set-up stay.
         for kept in [
             "OpenRAC/assets/port/rac1/ntsc/levels-4.json",
             "OpenRAC/assets/levels/rac1/pal/level_00/project.godot",
             "OpenRAC/assets/packed/rac1/pal/level_00/gameplay_pal.wad",
-            "install/active/rac1/data/probes/ntsc/level_00.bin",
+            "install/active/rac1/data/probes-rtx/ntsc/level_00.bin",
             "install/active/rac1/data/exports/level_00-textures/a.png",
             "install/active/rac1/data/overrides/overrides.json",
             "install/active/rac1/data/iso_data/rac1/disc.iso",
@@ -540,8 +540,8 @@ mod tests {
                 "install/active/rac1/data/iso_data/rac1/disc.iso",
                 "install/active/rac1/data/mods/ntsc/level_00/x.bin",
                 "install/active/rac1/data/plugins/plugins.json",
-                "install/active/rac1/data/probes/ntsc/level_00.bin",
-                "install/active/rac1/data/probes/pal/level_00.bin",
+                "install/active/rac1/data/probes-rtx/ntsc/level_00.bin",
+                "install/active/rac1/data/probes-rtx/pal/level_00.bin",
                 "install/active/rac1/data/saves/card.ps2",
             ]
         );
