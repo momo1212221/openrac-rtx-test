@@ -189,7 +189,7 @@ id<MTLFunction> function_of(Program& p, id<MTLLibrary> library, const std::strin
 
 }  // namespace
 
-// Compute programs link (their stage compiles and translates) but have no dispatch yet.
+// A compute program links to its pipeline state, which glDispatchCompute runs.
 void MTLGL link_program(GLuint name) {
     Program* p = g->programs.find(name);
     if (p == nullptr) {
@@ -222,8 +222,20 @@ void MTLGL link_program(GLuint name) {
                 return;
             }
         }
-    } else if (library_of(*p, p->msl.compute) == nil) {
-        return;
+    } else {
+        id<MTLLibrary> library = library_of(*p, p->msl.compute);
+        id<MTLFunction> function =
+            library != nil ? function_of(*p, library, p->msl.compute_entry, 0) : nil;
+        if (function == nil) {
+            return;
+        }
+        NSError* error = nil;
+        p->compute = [g->device newComputePipelineStateWithFunction:function error:&error];
+        if (p->compute == nil) {
+            p->log = std::format("Metal: {}: {}", p->msl.compute_entry,
+                                 error.localizedDescription.UTF8String);
+            return;
+        }
     }
     // Uniforms start at zero, as GL's do.
     p->uniforms.assign(static_cast<std::size_t>(std::max(p->compiled.default_size, 0)), 0);
@@ -905,36 +917,71 @@ id<MTLTexture> texel_view(Texture& t) {
     return t.buffer_view;
 }
 
-// The bytes of `size` at `slot` in both stages: `data`, padded with zeros past `length`.
-void set_bytes(id<MTLRenderCommandEncoder> pass, NSUInteger slot, const void* data, std::size_t length,
-               std::size_t size) {
+// Where bind_resources puts a program's resources: both stages of a draw, or a dispatch.
+struct RenderBinder {
+    id<MTLRenderCommandEncoder> e;
+    void bytes(const void* data, NSUInteger length, NSUInteger slot) const {
+        [e setVertexBytes:data length:length atIndex:slot];
+        [e setFragmentBytes:data length:length atIndex:slot];
+    }
+    void buffer(id<MTLBuffer> b, NSUInteger slot) const {
+        [e setVertexBuffer:b offset:0 atIndex:slot];
+        [e setFragmentBuffer:b offset:0 atIndex:slot];
+    }
+    void texture(id<MTLTexture> t, NSUInteger slot) const {
+        [e setVertexTexture:t atIndex:slot];
+        [e setFragmentTexture:t atIndex:slot];
+    }
+    void sampler(id<MTLSamplerState> s, NSUInteger slot) const {
+        [e setVertexSamplerState:s atIndex:slot];
+        [e setFragmentSamplerState:s atIndex:slot];
+    }
+};
+
+struct ComputeBinder {
+    id<MTLComputeCommandEncoder> e;
+    void bytes(const void* data, NSUInteger length, NSUInteger slot) const {
+        [e setBytes:data length:length atIndex:slot];
+    }
+    void buffer(id<MTLBuffer> b, NSUInteger slot) const { [e setBuffer:b offset:0 atIndex:slot]; }
+    void texture(id<MTLTexture> t, NSUInteger slot) const { [e setTexture:t atIndex:slot]; }
+    void sampler(id<MTLSamplerState> s, NSUInteger slot) const {
+        [e setSamplerState:s atIndex:slot];
+    }
+};
+
+// The bytes of `size` at `slot`: `data`, padded with zeros past `length`.
+template <class Binder>
+void set_bytes(const Binder& to, NSUInteger slot, const void* data, std::size_t length, std::size_t size) {
     std::vector<std::uint8_t> bytes(std::max<std::size_t>(size, 16), 0);
     std::memcpy(bytes.data(), data, std::min(length, size));
     if (bytes.size() <= 4096) {
-        [pass setVertexBytes:bytes.data() length:bytes.size() atIndex:slot];
-        [pass setFragmentBytes:bytes.data() length:bytes.size() atIndex:slot];
+        to.bytes(bytes.data(), bytes.size(), slot);
     } else {
-        id<MTLBuffer> b = [g->device newBufferWithBytes:bytes.data()
-                                                 length:bytes.size()
-                                                options:MTLResourceStorageModeShared];
-        [pass setVertexBuffer:b offset:0 atIndex:slot];
-        [pass setFragmentBuffer:b offset:0 atIndex:slot];
+        to.buffer([g->device newBufferWithBytes:bytes.data()
+                                         length:bytes.size()
+                                        options:MTLResourceStorageModeShared],
+                  slot);
     }
 }
 
-void set_buffer(id<MTLRenderCommandEncoder> pass, NSUInteger slot, Buffer* b, std::size_t size) {
-    if (b == nullptr || b->buffer == nil || b->size < size) {
-        set_bytes(pass, slot, b != nullptr && b->buffer != nil ? b->buffer.contents : nullptr,
+// A block's buffer. A uniform block smaller than the shader declares is read from a padded copy;
+// a storage block is always bound itself, so that what the shader writes lands in it (its
+// runtime-sized array makes the declared size a lower bound only).
+template <class Binder>
+void set_buffer(const Binder& to, NSUInteger slot, Buffer* b, std::size_t size, bool storage = false) {
+    if (b == nullptr || b->buffer == nil || (!storage && b->size < size)) {
+        set_bytes(to, slot, b != nullptr && b->buffer != nil ? b->buffer.contents : nullptr,
                   b != nullptr ? b->size : 0, size);
         return;
     }
     b->used = g->serial;
-    [pass setVertexBuffer:b->buffer offset:0 atIndex:slot];
-    [pass setFragmentBuffer:b->buffer offset:0 atIndex:slot];
+    to.buffer(b->buffer, slot);
 }
 
 // The program's blocks and textures at their Metal slots.
-void bind_resources(id<MTLRenderCommandEncoder> pass, Program& p, const Target& t) {
+template <class Binder>
+void bind_resources(const Binder& pass, Program& p, const Target& t) {
     const State& s = g->state;
     const vkgl::CompiledProgram& c = p.compiled;
     // MSL rounds a block's struct up to its alignment, at most 16 bytes, past the GL size.
@@ -959,7 +1006,7 @@ void bind_resources(id<MTLRenderCommandEncoder> pass, Program& p, const Target& 
                            static_cast<GLuint>(binding) < kUniformBindings
                                ? g->buffers.find(s.storage_bindings[binding])
                                : nullptr,
-                           static_cast<std::size_t>(block.size));
+                           static_cast<std::size_t>(block.size), true);
             }
         }
     }
@@ -1005,8 +1052,7 @@ void bind_resources(id<MTLRenderCommandEncoder> pass, Program& p, const Target& 
         } else {
             tex->used = g->serial;
         }
-        [pass setVertexTexture:texture atIndex:slot];
-        [pass setFragmentTexture:texture atIndex:slot];
+        pass.texture(texture, slot);
         if (mt.sampler >= 0) {
             if (const SamplerParams* bound = g->samplers.find(s.unit_sampler[unit])) {
                 params = bound;
@@ -1014,8 +1060,7 @@ void bind_resources(id<MTLRenderCommandEncoder> pass, Program& p, const Target& 
             static const SamplerParams kDefault;
             id<MTLSamplerState> sampler = sampler_of(params != nullptr ? *params : kDefault, base,
                                                      max, is_integer(texture.pixelFormat));
-            [pass setVertexSamplerState:sampler atIndex:static_cast<NSUInteger>(mt.sampler)];
-            [pass setFragmentSamplerState:sampler atIndex:static_cast<NSUInteger>(mt.sampler)];
+            pass.sampler(sampler, static_cast<NSUInteger>(mt.sampler));
         }
     }
 }
@@ -1103,7 +1148,7 @@ void draw(GLenum mode, GLint first, GLsizei count, GLsizei instances, bool index
     }
     [pass setScissorRect:{static_cast<NSUInteger>(x0), static_cast<NSUInteger>(y0),
                           static_cast<NSUInteger>(x1 - x0), static_cast<NSUInteger>(y1 - y0)}];
-    bind_resources(pass, *p, t);
+    bind_resources(RenderBinder{pass}, *p, t);
     for (std::size_t i = 0; i < inputs.buffers.size(); ++i) {
         const Stream& stream = inputs.buffers[i];
         stream.buffer->used = g->serial;
@@ -1163,6 +1208,35 @@ void MTLGL draw_elements(GLenum mode, GLsizei count, GLenum type, const void* in
 void MTLGL draw_elements_instanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                    GLsizei instances) {
     draw(mode, 0, count, instances, true, type, reinterpret_cast<std::uintptr_t>(indices));
+}
+
+// ---- Compute ----
+
+// A dispatch goes into the frame's compute encoder, after the draws and copies before it: Metal
+// orders encoders on one command buffer and tracks the hazards of the resources they share.
+void MTLGL dispatch_compute(GLuint x, GLuint y, GLuint z) {
+    Program* p = current_program();
+    if (p == nullptr || !p->linked || p->compute == nil) {
+        fail(kGlInvalidOperation);
+        return;
+    }
+    if (x == 0 || y == 0 || z == 0) {
+        return;
+    }
+    id<MTLComputeCommandEncoder> encoder = compute_encoder();
+    [encoder setComputePipelineState:p->compute];
+    bind_resources(ComputeBinder{encoder}, *p, Target{});
+    const auto& w = p->msl.workgroup;
+    [encoder dispatchThreadgroups:MTLSizeMake(x, y, z)
+            threadsPerThreadgroup:MTLSizeMake(w[0], w[1], w[2])];
+}
+
+// GL's barriers order a dispatch's writes before later reads. Between dispatches in one encoder
+// Metal needs an explicit one; across encoders (draws, copies) its hazard tracking orders them.
+void MTLGL memory_barrier(GLbitfield) {
+    if (g->compute != nil) {
+        [g->compute memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    }
 }
 
 #undef MTLGL

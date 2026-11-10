@@ -1341,6 +1341,92 @@ void main() { result = colour + v_tint; }
     CHECK(get_error() == 0x0500);  // GL_INVALID_ENUM
     draw_arrays(0x0006 /* GL_TRIANGLE_FAN */, 0, 4);
     CHECK(get_error() == 0x0500);
+
+    // Compute: one dispatch writes a storage buffer, a barrier, a second reads and changes what the
+    // first wrote, then a draw reads the buffer as a texel buffer (the enhanced passes' pattern:
+    // rtx.cpp writes rays' results that early lighting reads).
+    const auto dispatch_compute = proc<PFN_glDispatchCompute>("glDispatchCompute");
+    const auto memory_barrier = proc<PFN_glMemoryBarrier>("glMemoryBarrier");
+    const auto bind_buffer_base = proc<PFN_glBindBufferBase>("glBindBufferBase");
+    const auto tex_buffer = proc<PFN_glTexBuffer>("glTexBuffer");
+    const auto active_texture = proc<PFN_glActiveTexture>("glActiveTexture");
+    const auto uniform_1i = proc<PFN_glUniform1i>("glUniform1i");
+    const auto build = [&](std::initializer_list<std::pair<GLenum, const char*>> stages) {
+        const GLuint built = create_program();
+        for (const auto& [type, source] : stages) {
+            const GLuint shader = create_shader(type);
+            shader_source(shader, 1, &source, nullptr);
+            compile_shader(shader);
+            attach_shader(built, shader);
+        }
+        link_program(built);
+        GLint ok = 0;
+        get_program_iv(built, GL_LINK_STATUS, &ok);
+        if (ok != GL_TRUE) {
+            char log[1024] = {};
+            get_program_info_log(built, sizeof log, nullptr, log);
+            std::printf("%s\n", log);
+        }
+        CHECK(ok == GL_TRUE);
+        return built;
+    };
+    const GLuint fill = build({{GL_COMPUTE_SHADER, R"(#version 430 core
+layout(local_size_x = 2) in;
+layout(std430, binding = 3) writeonly buffer Values { uint values[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    values[i] = packUnorm4x8(vec4(float(i) / 3.0, 0.0, 0.0, 1.0));
+}
+)"}});
+    const GLuint mark = build({{GL_COMPUTE_SHADER, R"(#version 430 core
+layout(local_size_x = 4) in;
+layout(std430, binding = 3) buffer Values { uint values[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    vec4 v = unpackUnorm4x8(values[i]);
+    values[i] = packUnorm4x8(vec4(v.r, 1.0, v.r, v.a));
+}
+)"}});
+    const GLuint show = build({{GL_VERTEX_SHADER, sources[0]}, {GL_FRAGMENT_SHADER, R"(#version 410 core
+uniform samplerBuffer values;
+in vec4 v_tint;
+layout(location = 0) out vec4 result;
+void main() { result = texelFetch(values, int(gl_FragCoord.x)); }
+)"}});
+    GLuint storage = 0, view = 0;
+    gen_buffers(1, &storage);
+    bind_buffer(GL_SHADER_STORAGE_BUFFER, storage);
+    buffer_data(GL_SHADER_STORAGE_BUFFER, 4 * sizeof(std::uint32_t), nullptr, GL_DYNAMIC_DRAW);
+    bind_buffer_base(GL_SHADER_STORAGE_BUFFER, 3, storage);
+    use_program(fill);
+    dispatch_compute(2, 1, 1);
+    memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    use_program(mark);
+    dispatch_compute(1, 1, 1);
+    memory_barrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+    CHECK(get_error() == GL_NO_ERROR);
+    gen_textures(1, &view);
+    active_texture(GL_TEXTURE0 + 5);
+    bind_texture(0x8C2A /* GL_TEXTURE_BUFFER */, view);
+    tex_buffer(0x8C2A, GL_RGBA8, storage);
+    active_texture(GL_TEXTURE0);
+    use_program(show);
+    uniform_1i(get_uniform_location(show, "values"), 5);
+    const float whole[8] = {-1, -1, 1, -1, 1, 1, -1, 1};
+    bind_buffer(GL_ARRAY_BUFFER, quad[0]);
+    buffer_data(GL_ARRAY_BUFFER, sizeof whole, whole, GL_STATIC_DRAW);
+    clear(GL_COLOR_BUFFER_BIT);
+    draw_elements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+    CHECK(get_error() == GL_NO_ERROR);
+    read_pixels(0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, drawn);
+    for (int x = 0; x < 4; ++x) {
+        const std::uint8_t* p = &drawn[x * 4];
+        const int expected = (x * 255 + 1) / 3;
+        CHECK(std::abs(p[0] - expected) <= 1 && p[1] == 255 && p[2] == p[0] && p[3] == 255);
+    }
+    // Without a compute program a dispatch is refused.
+    dispatch_compute(1, 1, 1);
+    CHECK(get_error() == 0x0502);  // GL_INVALID_OPERATION
     bind_framebuffer(GL_FRAMEBUFFER, 0);
 
     openrac::mtlgl::present();

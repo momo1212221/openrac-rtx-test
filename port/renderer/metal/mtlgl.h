@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 
 struct SDL_Window;
@@ -43,5 +44,25 @@ void set_swap_interval(int interval);
 
 // The GPU's name, for the log.
 std::string device_name();
+
+// ---- Native Metal, for what the GL does not express (enhanced/renderer/rtx_metal.mm's ray tracing) ----
+// Objective-C objects are given as void*: an Objective-C++ caller bridges them with
+// (__bridge id<MTLDevice>) and the like. They are the context's own, alive while it is open.
+
+struct Native {
+    void* device = nullptr;  // id<MTLDevice>: the GPU the GL draws with
+    void* queue = nullptr;   // id<MTLCommandQueue>
+};
+// The context's device and queue; nulls while no context is open.
+Native native();
+// The MTLBuffer behind GL buffer `name`, counted as used by this frame (so that a later
+// glBufferSubData copies it instead of writing what the GPU may still read); null for none.
+void* native_buffer(unsigned name);
+// The MTLTexture behind GL texture `name`; null for none or a texture buffer.
+void* native_texture(unsigned name);
+// Ends the open encoder and gives `record` the frame's command buffer (id<MTLCommandBuffer>), so
+// that what it encodes runs after the GL's commands so far and before those that follow. False,
+// without calling `record`, while no context is open.
+bool encode_native(const std::function<void(void* commands)>& record);
 
 }  // namespace openrac::mtlgl

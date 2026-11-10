@@ -150,6 +150,7 @@ struct Program {
     std::vector<GLint> units;            // by uniform: a sampler's texture unit
     std::vector<GLuint> block_bindings;  // by block: its GL uniform buffer binding
     std::unordered_map<std::string, id<MTLRenderPipelineState>> pipelines;
+    id<MTLComputePipelineState> compute;  // a compute program's
 };
 
 inline constexpr GLuint kAttributes = 16;
@@ -217,6 +218,7 @@ struct Context {
     id<MTLRenderCommandEncoder> pass;  // open on pass_target
     Target pass_target;
     id<MTLBlitCommandEncoder> blit, upload_blit;
+    id<MTLComputeCommandEncoder> compute;  // open for dispatches
     std::uint64_t serial = 1;  // the frame's commands'; those before it have smaller ones
     std::atomic<std::uint64_t> completed{0};  // the last serial the GPU has finished
 
@@ -245,10 +247,12 @@ void fail(GLenum error);
 
 // The frame's command buffer.
 id<MTLCommandBuffer> commands();
-// Ends the open encoder, a render pass or a copy.
+// Ends the open encoder, a render pass, a copy or dispatches.
 void end_encoders();
 // A copy encoder in the frame's command order.
 id<MTLBlitCommandEncoder> blit();
+// A compute encoder in the frame's command order.
+id<MTLComputeCommandEncoder> compute_encoder();
 // A copy encoder for writing `texture`: the upload command buffer's while nothing this frame has
 // used it, so its render passes stay whole, else blit()'s.
 id<MTLBlitCommandEncoder> blit_for(Texture& texture);
@@ -358,6 +362,8 @@ void MTLGL draw_arrays_instanced(GLenum mode, GLint first, GLsizei count, GLsize
 void MTLGL draw_elements(GLenum mode, GLsizei count, GLenum type, const void* indices);
 void MTLGL draw_elements_instanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                    GLsizei instances);
+void MTLGL dispatch_compute(GLuint x, GLuint y, GLuint z);
+void MTLGL memory_barrier(GLbitfield barriers);
 #undef MTLGL
 
 }  // namespace openrac::mtlgl::detail

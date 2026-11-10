@@ -396,6 +396,10 @@ bool loaded();
 // renderer optimisations without changing desktop GL or ES behaviour.
 bool is_vulkan();
 
+// The Metal backend (renderer/metal, OPENRAC_GL_API=metal): the same GL surface carried out with
+// Metal, compute included, and native Metal for what the GL does not express (mtlgl.h).
+bool is_metal();
+
 // Enhanced rendering (probe GI, modern shadows, GTAO: port/enhanced) is compiled into the desktop
 // builds and chosen when the game starts: the `enhanced_rendering` setting (the launcher's Mods
 // entry), or OPENRAC_ENHANCED=1 (or OPENRAC_PROBE_GI naming a bake) for scripts and tests. It is
@@ -404,7 +408,9 @@ bool is_vulkan();
 bool enhanced_rendering_enabled();
 void set_enhanced_rendering(bool on);
 
-// Enhanced rendering is chosen at start and supported only by Vulkan.
+// Enhanced rendering is chosen at start and supported only by Vulkan. Metal has its compute now
+// (renderer/metal), but the enhanced mesh shader binds 18 samplers where Metal allows 16 a stage:
+// it waits for shared samplers before is_metal() may join here.
 // Keep this decision at resource/pass/UI boundaries, not in every draw.
 inline bool enhanced_rendering_available() {
 #if defined(OPENRAC_ENHANCED_RENDERING) && OPENRAC_ENHANCED_RENDERING

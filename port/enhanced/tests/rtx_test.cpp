@@ -128,7 +128,7 @@ void check_level_data_extraction() {
 
     const auto st = enhanced::rtx_status();
     CHECK(st.triangle_count == 10);
-    CHECK(st.node_count == pipeline.bvh_nodes().size());
+    CHECK(st.node_count == pipeline.bvh_nodes().size() + pipeline.dynamic_nodes().size());
     CHECK(st.dynamic_instance_count == 3);
 
     // Now the upward ray hits the dynamic moby at z = 3.0 (t = 2.5)

@@ -42,6 +42,8 @@ void end_encoders() {
     g->pass_target = {};
     [g->blit endEncoding];
     g->blit = nil;
+    [g->compute endEncoding];
+    g->compute = nil;
 }
 
 id<MTLBlitCommandEncoder> blit() {
@@ -50,6 +52,14 @@ id<MTLBlitCommandEncoder> blit() {
         g->blit = [commands() blitCommandEncoder];
     }
     return g->blit;
+}
+
+id<MTLComputeCommandEncoder> compute_encoder() {
+    if (g->compute == nil) {
+        end_encoders();
+        g->compute = [commands() computeCommandEncoder];
+    }
+    return g->compute;
 }
 
 id<MTLCommandBuffer> uploads() {
@@ -757,6 +767,8 @@ const Entry kEntries[] = {
     MTLGL_ENTRY(glVertexAttribPointer, vertex_attrib_pointer),
     MTLGL_ENTRY(glVertexAttribIPointer, vertex_attrib_i_pointer),
     MTLGL_ENTRY(glVertexAttribDivisor, vertex_attrib_divisor),
+    MTLGL_ENTRY(glDispatchCompute, dispatch_compute),
+    MTLGL_ENTRY(glMemoryBarrier, memory_barrier),
     MTLGL_ENTRY(glDrawArrays, draw_arrays),
     MTLGL_ENTRY(glDrawArraysInstanced, draw_arrays_instanced),
     MTLGL_ENTRY(glDrawElements, draw_elements),
@@ -935,6 +947,40 @@ void set_swap_interval(int interval) {
     if (g->layer != nil) {
         g->layer.displaySyncEnabled = interval != 0;
     }
+}
+
+Native native() {
+    if (g == nullptr) {
+        return {};
+    }
+    return {(__bridge void*)g->device, (__bridge void*)g->queue};
+}
+
+void* native_buffer(unsigned name) {
+    Buffer* b = g != nullptr ? g->buffers.find(name) : nullptr;
+    if (b == nullptr || b->buffer == nil) {
+        return nullptr;
+    }
+    b->used = g->serial;
+    return (__bridge void*)b->buffer;
+}
+
+void* native_texture(unsigned name) {
+    Texture* t = g != nullptr ? g->textures.find(name) : nullptr;
+    if (t == nullptr || t->texture == nil) {
+        return nullptr;
+    }
+    t->used = g->serial;
+    return (__bridge void*)t->texture;
+}
+
+bool encode_native(const std::function<void(void* commands)>& record) {
+    if (g == nullptr) {
+        return false;
+    }
+    end_encoders();
+    record((__bridge void*)commands());
+    return true;
 }
 
 std::string device_name() {

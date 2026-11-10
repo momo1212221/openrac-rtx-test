@@ -80,6 +80,12 @@ float ambient_visibility(ivec2 pixel, vec3 centre, vec3 normal) {
     return clamp(1.0 - (1.0 - ao) * early_ao_strength, 0.0, 1.0);
 }
 
+// rtx_trace.comp's bounce, from its log encoding (encode_early_gi) back to light.
+vec3 decode_rtx_gi(vec3 encoded) {
+    return any(greaterThan(encoded, vec3(0.0))) ? exp2(encoded * 12.0 - (12.0 - log2(16.0)))
+                                                : vec3(0.0);
+}
+
 void main() {
     ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
     ivec2 extent = textureSize(early_depth, 0), half_extent = (extent + 1) / 2;
@@ -122,15 +128,18 @@ void main() {
             world, normal, probe_surface_bias(normal, inverse_view * (-centre)), irradiance
         );
     }
-    irradiance *= ao;
     float shadow = sun_shadow_visibility(world, normal, normal);
     if (rtx_enabled != 0) {
-        vec4 rtx_sample = texelFetch(rtx_values, index * 2);
-        vec4 rtx_refl = texelFetch(rtx_values, index * 2 + 1);
+        // rtx_trace.comp's two words: (bounce, sun visibility), (weighted reflection, ambient
+        // visibility). The filter averages decoded values, never the log-encoded bytes.
+        vec4 s0 = texelFetch(rtx_values, index * 2);
+        vec4 s1 = texelFetch(rtx_values, index * 2 + 1);
+        vec3 gi = decode_rtx_gi(s0.rgb);
+        float sun = s0.a, ambient = s1.a;
+        vec3 reflection = s1.rgb;
         if (rtx_denoise != 0) {
-            vec4 sum_s = vec4(0.0);
-            vec4 sum_r = vec4(0.0);
-            float w_sum = 0.0;
+            vec3 sum_gi = vec3(0.0), sum_refl = vec3(0.0);
+            float sum_sun = 0.0, sum_ambient = 0.0, w_sum = 0.0;
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     ivec2 nc = clamp(cell + ivec2(dx, dy), ivec2(0), half_extent - 1);
@@ -142,56 +151,73 @@ void main() {
                     float plane = abs(dot(nv, position_at(np, nd) - centre));
                     float w = exp(-float(dx * dx + dy * dy) * 0.5 - plane * plane / 0.01);
                     int nidx = nc.y * half_extent.x + nc.x;
-                    sum_s += texelFetch(rtx_values, nidx * 2) * w;
-                    sum_r += texelFetch(rtx_values, nidx * 2 + 1) * w;
+                    vec4 n0 = texelFetch(rtx_values, nidx * 2);
+                    vec4 n1 = texelFetch(rtx_values, nidx * 2 + 1);
+                    sum_gi += decode_rtx_gi(n0.rgb) * w;
+                    sum_sun += n0.a * w;
+                    sum_refl += n1.rgb * w;
+                    sum_ambient += n1.a * w;
                     w_sum += w;
                 }
             }
             if (w_sum > 1e-5) {
-                rtx_sample = sum_s / w_sum;
-                rtx_refl = sum_r / w_sum;
+                gi = sum_gi / w_sum;
+                sun = sum_sun / w_sum;
+                reflection = sum_refl / w_sum;
+                ambient = sum_ambient / w_sum;
             }
         }
         if (rtx_debug_view == 1) {
-            irradiance = vec3(rtx_sample.a);
-            shadow = rtx_sample.a;
+            irradiance = vec3(sun);
+            shadow = sun;
+            ao = 1.0;
             covered = true;
         } else if (rtx_debug_view == 2) {
-            irradiance = vec3(rtx_sample.a);
+            irradiance = vec3(ambient);
             shadow = 1.0;
+            ao = 1.0;
             covered = true;
         } else if (rtx_debug_view == 3) {
-            irradiance = rtx_refl.rgb * max(rtx_refl.a, 0.25);
+            irradiance = reflection;
             shadow = 1.0;
+            ao = 1.0;
             covered = true;
         } else if (rtx_debug_view == 4) {
-            irradiance = any(greaterThan(rtx_sample.rgb, vec3(0.0)))
-                             ? exp2(rtx_sample.rgb * 12.0 - (12.0 - log2(16.0)))
-                             : vec3(0.0);
+            irradiance = gi;
             shadow = 1.0;
+            ao = 1.0;
             covered = true;
         } else if (rtx_debug_view == 5) {
-            irradiance = rtx_sample.rgb * 2.0;
+            irradiance = s0.rgb * 2.0;  // the trace's step heat map, not a light
             shadow = 1.0;
+            ao = 1.0;
             covered = true;
         } else {
-            if ((rtx_flags & 8) != 0 && any(greaterThan(rtx_sample.rgb, vec3(0.0)))) {
-                vec3 rtx_gi = exp2(rtx_sample.rgb * 12.0 - (12.0 - log2(16.0)));
-                irradiance += rtx_gi;
+            // The bounce takes the probes' place where there are none, and shares it half and
+            // half where there are: both are the same light, which added would count it twice.
+            if ((rtx_flags & 8) != 0) {
+                irradiance = covered ? mix(irradiance, gi, 0.5) : gi;
                 covered = true;
             }
-            if ((rtx_flags & 4) != 0 && rtx_refl.a > 0.0) {
-                irradiance += rtx_refl.rgb * rtx_refl.a;
-                covered = true;
+            // Reflections are specular: Schlick's Fresnel keeps them to grazing angles instead of
+            // washing every surface in the sky's colour as a diffuse light.
+            if ((rtx_flags & 4) != 0 && covered) {
+                float cos_v = clamp(dot(nv, normalize(-centre)), 0.0, 1.0);
+                float fresnel = 0.04 + 0.96 * pow(1.0 - cos_v, 5.0);
+                irradiance += reflection * fresnel;
             }
+            // Traced AO replaces the screen-space one (not both: that darkened every corner
+            // twice); the traced sun visibility replaces the shadow map's and touches only
+            // the sun's light, never the ambient.
             if ((rtx_flags & 2) != 0) {
-                irradiance *= rtx_sample.a;
+                ao = ambient;
             }
             if ((rtx_flags & 1) != 0) {
-                shadow *= rtx_sample.a;
+                shadow = sun;
             }
         }
     }
+    irradiance *= ao;
     uint hero = uint(round(clamp(hero_shadow_sample(world, normal), 0.0, 1.0) * 255.0));
     // Log encoding spans the finite half-float lighting range. Decode each
     // candidate before spatial filtering; alpha is linear visibility.

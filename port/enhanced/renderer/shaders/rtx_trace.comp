@@ -19,6 +19,10 @@ uniform vec3 rtx_sun_dir;
 uniform vec3 rtx_sun_colour;
 uniform vec3 rtx_sky_colour;
 uniform int rtx_node_count;
+uniform samplerBuffer rtx_dynamic_nodes;      // the mobys' tree, rebuilt as they move
+uniform samplerBuffer rtx_dynamic_triangles;
+uniform int rtx_dynamic_node_count;
+uniform int rtx_step_budget;                  // nodes a ray may visit, by quality
 uniform int rtx_samples_per_pixel;
 uniform int rtx_flags;  // bit0: shadows, bit1: ao, bit2: reflections, bit3: gi
 uniform int rtx_frame_index;
@@ -106,66 +110,66 @@ vec3 reconstruct_view(ivec2 pixel, float distance, ivec2 extent) {
     return vec3((ndc + rtx_projection[2].xy) / scale, -1.0) * distance;
 }
 
-bool intersect_aabb(vec3 origin, vec3 inv_dir, float t_min, float t_max, vec3 bmin, vec3 bmax) {
+// Where the ray enters the box, or -1 when it misses it within t_min..t_max.
+float enter_aabb(vec3 origin, vec3 inv_dir, float t_min, float t_max, vec3 bmin, vec3 bmax) {
     vec3 t0 = (bmin - origin) * inv_dir;
     vec3 t1 = (bmax - origin) * inv_dir;
     vec3 tsmaller = min(t0, t1);
     vec3 tbigger = max(t0, t1);
     float tmin = max(t_min, max(tsmaller.x, max(tsmaller.y, tsmaller.z)));
     float tmax = min(t_max, min(tbigger.x, min(tbigger.y, tbigger.z)));
-    return tmax >= tmin;
+    return tmax >= tmin ? tmin : -1.0;
 }
 
-bool trace_bvh(
+// Set when the last trace_bvh ran out of its step budget or stack before it finished: its answer
+// is unknown, and the caller leaves that sample out instead of counting it as a miss (which lit
+// what is in shadow and leaked light through walls in big levels).
+bool g_rtx_unknown = false;
+
+const int kStack = 48;
+
+// One tree: the level's static one or the mobys' (rtx.cpp builds both, so that the static one is
+// uploaded once and only the small moby tree changes from frame to frame). Children are visited
+// nearest first along the ray, so a closest hit shrinks hit_t early and prunes the far child.
+bool trace_tree(
+    samplerBuffer nodes,
+    samplerBuffer tris,
+    int node_count,
     vec3 origin,
     vec3 dir,
+    vec3 inv_dir,
     float t_min,
-    float t_max,
     bool any_hit,
-    out float hit_t,
-    out vec3 hit_normal,
-    out vec3 hit_albedo,
-    out int steps
+    inout float hit_t,
+    inout vec3 hit_normal,
+    inout vec3 hit_albedo,
+    inout int steps
 ) {
-    hit_t = t_max;
-    hit_normal = vec3(0.0, 0.0, 1.0);
-    hit_albedo = vec3(0.5);
-    steps = 0;
-    if (rtx_node_count <= 0) {
+    if (node_count <= 0) {
         return false;
     }
-
-    vec3 safe_dir = vec3(
-        abs(dir.x) > 1e-8 ? dir.x : (dir.x >= 0.0 ? 1e-8 : -1e-8),
-        abs(dir.y) > 1e-8 ? dir.y : (dir.y >= 0.0 ? 1e-8 : -1e-8),
-        abs(dir.z) > 1e-8 ? dir.z : (dir.z >= 0.0 ? 1e-8 : -1e-8)
-    );
-    vec3 inv_dir = 1.0 / safe_dir;
-
-    int stack[48];
+    int stack[kStack];
     int sp = 0;
     stack[sp++] = 0;
     bool found = false;
-
-    while (sp > 0 && steps < 256) {
+    while (sp > 0) {
+        if (steps >= rtx_step_budget) {
+            g_rtx_unknown = true;
+            return found;
+        }
         ++steps;
         int idx = stack[--sp];
-        vec4 node_min_left = texelFetch(rtx_bvh_nodes, idx * 2 + 0);
-        vec4 node_max_count = texelFetch(rtx_bvh_nodes, idx * 2 + 1);
-        if (!intersect_aabb(origin, inv_dir, t_min, hit_t, node_min_left.xyz, node_max_count.xyz)) {
-            continue;
-        }
+        vec4 node_min_left = texelFetch(nodes, idx * 2 + 0);
+        vec4 node_max_count = texelFetch(nodes, idx * 2 + 1);
         int left_or_first = floatBitsToInt(node_min_left.w);
         int count = floatBitsToInt(node_max_count.w);
         if (count > 0) {
             int first = ~left_or_first;
             for (int i = 0; i < count; ++i) {
                 int tri_base = (first + i) * 4;
-                vec4 tri_v0_mat = texelFetch(rtx_triangles, tri_base + 0);
-                vec4 tri_e1_layer = texelFetch(rtx_triangles, tri_base + 1);
-                vec4 tri_e2_flags = texelFetch(rtx_triangles, tri_base + 2);
-                vec3 e1 = tri_e1_layer.xyz;
-                vec3 e2 = tri_e2_flags.xyz;
+                vec4 tri_v0_mat = texelFetch(tris, tri_base + 0);
+                vec3 e1 = texelFetch(tris, tri_base + 1).xyz;
+                vec3 e2 = texelFetch(tris, tri_base + 2).xyz;
                 vec3 pvec = cross(dir, e2);
                 float det = dot(e1, pvec);
                 if (abs(det) < 1e-8) {
@@ -184,7 +188,7 @@ bool trace_bvh(
                 }
                 float t = dot(e2, qvec) * inv_det;
                 if (t >= t_min && t < hit_t) {
-                    vec4 tri_normal_albedo = texelFetch(rtx_triangles, tri_base + 3);
+                    vec4 tri_normal_albedo = texelFetch(tris, tri_base + 3);
                     hit_t = t;
                     hit_normal = tri_normal_albedo.xyz;
                     hit_albedo = unpack_rgb8(floatBitsToUint(tri_normal_albedo.w));
@@ -194,10 +198,72 @@ bool trace_bvh(
                     }
                 }
             }
-        } else if (sp + 2 <= 48) {
-            stack[sp++] = left_or_first + 1;
-            stack[sp++] = left_or_first;
+            continue;
         }
+        // Internal: both children's boxes, the nearer pushed last so that it is visited first.
+        int left = left_or_first, right = left_or_first + 1;
+        float tl = enter_aabb(origin, inv_dir, t_min, hit_t,
+                              texelFetch(nodes, left * 2).xyz, texelFetch(nodes, left * 2 + 1).xyz);
+        float tr = enter_aabb(origin, inv_dir, t_min, hit_t,
+                              texelFetch(nodes, right * 2).xyz, texelFetch(nodes, right * 2 + 1).xyz);
+        if (tl >= 0.0 && tr >= 0.0) {
+            if (sp + 2 > kStack) {
+                g_rtx_unknown = true;
+                return found;
+            }
+            bool left_first = tl <= tr;
+            stack[sp++] = left_first ? right : left;
+            stack[sp++] = left_first ? left : right;
+        } else if (tl >= 0.0 || tr >= 0.0) {
+            if (sp + 1 > kStack) {
+                g_rtx_unknown = true;
+                return found;
+            }
+            stack[sp++] = tl >= 0.0 ? left : right;
+        }
+    }
+    return found;
+}
+
+bool trace_bvh(
+    vec3 origin,
+    vec3 dir,
+    float t_min,
+    float t_max,
+    bool any_hit,
+    out float hit_t,
+    out vec3 hit_normal,
+    out vec3 hit_albedo,
+    out int steps
+) {
+    hit_t = t_max;
+    hit_normal = vec3(0.0, 0.0, 1.0);
+    hit_albedo = vec3(0.5);
+    steps = 0;
+    g_rtx_unknown = false;
+    vec3 safe_dir = vec3(
+        abs(dir.x) > 1e-8 ? dir.x : (dir.x >= 0.0 ? 1e-8 : -1e-8),
+        abs(dir.y) > 1e-8 ? dir.y : (dir.y >= 0.0 ? 1e-8 : -1e-8),
+        abs(dir.z) > 1e-8 ? dir.z : (dir.z >= 0.0 ? 1e-8 : -1e-8)
+    );
+    vec3 inv_dir = 1.0 / safe_dir;
+    // The root's own box is tested here; the trees test their children's before visiting them.
+    bool found = false;
+    if (rtx_node_count > 0
+        && enter_aabb(origin, inv_dir, t_min, hit_t, texelFetch(rtx_bvh_nodes, 0).xyz,
+                      texelFetch(rtx_bvh_nodes, 1).xyz) >= 0.0) {
+        found = trace_tree(rtx_bvh_nodes, rtx_triangles, rtx_node_count, origin, dir, inv_dir,
+                           t_min, any_hit, hit_t, hit_normal, hit_albedo, steps);
+    }
+    if (found && any_hit) {
+        return true;
+    }
+    if (rtx_dynamic_node_count > 0
+        && enter_aabb(origin, inv_dir, t_min, hit_t, texelFetch(rtx_dynamic_nodes, 0).xyz,
+                      texelFetch(rtx_dynamic_nodes, 1).xyz) >= 0.0) {
+        found = trace_tree(rtx_dynamic_nodes, rtx_dynamic_triangles, rtx_dynamic_node_count,
+                           origin, dir, inv_dir, t_min, any_hit, hit_t, hit_normal, hit_albedo,
+                           steps) || found;
     }
     return found;
 }
@@ -225,7 +291,7 @@ void main() {
     }
     if (depth <= 0.0) {
         rtx_pairs[cell * 2 + 0] = 0xFF000000u;
-        rtx_pairs[cell * 2 + 1] = 0u;
+        rtx_pairs[cell * 2 + 1] = 0xFF000000u;  // no reflection, nothing occluded
         return;
     }
 
@@ -249,7 +315,7 @@ void main() {
         if (ndotl > 0.0) {
             vec3 st, sb;
             make_basis(to_sun, st, sb);
-            int unoccluded = 0;
+            int unoccluded = 0, known = 0;
             for (int s = 0; s < spp; ++s) {
                 float u1 = rand01(seed);
                 float u2 = rand01(seed);
@@ -259,12 +325,16 @@ void main() {
                 float ht;
                 vec3 hn, ha;
                 int stp;
-                if (!trace_bvh(origin, dir, 0.025, rtx_ray_distance, true, ht, hn, ha, stp)) {
-                    unoccluded++;
-                }
+                bool hit = trace_bvh(origin, dir, 0.025, rtx_ray_distance, true, ht, hn, ha, stp);
                 total_steps += stp;
+                if (!hit && g_rtx_unknown) {
+                    continue;  // out of budget: neither lit nor shadowed
+                }
+                ++known;
+                unoccluded += hit ? 0 : 1;
             }
-            shadow_vis = float(unoccluded) / float(spp);
+            // Every sample unknown: the shadow map's answer stands (early lighting's own).
+            shadow_vis = known > 0 ? float(unoccluded) / float(known) : 1.0;
         } else {
             shadow_vis = 0.0;
         }
@@ -274,14 +344,22 @@ void main() {
     float ao_vis = 1.0;
     vec3 gi_radiance = vec3(0.0);
     if ((rtx_flags & 10) != 0) {
-        int ao_hits = 0;
+        int ao_hits = 0, ao_known = 0, gi_known = 0;
         for (int s = 0; s < spp; ++s) {
             vec3 dir = sample_cosine_hemisphere(N, rand01(seed), rand01(seed));
             float max_t = ((rtx_flags & 8) != 0) ? rtx_ray_distance : rtx_ao_radius;
             float ht;
             vec3 hn, ha;
             int stp;
-            if (trace_bvh(origin, dir, 0.025, max_t, false, ht, hn, ha, stp)) {
+            bool hit = trace_bvh(origin, dir, 0.025, max_t, false, ht, hn, ha, stp);
+            total_steps += stp;
+            if (!hit && g_rtx_unknown) {
+                continue;
+            }
+            ++gi_known;
+            // A hit beyond the AO radius after the budget ran out still proves the near part free.
+            ++ao_known;
+            if (hit) {
                 if (ht <= rtx_ao_radius) {
                     ao_hits++;
                 }
@@ -305,13 +383,12 @@ void main() {
             } else if ((rtx_flags & 8) != 0) {
                 gi_radiance += rtx_sky_colour * max(0.2, 0.5 + 0.5 * dir.z);
             }
-            total_steps += stp;
         }
         if ((rtx_flags & 2) != 0) {
-            ao_vis = 1.0 - (float(ao_hits) / float(spp));
+            ao_vis = ao_known > 0 ? 1.0 - (float(ao_hits) / float(ao_known)) : 1.0;
         }
         if ((rtx_flags & 8) != 0) {
-            gi_radiance = (gi_radiance / float(spp)) * rtx_gi_strength;
+            gi_radiance = gi_known > 0 ? (gi_radiance / float(gi_known)) * rtx_gi_strength : vec3(0.0);
         }
     }
 
@@ -349,7 +426,7 @@ void main() {
                 refl_radiance = ha * (rtx_sun_colour * hit_sun + rtx_sky_colour * 0.35);
                 refl_confidence =
                     clamp(1.0 - ht / rtx_ray_distance, 0.15, 1.0) * clamp(rtx_roughness_cutoff, 0.1, 1.0);
-            } else {
+            } else if (!g_rtx_unknown) {
                 refl_radiance = rtx_sky_colour * max(0.25, 0.5 + 0.5 * R.z);
                 refl_confidence = 0.5 * clamp(rtx_roughness_cutoff, 0.1, 1.0);
             }
@@ -357,16 +434,15 @@ void main() {
         }
     }
 
+    // Two RGBA8 words a cell (early_lighting.comp reads them):
+    //   word 0: rgb the bounce (log encoded, encode_early_gi), a the sun's visibility;
+    //   word 1: rgb the reflection already weighted by its confidence, a the ambient visibility.
+    // Shadow and AO stay apart so that the sun's shadow darkens only the sun's light.
     vec3 encoded_gi = encode_early_gi(gi_radiance);
-    float vis_alpha = shadow_vis * ao_vis;
-    if (rtx_debug_view == 1) {
-        vis_alpha = shadow_vis;
-    } else if (rtx_debug_view == 2) {
-        vis_alpha = ao_vis;
-    } else if (rtx_debug_view == 5) {
-        encoded_gi = heatmap_colour(float(total_steps) / 64.0);
-        vis_alpha = 1.0;
+    vec3 reflection = clamp(refl_radiance * refl_confidence, 0.0, 1.0);
+    if (rtx_debug_view == 5) {
+        encoded_gi = heatmap_colour(float(total_steps) / float(max(rtx_step_budget, 1)));
     }
-    rtx_pairs[cell * 2 + 0] = packUnorm4x8(vec4(encoded_gi, vis_alpha));
-    rtx_pairs[cell * 2 + 1] = packUnorm4x8(vec4(clamp(refl_radiance, 0.0, 1.0), refl_confidence));
+    rtx_pairs[cell * 2 + 0] = packUnorm4x8(vec4(encoded_gi, shadow_vis));
+    rtx_pairs[cell * 2 + 1] = packUnorm4x8(vec4(reflection, ao_vis));
 }

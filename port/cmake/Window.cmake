@@ -499,6 +499,11 @@ if(APPLE)
   target_sources(openrac_enhanced_viewer PRIVATE enhanced/renderer/rtx_metal.mm)
   target_compile_options(openrac_enhanced_viewer PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
   target_link_libraries(openrac_enhanced_viewer PUBLIC "-framework Metal" "-framework Foundation")
+  # The ray tracing encodes on the Metal GL's own device and frame (renderer/metal/mtlgl.h).
+  if(OPENRAC_METAL)
+    target_link_libraries(openrac_enhanced_viewer PRIVATE openrac_renderer_metal)
+    target_compile_definitions(openrac_enhanced_viewer PRIVATE OPENRAC_METAL=1)
+  endif()
 endif()
 if(OPENRAC_LIGHT_AUTHORING)
   target_sources(openrac_enhanced_viewer PRIVATE

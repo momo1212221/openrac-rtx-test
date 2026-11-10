@@ -183,8 +183,11 @@ public:
     bool active(const renderer::FrameInput& input, const renderer::RenderState& state) const;
     unsigned output_buffer() const { return m_output_buffer; }
     unsigned output_texture() const { return m_output_texture; }
+    // The static tree; the mobys' is apart (dynamic_*).
     std::span<const RtxTriangle> triangles() const { return m_triangles; }
     std::span<const RtxBvhNode> bvh_nodes() const { return m_nodes; }
+    std::span<const RtxTriangle> dynamic_triangles() const { return m_dynamic_triangles; }
+    std::span<const RtxBvhNode> dynamic_nodes() const { return m_dynamic_nodes; }
     void release();
 
 private:
@@ -192,10 +195,16 @@ private:
     void ensure_gpu_buffers();
     RtxHardwareBackend* select_hardware_backend(renderer::RtxBackend requested) const;
 
-    std::vector<RtxTriangle> m_static_triangles;
-    std::vector<RtxBvhNode> m_static_nodes;
+    void clear_dynamic();
+    void publish_counts();
+
+    // The level's static tree (terrain, ties, shrubs), built and uploaded once a level.
     std::vector<RtxTriangle> m_triangles;
     std::vector<RtxBvhNode> m_nodes;
+    // The mobys' tree, rebuilt when one moves (m_dynamic_key: their models and matrices).
+    std::vector<RtxTriangle> m_dynamic_triangles;
+    std::vector<RtxBvhNode> m_dynamic_nodes;
+    std::uint64_t m_dynamic_key = 0;
     struct MobyMeshSlice {
         std::vector<RtxTriangle> local_triangles;
     };
@@ -210,9 +219,14 @@ private:
     unsigned m_bvh_texture = 0;
     unsigned m_tri_buffer = 0;
     unsigned m_tri_texture = 0;
+    unsigned m_dyn_bvh_buffer = 0;
+    unsigned m_dyn_bvh_texture = 0;
+    unsigned m_dyn_tri_buffer = 0;
+    unsigned m_dyn_tri_texture = 0;
     unsigned m_output_buffer = 0;
     unsigned m_output_texture = 0;
-    bool m_gpu_scene_dirty = false;
+    bool m_static_dirty = false;
+    bool m_dynamic_dirty = false;
     bool m_compute_failed = false;
 
     int m_width = 0;
@@ -220,6 +234,7 @@ private:
     unsigned m_target = 0;
     std::uint64_t m_frame = 0;
     bool m_ready = false;
+    const char* m_logged = nullptr;  // the last state logged (render's reasons), once each
 };
 
 }  // namespace openrac::enhanced

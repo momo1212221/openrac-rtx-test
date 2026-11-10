@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -180,14 +181,16 @@ void build_sah_bvh_recursive(
     build_sah_bvh_recursive(nodes, tri_indices, entries, left_idx + 1, mid, start + count - mid);
 }
 
-// CPU SAH-BVH ray traversal fallback when neither Metal nor CUDA is requested/present.
+// CPU SAH-BVH ray traversal fallback when neither Metal nor CUDA is requested/present: one tree,
+// keeping `out_hit` when it is nearer (the static tree's, then the mobys'), its triangles
+// numbered from `first_triangle`.
 void trace_cpu_bvh(
     std::span<const RtxBvhNode> nodes,
     std::span<const RtxTriangle> tris,
     const RtxRay& ray,
-    RtxHit& out_hit
+    RtxHit& out_hit,
+    std::int32_t first_triangle = 0
 ) {
-    out_hit = RtxHit{};
     if (nodes.empty() || tris.empty()) {
         return;
     }
@@ -203,7 +206,7 @@ void trace_cpu_bvh(
     std::int32_t stack[64];
     int sp = 0;
     stack[sp++] = 0;
-    float closest = ray.t_max;
+    float closest = out_hit.t >= 0.0f ? std::min(out_hit.t, ray.t_max) : ray.t_max;
 
     while (sp > 0) {
         const std::int32_t idx = stack[--sp];
@@ -262,7 +265,7 @@ void trace_cpu_bvh(
                 if (t >= ray.t_min && t < closest) {
                     closest = t;
                     out_hit.t = t;
-                    out_hit.triangle_index = tri_idx;
+                    out_hit.triangle_index = first_triangle + tri_idx;
                     out_hit.u = u;
                     out_hit.v = v;
                     out_hit.normal = {
@@ -275,6 +278,52 @@ void trace_cpu_bvh(
             stack[sp++] = node.left_or_first + 1;
             stack[sp++] = node.left_or_first;
         }
+    }
+}
+
+// Builds the SAH tree of `tris` into `nodes` and reorders `tris` to its leaves' order.
+void build_tree(std::vector<RtxTriangle>& tris, std::vector<RtxBvhNode>& nodes) {
+    nodes.clear();
+    if (tris.empty()) {
+        return;
+    }
+    std::vector<BvhBuildEntry> entries(tris.size());
+    std::vector<std::uint32_t> order(tris.size());
+    for (std::size_t i = 0; i < tris.size(); ++i) {
+        order[i] = static_cast<std::uint32_t>(i);
+        const auto& t = tris[i];
+        const std::array<float, 3> v0{t.v0_mat[0], t.v0_mat[1], t.v0_mat[2]};
+        const std::array<float, 3> v1{
+            v0[0] + t.e1_layer[0], v0[1] + t.e1_layer[1], v0[2] + t.e1_layer[2]
+        };
+        const std::array<float, 3> v2{
+            v0[0] + t.e2_flags[0], v0[1] + t.e2_flags[1], v0[2] + t.e2_flags[2]
+        };
+        for (int a = 0; a < 3; ++a) {
+            entries[i].bmin[a] = std::min({v0[a], v1[a], v2[a]}) - 1e-4f;
+            entries[i].bmax[a] = std::max({v0[a], v1[a], v2[a]}) + 1e-4f;
+            entries[i].centroid[a] = (v0[a] + v1[a] + v2[a]) * (1.0f / 3.0f);
+        }
+    }
+    nodes.reserve(tris.size() * 2);
+    nodes.emplace_back();
+    build_sah_bvh_recursive(nodes, order, entries, 0, 0, static_cast<std::uint32_t>(tris.size()));
+    std::vector<RtxTriangle> reordered(tris.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        reordered[i] = tris[order[i]];
+    }
+    tris = std::move(reordered);
+}
+
+// Nodes a ray may visit before its answer counts as unknown (rtx_trace.comp), by quality.
+int step_budget(renderer::RtxQuality quality) {
+    switch (quality) {
+        case renderer::RtxQuality::Performance:
+            return 192;
+        case renderer::RtxQuality::Quality:
+            return 1024;
+        default:
+            return 448;
     }
 }
 
@@ -306,6 +355,14 @@ void set_rtx_debug_view(RtxDebugView view) {
 }
 
 RtxPipeline::RtxPipeline() {
+    // OPENRAC_RTX_VIEW=N starts in debug view N (1 shadows, 2 AO, 3 reflections, 4 bounce,
+    // 5 the trace's step heat map), for hidden runs and screenshots.
+    if (const char* view = std::getenv("OPENRAC_RTX_VIEW")) {
+        const int n = std::atoi(view);
+        if (n > 0 && n < static_cast<int>(RtxDebugView::Count)) {
+            set_rtx_debug_view(static_cast<RtxDebugView>(n));
+        }
+    }
     m_metal_backend = create_metal_rtx_backend();
     m_cuda_backend = create_cuda_rtx_backend();
 
@@ -358,7 +415,6 @@ RtxHardwareBackend* RtxPipeline::select_hardware_backend(renderer::RtxBackend re
 }
 
 void RtxPipeline::upload(const scene::LevelData& level) {
-    m_static_triangles.clear();
     m_triangles.clear();
     m_nodes.clear();
     m_moby_meshes.clear();
@@ -442,7 +498,7 @@ void RtxPipeline::upload(const scene::LevelData& level) {
          {scene::Layer::Terrain, scene::Layer::Ties, scene::Layer::Shrubs}) {
         const auto& list = level.instances[static_cast<std::size_t>(layer)];
         for (const auto& inst : list) {
-            extract_instance(inst, layer, m_static_triangles);
+            extract_instance(inst, layer, m_triangles);
         }
     }
 
@@ -455,18 +511,15 @@ void RtxPipeline::upload(const scene::LevelData& level) {
         extract_instance(identity_inst, scene::Layer::Mobys, m_moby_meshes[m].local_triangles);
     }
 
-    m_triangles = m_static_triangles;
     build_bvh();
-    m_static_triangles = m_triangles;
-    m_static_nodes = m_nodes;
 }
 
 bool RtxPipeline::upload_triangles(std::span<const RtxTriangle> triangles, std::string& error) {
-    m_static_triangles.assign(triangles.begin(), triangles.end());
-    m_triangles = m_static_triangles;
-    build_bvh();
-    m_static_triangles = m_triangles;
-    m_static_nodes = m_nodes;
+    m_triangles.assign(triangles.begin(), triangles.end());
+    clear_dynamic();
+    build_tree(m_triangles, m_nodes);
+    m_static_dirty = true;
+    publish_counts();
     if (m_metal_backend && !m_metal_backend->upload_scene(m_triangles, m_nodes, error)) {
         return false;
     }
@@ -476,6 +529,25 @@ bool RtxPipeline::upload_triangles(std::span<const RtxTriangle> triangles, std::
     return true;
 }
 
+void RtxPipeline::clear_dynamic() {
+    if (!m_dynamic_triangles.empty() || !m_dynamic_nodes.empty()) {
+        m_dynamic_dirty = true;
+    }
+    m_dynamic_triangles.clear();
+    m_dynamic_nodes.clear();
+    m_dynamic_key = 0;
+}
+
+void RtxPipeline::publish_counts() {
+    std::lock_guard lock(g_rtx_mutex);
+    g_rtx_status.triangle_count = m_triangles.size() + m_dynamic_triangles.size();
+    g_rtx_status.node_count = m_nodes.size() + m_dynamic_nodes.size();
+    g_rtx_status.dynamic_instance_count = m_dynamic_instance_count;
+}
+
+// The mobys get a tree of their own, beside the level's static one: the static tree is built and
+// uploaded once a level, the mobys' (a few thousand triangles at most) only when one has moved.
+// Bind poses: animation does not reach the tree yet.
 void RtxPipeline::prepare_instances(
     scene::Layer layer, std::span<const scene::Instance> instances
 ) {
@@ -483,15 +555,33 @@ void RtxPipeline::prepare_instances(
         return;
     }
     m_dynamic_instance_count = instances.size();
-    {
-        std::lock_guard lock(g_rtx_mutex);
-        g_rtx_status.dynamic_instance_count = m_dynamic_instance_count;
-    }
     if (m_moby_meshes.empty()) {
+        publish_counts();
         return;
     }
 
-    constexpr std::size_t kMaxDynamicMobyTriangles = 2048;
+    // What the tree depends on: each instance's model and matrix. Unchanged, nothing is rebuilt.
+    std::uint64_t key = 1469598103934665603ull;
+    const auto mix = [&key](const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < size; ++i) {
+            key = (key ^ bytes[i]) * 1099511628211ull;
+        }
+    };
+    for (const auto& inst : instances) {
+        if (inst.stand_in || inst.lighting_only || inst.model >= m_moby_meshes.size()) {
+            continue;
+        }
+        mix(&inst.model, sizeof inst.model);
+        mix(inst.matrix.data(), sizeof(float) * 16);
+    }
+    if (key == m_dynamic_key && (m_dynamic_key != 0 || m_dynamic_triangles.empty())) {
+        publish_counts();
+        return;
+    }
+    m_dynamic_key = key;
+
+    constexpr std::size_t kMaxDynamicMobyTriangles = 8192;
     std::vector<RtxTriangle> dyn_tris;
     dyn_tris.reserve(std::min<std::size_t>(kMaxDynamicMobyTriangles, instances.size() * 64));
     for (const auto& inst : instances) {
@@ -535,150 +625,23 @@ void RtxPipeline::prepare_instances(
             dyn_tris.push_back(wt);
         }
     }
-
-    if (dyn_tris.empty()) {
-        if (m_triangles.size() != m_static_triangles.size()) {
-            m_triangles = m_static_triangles;
-            m_nodes = m_static_nodes;
-            m_gpu_scene_dirty = true;
-            std::lock_guard lock(g_rtx_mutex);
-            g_rtx_status.triangle_count = m_triangles.size();
-            g_rtx_status.node_count = m_nodes.size();
-        }
-        return;
-    }
-
-    // Build a fast SAH BVH over only the dynamic moby triangles, then merge with m_static_nodes.
-    std::vector<BvhBuildEntry> entries(dyn_tris.size());
-    std::vector<std::uint32_t> order(dyn_tris.size());
-    for (std::size_t i = 0; i < dyn_tris.size(); ++i) {
-        order[i] = static_cast<std::uint32_t>(i);
-        const auto& t = dyn_tris[i];
-        const std::array<float, 3> v0{t.v0_mat[0], t.v0_mat[1], t.v0_mat[2]};
-        const std::array<float, 3> v1{
-            v0[0] + t.e1_layer[0], v0[1] + t.e1_layer[1], v0[2] + t.e1_layer[2]
-        };
-        const std::array<float, 3> v2{
-            v0[0] + t.e2_flags[0], v0[1] + t.e2_flags[1], v0[2] + t.e2_flags[2]
-        };
-        for (int a = 0; a < 3; ++a) {
-            entries[i].bmin[a] = std::min({v0[a], v1[a], v2[a]}) - 1e-4f;
-            entries[i].bmax[a] = std::max({v0[a], v1[a], v2[a]}) + 1e-4f;
-            entries[i].centroid[a] = (v0[a] + v1[a] + v2[a]) * (1.0f / 3.0f);
-        }
-    }
-    std::vector<RtxBvhNode> dyn_nodes;
-    dyn_nodes.reserve(dyn_tris.size() * 2);
-    dyn_nodes.emplace_back();
-    build_sah_bvh_recursive(
-        dyn_nodes, order, entries, 0, 0, static_cast<std::uint32_t>(dyn_tris.size())
-    );
-    std::vector<RtxTriangle> reordered_dyn(dyn_tris.size());
-    for (std::size_t i = 0; i < order.size(); ++i) {
-        reordered_dyn[i] = dyn_tris[order[i]];
-    }
-
-    const std::int32_t static_tri_offset = static_cast<std::int32_t>(m_static_triangles.size());
-    m_triangles = m_static_triangles;
-    m_triangles.insert(m_triangles.end(), reordered_dyn.begin(), reordered_dyn.end());
-
-    if (m_static_nodes.empty()) {
-        m_nodes = std::move(dyn_nodes);
-    } else {
-        const std::int32_t S = static_cast<std::int32_t>(m_static_nodes.size());
-        const std::int32_t D = static_cast<std::int32_t>(dyn_nodes.size());
-        m_nodes.resize(static_cast<std::size_t>(1 + S + D));
-
-        // Node 0: combined root whose children are node 1 (static root) and node 2 (dynamic root).
-        RtxBvhNode root{};
-        for (int a = 0; a < 3; ++a) {
-            root.bbox_min[a] = std::min(m_static_nodes[0].bbox_min[a], dyn_nodes[0].bbox_min[a]);
-            root.bbox_max[a] = std::max(m_static_nodes[0].bbox_max[a], dyn_nodes[0].bbox_max[a]);
-        }
-        root.left_or_first = 1;
-        root.count = 0;
-        m_nodes[0] = root;
-
-        auto adjust_static = [](RtxBvhNode n) {
-            if (n.count == 0) {
-                n.left_or_first += 2;
-            }
-            return n;
-        };
-        auto adjust_dynamic = [S, static_tri_offset](RtxBvhNode n) {
-            if (n.count == 0) {
-                n.left_or_first += (S + 1);
-            } else {
-                const std::int32_t first = ~n.left_or_first;
-                n.left_or_first = ~(first + static_tri_offset);
-            }
-            return n;
-        };
-
-        m_nodes[1] = adjust_static(m_static_nodes[0]);
-        m_nodes[2] = adjust_dynamic(dyn_nodes[0]);
-        for (std::int32_t i = 1; i < S; ++i) {
-            m_nodes[static_cast<std::size_t>(i + 2)] =
-                adjust_static(m_static_nodes[static_cast<std::size_t>(i)]);
-        }
-        for (std::int32_t j = 1; j < D; ++j) {
-            m_nodes[static_cast<std::size_t>(j + S + 1)] =
-                adjust_dynamic(dyn_nodes[static_cast<std::size_t>(j)]);
-        }
-    }
-
-    m_gpu_scene_dirty = true;
-    std::lock_guard lock(g_rtx_mutex);
-    g_rtx_status.triangle_count = m_triangles.size();
-    g_rtx_status.node_count = m_nodes.size();
+    m_dynamic_triangles = std::move(dyn_tris);
+    build_tree(m_dynamic_triangles, m_dynamic_nodes);
+    m_dynamic_dirty = true;
+    publish_counts();
 }
 
 void RtxPipeline::build_bvh() {
-    m_nodes.clear();
-    if (!m_triangles.empty()) {
-        std::vector<BvhBuildEntry> entries(m_triangles.size());
-        std::vector<std::uint32_t> order(m_triangles.size());
-        for (std::size_t i = 0; i < m_triangles.size(); ++i) {
-            order[i] = static_cast<std::uint32_t>(i);
-            const auto& t = m_triangles[i];
-            const std::array<float, 3> v0{t.v0_mat[0], t.v0_mat[1], t.v0_mat[2]};
-            const std::array<float, 3> v1{
-                v0[0] + t.e1_layer[0], v0[1] + t.e1_layer[1], v0[2] + t.e1_layer[2]
-            };
-            const std::array<float, 3> v2{
-                v0[0] + t.e2_flags[0], v0[1] + t.e2_flags[1], v0[2] + t.e2_flags[2]
-            };
-            for (int a = 0; a < 3; ++a) {
-                entries[i].bmin[a] = std::min({v0[a], v1[a], v2[a]}) - 1e-4f;
-                entries[i].bmax[a] = std::max({v0[a], v1[a], v2[a]}) + 1e-4f;
-                entries[i].centroid[a] = (v0[a] + v1[a] + v2[a]) * (1.0f / 3.0f);
-            }
-        }
-        m_nodes.reserve(m_triangles.size() * 2);
-        m_nodes.emplace_back();
-        build_sah_bvh_recursive(
-            m_nodes, order, entries, 0, 0, static_cast<std::uint32_t>(m_triangles.size())
-        );
-
-        std::vector<RtxTriangle> reordered(m_triangles.size());
-        for (std::size_t i = 0; i < order.size(); ++i) {
-            reordered[i] = m_triangles[order[i]];
-        }
-        m_triangles = std::move(reordered);
-    }
-
+    clear_dynamic();
+    build_tree(m_triangles, m_nodes);
     std::string backend_error;
-    if (m_metal_backend) {
-        m_metal_backend->upload_scene(m_triangles, m_nodes, backend_error);
+    if (auto* hw = select_hardware_backend(renderer::RtxBackend::Auto)) {
+        if (!hw->upload_scene(m_triangles, m_nodes, backend_error)) {
+            log::warn("rtx: {}: {}", hw->device_name(), backend_error);
+        }
     }
-    if (m_cuda_backend) {
-        m_cuda_backend->upload_scene(m_triangles, m_nodes, backend_error);
-    }
-    m_gpu_scene_dirty = true;
-
-    std::lock_guard lock(g_rtx_mutex);
-    g_rtx_status.triangle_count = m_triangles.size();
-    g_rtx_status.node_count = m_nodes.size();
+    m_static_dirty = true;
+    publish_counts();
 }
 
 bool RtxPipeline::trace_rays(
@@ -689,17 +652,43 @@ bool RtxPipeline::trace_rays(
     if (rays.size() != hits.size()) {
         return false;
     }
-    if (auto* hw = select_hardware_backend(preferred)) {
-        std::string error;
-        if (hw->trace_rays(rays, hits, error)) {
-            return true;
+    // The hardware backends hold the static tree only: with mobys in the scene the CPU answers.
+    if (m_dynamic_triangles.empty()) {
+        if (auto* hw = select_hardware_backend(preferred)) {
+            std::string error;
+            if (hw->trace_rays(rays, hits, error)) {
+                return true;
+            }
         }
     }
+    const auto first_dynamic = static_cast<std::int32_t>(m_triangles.size());
     for (std::size_t i = 0; i < rays.size(); ++i) {
+        hits[i] = RtxHit{};
         trace_cpu_bvh(m_nodes, m_triangles, rays[i], hits[i]);
+        trace_cpu_bvh(m_dynamic_nodes, m_dynamic_triangles, rays[i], hits[i], first_dynamic);
     }
     return true;
 }
+
+namespace {
+
+// Uploads `data` (at least one element: a texel buffer may not be empty) into `buffer` and views
+// it as RGBA32F texels in `texture`.
+template <typename T>
+void upload_texels(unsigned buffer, unsigned texture, std::span<const T> data) {
+    const T dummy{};
+    glBindBuffer(wgl::GL_TEXTURE_BUFFER, buffer);
+    glBufferData(
+        wgl::GL_TEXTURE_BUFFER,
+        std::max<std::size_t>(1, data.size()) * sizeof(T),
+        data.empty() ? &dummy : data.data(),
+        GL_STATIC_DRAW
+    );
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, texture);
+    glTexBuffer(wgl::GL_TEXTURE_BUFFER, wgl::GL_RGBA32F, buffer);
+}
+
+}  // namespace
 
 void RtxPipeline::ensure_gpu_buffers() {
     if (!m_bvh_buffer) {
@@ -707,37 +696,32 @@ void RtxPipeline::ensure_gpu_buffers() {
         glGenTextures(1, &m_bvh_texture);
         glGenBuffers(1, &m_tri_buffer);
         glGenTextures(1, &m_tri_texture);
+        glGenBuffers(1, &m_dyn_bvh_buffer);
+        glGenTextures(1, &m_dyn_bvh_texture);
+        glGenBuffers(1, &m_dyn_tri_buffer);
+        glGenTextures(1, &m_dyn_tri_texture);
         glGenBuffers(1, &m_output_buffer);
         glGenTextures(1, &m_output_texture);
-        m_gpu_scene_dirty = true;
+        m_static_dirty = true;
+        m_dynamic_dirty = true;
     }
-    if (m_gpu_scene_dirty) {
-        const RtxBvhNode dummy_node{};
-        const RtxTriangle dummy_tri{};
-        glBindBuffer(wgl::GL_TEXTURE_BUFFER, m_bvh_buffer);
-        glBufferData(
-            wgl::GL_TEXTURE_BUFFER,
-            std::max<std::size_t>(1, m_nodes.size()) * sizeof(RtxBvhNode),
-            m_nodes.empty() ? &dummy_node : m_nodes.data(),
-            GL_STATIC_DRAW
-        );
-        glActiveTexture(GL_TEXTURE0 + 23);
-        glBindTexture(wgl::GL_TEXTURE_BUFFER, m_bvh_texture);
-        glTexBuffer(wgl::GL_TEXTURE_BUFFER, wgl::GL_RGBA32F, m_bvh_buffer);
-
-        glBindBuffer(wgl::GL_TEXTURE_BUFFER, m_tri_buffer);
-        glBufferData(
-            wgl::GL_TEXTURE_BUFFER,
-            std::max<std::size_t>(1, m_triangles.size()) * sizeof(RtxTriangle),
-            m_triangles.empty() ? &dummy_tri : m_triangles.data(),
-            GL_STATIC_DRAW
-        );
+    glActiveTexture(GL_TEXTURE0 + 23);
+    if (m_static_dirty) {
+        // The level's tree: once a level, megabytes.
+        upload_texels<RtxBvhNode>(m_bvh_buffer, m_bvh_texture, m_nodes);
         glActiveTexture(GL_TEXTURE0 + 24);
-        glBindTexture(wgl::GL_TEXTURE_BUFFER, m_tri_texture);
-        glTexBuffer(wgl::GL_TEXTURE_BUFFER, wgl::GL_RGBA32F, m_tri_buffer);
-        glActiveTexture(GL_TEXTURE0);
-        m_gpu_scene_dirty = false;
+        upload_texels<RtxTriangle>(m_tri_buffer, m_tri_texture, m_triangles);
+        m_static_dirty = false;
     }
+    if (m_dynamic_dirty) {
+        // The mobys' tree: when one moved, kilobytes.
+        glActiveTexture(GL_TEXTURE0 + 26);
+        upload_texels<RtxBvhNode>(m_dyn_bvh_buffer, m_dyn_bvh_texture, m_dynamic_nodes);
+        glActiveTexture(GL_TEXTURE0 + 27);
+        upload_texels<RtxTriangle>(m_dyn_tri_buffer, m_dyn_tri_texture, m_dynamic_triangles);
+        m_dynamic_dirty = false;
+    }
+    glActiveTexture(GL_TEXTURE0);
 }
 
 bool RtxPipeline::render(
@@ -750,21 +734,36 @@ bool RtxPipeline::render(
     std::string& error
 ) {
     m_ready = false;
+    // What runs is the GPU compute pass over the two trees (the native backends trace only
+    // tests' and bakes' batches): the status says that, not the backend chosen in the menu.
+    const char* runs = "GPU compute BVH";
     {
         std::lock_guard lock(g_rtx_mutex);
         g_rtx_status.active = input.rtx;
-        if (auto* hw = select_hardware_backend(input.rtx_settings.backend)) {
-            g_rtx_status.active_backend = hw->kind();
-            g_rtx_status.device_name = std::string(hw->device_name());
-        } else {
-            g_rtx_status.active_backend = renderer::RtxBackend::VulkanRayQuery;
-            g_rtx_status.device_name = g_rtx_status.vulkan_ray_query_supported
-                                           ? "Vulkan Hardware Ray Query"
-                                           : "Vulkan Compute BVH";
-        }
+        g_rtx_status.active_backend = renderer::RtxBackend::VulkanRayQuery;
+        g_rtx_status.device_name = runs;
     }
-    if (!input.rtx || m_compute_failed || !enhanced_rendering_available() || !glDispatchCompute
-        || !depth || target.width < 2 || target.height < 2) {
+    // Once a session, why tracing does not run, or that it does and how.
+    const auto why_not = [&](const char* reason) {
+        if (input.rtx && m_logged != reason) {
+            log::info("rtx: not tracing: {}", reason);
+            m_logged = reason;
+        }
+        return false;
+    };
+    if (!input.rtx) {
+        return false;
+    }
+    if (m_compute_failed) {
+        return why_not("its compute program failed to build");
+    }
+    if (!enhanced_rendering_available()) {
+        return why_not("enhanced rendering is off or this GL has none");
+    }
+    if (!glDispatchCompute) {
+        return why_not("this GL has no compute");
+    }
+    if (!depth || target.width < 2 || target.height < 2) {
         return false;
     }
 
@@ -806,6 +805,10 @@ bool RtxPipeline::render(
     glActiveTexture(GL_TEXTURE0 + 25);
     glBindTexture(wgl::GL_TEXTURE_BUFFER, m_output_texture);
     glTexBuffer(wgl::GL_TEXTURE_BUFFER, GL_RGBA8, m_output_buffer);
+    glActiveTexture(GL_TEXTURE0 + 26);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_dyn_bvh_texture);
+    glActiveTexture(GL_TEXTURE0 + 27);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_dyn_tri_texture);
 
     const auto& s = input.rtx_settings;
     const int flags = (s.shadows ? 1 : 0) | (s.ambient_occlusion ? 2 : 0)
@@ -846,6 +849,12 @@ bool RtxPipeline::render(
         m_compute.uniform("rtx_sky_colour"), sky_colour[0], sky_colour[1], sky_colour[2]
     );
     glUniform1i(m_compute.uniform("rtx_node_count"), static_cast<int>(m_nodes.size()));
+    glUniform1i(m_compute.uniform("rtx_dynamic_nodes"), 26);
+    glUniform1i(m_compute.uniform("rtx_dynamic_triangles"), 27);
+    glUniform1i(
+        m_compute.uniform("rtx_dynamic_node_count"), static_cast<int>(m_dynamic_nodes.size())
+    );
+    glUniform1i(m_compute.uniform("rtx_step_budget"), step_budget(s.quality));
     glUniform1i(m_compute.uniform("rtx_samples_per_pixel"), std::clamp(quality_spp, 1, 8));
     glUniform1i(m_compute.uniform("rtx_flags"), flags);
     glUniform1i(m_compute.uniform("rtx_frame_index"), static_cast<int>(input.frame));
@@ -884,6 +893,11 @@ bool RtxPipeline::render(
     m_ready = true;
     glBindTexture(GL_TEXTURE_2D, 0);
     stats::gauge("rtx ray tracing cells", static_cast<double>(cells));
+    if (m_logged != runs) {
+        log::info("rtx: tracing {}x{} cells on {}, {} static and {} moby triangles",
+                  cells_w, cells_h, runs, m_triangles.size(), m_dynamic_triangles.size());
+        m_logged = runs;
+    }
     return true;
 }
 
@@ -955,6 +969,18 @@ void RtxPipeline::release() {
     if (m_output_texture) {
         glDeleteTextures(1, &m_output_texture);
         m_output_texture = 0;
+    }
+    for (unsigned* buffer : {&m_dyn_bvh_buffer, &m_dyn_tri_buffer}) {
+        if (*buffer) {
+            glDeleteBuffers(1, buffer);
+            *buffer = 0;
+        }
+    }
+    for (unsigned* texture : {&m_dyn_bvh_texture, &m_dyn_tri_texture}) {
+        if (*texture) {
+            glDeleteTextures(1, texture);
+            *texture = 0;
+        }
     }
     m_width = m_height = 0;
     m_ready = false;
