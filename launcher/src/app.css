@@ -1,0 +1,1242 @@
+/*
+ * The launcher's look, taken from the OpenRAC website (OpenRAC/openrac-site:
+ * src/app/globals.css for the colours and type, src/components/Header.tsx for
+ * the orange bar, src/components/Progress.tsx for the game cards). The tokens
+ * keep the site's names; docs/STYLE.md lists them and says what to keep in
+ * step when the site changes.
+ */
+
+:root {
+  /* The site's @theme colours. */
+  --ink: #1c1a16;
+  --ink-deep: #14120e;
+  /* Cards and panels: a flat --panel (hover or open: --panel-hi), no border. */
+  --panel: #24221e;
+  --panel-hi: #2c2a26;
+  /* The game list beside the page and Android's rail: darker than the page, but not black; a
+     theme with a black of its own (OLED) sets its own. */
+  --rail: #161410;
+  /* Big surfaces are flat (stripes there tire the eyes; user decision): only the bar's buttons
+     wear stripes. */
+  --card: var(--panel);
+  --card-hi: var(--panel-hi);
+  --brand: #d6a020;
+  --amber: #f5c040;
+  --gold: #ffe08f;
+  --lav: #d4d4de;
+  --soft: #b4b4bf;
+  --dim: #8b8b98;
+  /* Thin lines only split things (rows of a list, a bar from the page): nothing has a frame. */
+  --line: rgb(255 255 255 / 0.09);
+  --line-strong: rgb(255 255 255 / 0.16);
+  /* Body text and headings, neutral rather than blue, so the gold is the only accent. */
+  --text: #e6e6eb;
+  --body: #cacad3;
+  /* The header bar's gradient and the dark brown it writes on. */
+  --bar-top: #e5a013;
+  --bar-bottom: #cd8300;
+  --bar-stripe: #c99222;
+  --bar-stripe-alt: #bd8619;
+  --bar-ink: #2a1800;
+  --bar-ink-deep: #1b1206;
+  /* The logo on the bar. */
+  --bar-name: #000;
+  /* Text on a game's own colours or picture: a card's title, the disc switch, a name on Android's
+     game strip. */
+  --on-game: #fff;
+  /* Kept for the themes (palettes.json); fields have no edge now, a fill sets them apart. */
+  --line-field: rgb(255 255 255 / 0.3);
+  /* Control fills (STYLE.md, "Control fills"): one step lighter than what is behind them, no navy and no edge.
+     On the page (#1c1a16) a control is #24221e; on a card (#24221e) it is #2e2c28. A card sets
+     --control from the card pair; a theme (palettes.json) sets both pairs. */
+  --control: #24221e;
+  --control-hi: #2e2c28;
+  --control-card: #2e2c28;
+  --control-card-hi: #363430;
+  /* A game's own coal, worn with Game colours on (the rule under @property --gold): the launcher's
+     own until a game's accent sets it (palettes.json game_colors). */
+  --tint-panel: #24221e;
+  --tint-panel-hi: #2c2a26;
+  --tint-control: #24221e;
+  --tint-control-hi: #2e2c28;
+  --tint-control-card: #2e2c28;
+  --tint-control-card-hi: #363430;
+  /* The light under the bar (the rule on body::after): the picked game's colour (palettes.json
+     accents), the gold for Ratchet & Clank. Every game wears the launcher's own colours. */
+  --glow: #f5c040;
+  /* On or picked: a gold tint on the page's black, with gold text. */
+  --on-fill: color-mix(in srgb, var(--amber) 22%, var(--ink));
+  --on-fill-hi: color-mix(in srgb, var(--amber) 28%, var(--ink));
+  /* The bar's buttons: the bar's stripes continued in coal, laid on the window so they line up. */
+  --coal-stripes: repeating-linear-gradient(35deg, #181818 0 20px, #121212 20px 40px) fixed;
+  --coal-stripes-hi: repeating-linear-gradient(35deg, #252525 0 20px, #1f1f1f 20px 40px) fixed;
+  /* States. The site has none; these sit with its palette. */
+  --ok: #8fd694;
+  /* Its own amber, not var(--amber), which a theme could one day change. */
+  --warn: #f5c040;
+  --err: #ff8a7a;
+  --info: var(--lav);
+
+  --font-sans: "Inter Variable", system-ui, sans-serif;
+  --font-brand: "Audiowide", "Inter Variable", sans-serif;
+  --font-head: "Orbitron Variable", "Inter Variable", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* Cards, panels, pictures and dialogs; buttons, fields, chips and tabs; badges in text. */
+  --radius: 12px;
+  --radius-sm: 6px;
+  --radius-xs: 4px;
+  --shadow: 0 18px 50px rgb(0 0 0 / 0.45);
+  --shadow-sm: 0 8px 24px rgb(0 0 0 / 0.35);
+
+  /* Motion: one curve for what arrives and settles, and three lengths. */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --fast: 0.15s;
+  --medium: 0.28s;
+  --slow: 0.5s;
+
+  /* A page's margins, the space between its sections and its width (--page-x, --page-top,
+     --page-bottom, --page-gap, --page-max) are each page's own on a desktop, its fallback values;
+     a narrow window and Android set them below, the same on every page. */
+  /* What the navigation takes of the window: the header bar on top, or on Android the rail on
+     the left or the bar at the bottom (Header.svelte). */
+  --nav-top: 50px;
+  --nav-left: 0px;
+  --nav-bottom: 0px;
+  color-scheme: dark;
+}
+
+/* The picked game's colours as colours, so that they ease from one game's to the next (App.svelte)
+   rather than jump: its light, and with Game colours on its bar and gold. */
+@property --glow {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #f5c040;
+}
+
+@property --bar-top {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #e5a013;
+}
+
+@property --bar-bottom {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #cd8300;
+}
+
+@property --bar-stripe {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #c99222;
+}
+
+@property --bar-stripe-alt {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #bd8619;
+}
+
+@property --amber {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #f5c040;
+}
+
+@property --gold {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #ffe08f;
+}
+
+html {
+  transition:
+    --glow var(--slow) var(--ease),
+    --bar-top var(--slow) var(--ease),
+    --bar-bottom var(--slow) var(--ease),
+    --bar-stripe var(--slow) var(--ease),
+    --bar-stripe-alt var(--slow) var(--ease),
+    --amber var(--slow) var(--ease),
+    --gold var(--slow) var(--ease);
+}
+
+/* Game colours on (Settings, General): the launcher's own theme wears the picked game's coal too
+   (--tint-*, themes.ts); another theme keeps its own surfaces. */
+html[data-game-colors]:not([data-theme]),
+html[data-game-colors][data-theme="openrac"] {
+  --panel: var(--tint-panel);
+  --panel-hi: var(--tint-panel-hi);
+  --control: var(--tint-control);
+  --control-hi: var(--tint-control-hi);
+  --control-card: var(--tint-control-card);
+  --control-card-hi: var(--tint-control-card-hi);
+}
+
+/* The light under the bar: the picked game's colour, soft, on the window's background (screen
+   blend, so it only lightens). The page starts lit and darkens downwards, as under a lamp; on every
+   theme, OLED too. It lies under the page, not over its buttons, so a page sliding in (motion.ts)
+   is lit the same during the slide as after it. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: var(--nav-top) 0 0 var(--nav-left);
+  z-index: -1;
+  pointer-events: none;
+  mix-blend-mode: screen;
+  background:
+    radial-gradient(90% 620px at 50% 0, color-mix(in srgb, var(--glow) 13%, transparent), transparent 72%),
+    radial-gradient(60% 380px at 50% 0, color-mix(in srgb, var(--glow) 7%, transparent), transparent 70%);
+}
+
+/* While the launcher starts (main.ts, App.svelte), its accent goes on at once, not eased in. */
+html[data-starting] {
+  transition: none;
+}
+
+@media (max-width: 600px) {
+  :root {
+    --page-x: 16px;
+    --page-top: 16px;
+    --page-gap: 16px;
+  }
+}
+
+/* Android: Material's margins (24 dp beside the content, 16 on a phone held upright), and the
+   navigation as its apps have it: a rail on the left, or a bar at the bottom when the window is
+   narrow. */
+html[data-platform="android"] {
+  --page-x: 24px;
+  --page-top: 20px;
+  --page-bottom: 32px;
+  --page-gap: 16px;
+  /* One width for every page, so that a page's edge stays put from tab to tab (a desktop's pages
+     each keep their own, the fallback of --page-max). */
+  --page-max: 960px;
+  --nav-top: 0px;
+  --nav-left: 80px;
+}
+
+@media (max-width: 599px) {
+  html[data-platform="android"] {
+    --page-x: 16px;
+    --page-top: 16px;
+    --nav-left: 0px;
+    --nav-bottom: 80px;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  /* No blue flash on a tap (Android's WebView): a press shows in the launcher's own colours. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The system's text size (1rem) is kept: every size is in rem, so a player who reads larger has it. */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* Avoid root rem units: WebKit shrinks them while inherited colours animate between games.
+   Percentages keep the system's text size as the reference. */
+/* Only the root has the background: one on body would cover the light under the bar (body::after). */
+html {
+  font: 93.75%/1.55 var(--font-sans);
+  background: var(--ink);
+}
+
+body {
+  font: 0.9375rem/1.55 var(--font-sans);
+}
+
+#app {
+  height: 100%;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-head);
+  color: var(--gold);
+  margin: 0;
+  letter-spacing: 0.01em;
+  text-wrap: balance;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--amber) 38%, transparent);
+  color: var(--text);
+}
+
+input,
+textarea {
+  caret-color: var(--amber);
+}
+
+::placeholder {
+  color: var(--dim);
+  opacity: 1;
+}
+
+h1 {
+  font-size: 1.625rem;
+}
+
+h2 {
+  font-size: 1.125rem;
+}
+
+h3 {
+  font-size: 0.9375rem;
+  color: var(--text);
+}
+
+p {
+  margin: 0;
+  text-wrap: pretty;
+}
+
+a {
+  color: var(--amber);
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.7812rem;
+}
+
+.muted {
+  color: var(--soft);
+}
+
+.dim {
+  color: var(--dim);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.clip {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Section numbers, as on the site: 01, 02, ... */
+.sections {
+  counter-reset: sec;
+}
+
+.sec-num {
+  font-family: var(--font-head);
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--brand);
+  letter-spacing: 0.2em;
+}
+
+.sec-num::before {
+  counter-increment: sec;
+  content: "0" counter(sec);
+}
+
+.panel {
+  /* No frame: its fill, a little lighter than the page, sets it apart. */
+  background: var(--card);
+  --control: var(--control-card);
+  --control-hi: var(--control-card-hi);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+}
+
+@media (max-width: 600px) {
+  .panel {
+    padding: 16px;
+  }
+}
+
+/* Buttons: a fill and no border, 6 px corners, at least 40 px tall (a fair target for a thumb).
+   The primary one is a flat gold fill with dark text. */
+button,
+.button {
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 0;
+  background: var(--control);
+  /* The gold edge, drawn inside so it takes no room. */
+  color: var(--text);
+  min-height: 40px;
+  padding: 8px 16px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  transition:
+    background var(--fast),
+    color var(--fast),
+    filter var(--fast),
+    box-shadow var(--fast),
+    transform var(--fast) var(--ease);
+}
+
+/* On or picked (a filter in use, a choice made): a gold tint and gold text; the edge stays. */
+button[aria-pressed="true"],
+button[data-on] {
+  background: var(--on-fill);
+  color: var(--amber);
+}
+
+/* Under the pointer a button gets a little lighter; the main one lifts 2 px. */
+@media (hover: hover) {
+  html:where(:not([data-input="pad"])) button:hover:not(:disabled),
+  html:where(:not([data-input="pad"])) .button:hover {
+    background-color: var(--control-hi);
+  }
+
+  html:where(:not([data-input="pad"])) button.primary:hover:not(:disabled),
+  html:where(:not([data-input="pad"])) .button.primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.4);
+  }
+
+  html:where(:not([data-input="pad"])) button[aria-pressed="true"]:hover:not(:disabled),
+  html:where(:not([data-input="pad"])) button[data-on]:hover:not(:disabled) {
+    background-color: var(--on-fill-hi);
+  }
+}
+
+button:disabled,
+button[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Read out, not shown: what a mark on its own says (a dot for a crash, for an update). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* With a controller (src/lib/pad.ts) the focus is where A presses: always drawn, a little bolder
+   than a picked control's own ring (a theme, a game) so the two are told apart, and scrolled to
+   with room around it, so that its ring is not cut by the edge of what scrolls. The pointer's
+   hover is not drawn meanwhile (each :hover rule is under html:not([data-input="pad"])): a
+   mouse standing still over one control lit it beside the focus on another. */
+html[data-input="pad"] :focus {
+  outline: 3px solid var(--amber);
+  outline-offset: 3px;
+  scroll-margin: 20px;
+  scroll-margin-bottom: calc(20px + var(--pad-aside, 0px));
+}
+
+/* iOS keeps an explicit controller target even when WebKit declines DOM focus. White stays
+   visible on every game's accent; the dark border separates it from the selected game's ring. */
+html[data-platform="ios"][data-input="pad"] :focus:not([data-pad-focus]) {
+  outline: none;
+}
+
+html[data-platform="ios"][data-input="pad"] [data-pad-focus] {
+  outline: 4px solid var(--on-game);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 8px var(--ink-deep);
+  scroll-margin: 20px;
+  scroll-margin-bottom: calc(20px + var(--pad-aside, 0px));
+}
+
+/* A press dims the button and pushes it in a little (a controller's A too, pad.ts); on a touch
+   screen that is all it shows, as hover styles apply only where there is a pointer that hovers. */
+button:active:not(:disabled),
+.button:active,
+button.pad-press:not(:disabled),
+.button.pad-press {
+  filter: brightness(0.88);
+  transform: scale(0.97);
+}
+
+/* The one main action of a page: a flat fill in the accent, dark text. */
+button.primary,
+.button.primary {
+  background: var(--amber);
+  box-shadow: none;
+  color: var(--bar-ink-deep);
+}
+
+@media (hover: hover) {
+  html:where(:not([data-input="pad"])) button.primary:hover:not(:disabled),
+  html:where(:not([data-input="pad"])) .button.primary:hover {
+    background-color: var(--gold);
+    box-shadow: none;
+  }
+}
+
+/* A quiet button beside a main one: no fill until hovered. */
+button.ghost {
+  background: transparent;
+  box-shadow: none;
+  color: var(--soft);
+}
+
+@media (hover: hover) {
+  html:where(:not([data-input="pad"])) button.ghost:hover:not(:disabled) {
+    background: var(--control);
+    color: var(--text);
+  }
+}
+
+button.small {
+  font-size: 0.8125rem;
+  padding: 6px 12px;
+}
+
+/* Fields: as round as a button, a fill and no border, a 2 px gold ring inside on focus. */
+input[type="text"],
+input[type="search"],
+input[type="number"],
+input[type="url"],
+textarea,
+select {
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--text);
+  background-color: var(--control);
+  border: 0;
+  border-radius: var(--radius-sm);
+  transition:
+    background-color var(--fast),
+    box-shadow var(--fast);
+}
+
+input[type="text"],
+input[type="search"] {
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 12px;
+}
+
+:is(input[type="text"], input[type="search"], input[type="number"], input[type="url"], textarea, select):focus-visible,
+html[data-input="pad"]
+  :is(input[type="text"], input[type="search"], input[type="number"], input[type="url"], textarea, select):focus {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--amber);
+}
+
+:is(input, textarea)[aria-invalid="true"] {
+  box-shadow: inset 0 0 0 2px var(--err);
+}
+
+@media (hover: hover) {
+  html:where(:not([data-input="pad"])) input[type="text"]:hover:not(:focus):not(:disabled),
+  html:where(:not([data-input="pad"])) input[type="search"]:hover:not(:focus):not(:disabled),
+  html:where(:not([data-input="pad"])) input[type="number"]:hover:not(:focus):not(:disabled),
+  html:where(:not([data-input="pad"])) textarea:hover:not(:focus):not(:disabled),
+  html:where(:not([data-input="pad"])) select:hover:not(:focus):not(:disabled) {
+    background-color: var(--control-hi);
+  }
+}
+
+/* A dropdown: the same field with its own arrow. */
+select {
+  appearance: none;
+  cursor: pointer;
+  min-height: 40px;
+  padding: 8px 34px 8px 12px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='m4 6 4 4 4-4' fill='none' stroke='%238b8b98' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 14px;
+}
+
+select option {
+  background: var(--panel);
+  --control: var(--control-card);
+  --control-hi: var(--control-card-hi);
+}
+
+/* A search field is a text field: no system look (WebKit's rounded white box, Chromium's clear
+   button) beside the launcher's own fields. */
+input[type="search"] {
+  appearance: none;
+}
+
+input[type="search"]::-webkit-search-decoration,
+input[type="search"]::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+/* Settings (Settings.svelte, GpuDrivers.svelte): a row per setting, its name and at most a line
+   about it on the left, its control on the right, as Android's and the desktop systems' own
+   settings are laid out. */
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 56px;
+  padding: 10px 0;
+}
+
+.setting + .setting {
+  border-top: 1px solid var(--line);
+}
+
+label.setting {
+  cursor: pointer;
+}
+
+.setting > .text {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting strong {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.setting small {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.8125rem;
+  color: var(--soft);
+}
+
+/* An on/off setting: a checkbox drawn as a switch. */
+input.switch {
+  appearance: none;
+  flex: none;
+  position: relative;
+  width: 42px;
+  height: 24px;
+  margin: 0;
+  border-radius: 999px;
+  /* A track, as the site's progress tracks: the darkest black, no edge. */
+  background: var(--ink-deep);
+  border: 0;
+  cursor: pointer;
+  transition: background var(--fast) var(--ease);
+}
+
+input.switch::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--dim);
+  transition:
+    transform var(--medium) var(--ease),
+    background var(--fast) var(--ease);
+}
+
+/* On: the gold tint of a control that is on, its knob in the accent; the edge stays. A row of
+   switches that are on reads calm, not as a wall of solid gold. */
+input.switch:checked {
+  background: var(--on-fill);
+}
+
+input.switch:checked::before {
+  transform: translateX(18px);
+  background: var(--amber);
+}
+
+input.switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* One of a few choices, side by side: the chosen one filled. */
+.segmented {
+  flex: none;
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--control);
+}
+
+.segmented button {
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  box-shadow: none;
+  color: var(--soft);
+  font-size: 0.8125rem;
+  min-height: 36px;
+  padding: 5px 14px;
+}
+
+.segmented button[aria-checked="true"] {
+  background: var(--on-fill);
+  color: var(--amber);
+}
+
+@media (hover: hover) {
+  html:where(:not([data-input="pad"])) .segmented button:hover:not(:disabled) {
+    color: var(--text);
+  }
+}
+
+/* What most players never change, folded away (Settings, "Advanced"). */
+details.more > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: var(--radius-sm);
+}
+
+details.more > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.more > summary::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  border-right: 2px solid var(--soft);
+  border-bottom: 2px solid var(--soft);
+  transform: rotate(45deg);
+  transition: transform var(--medium) var(--ease);
+}
+
+details.more[open] > summary::after {
+  transform: rotate(225deg);
+}
+
+details.more > summary:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 4px;
+}
+
+details.more[open] > :not(summary) {
+  animation: rise var(--medium) var(--ease) both;
+}
+
+/* Steps (Mods: the level editor, models and textures): numbered rows with a rule between them,
+   the text on the left and the step's controls in a column of their own on the right. */
+ol.steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+ol.steps > li {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 14px 0;
+  counter-increment: step;
+}
+
+ol.steps > li + li {
+  border-top: 1px solid var(--line);
+}
+
+ol.steps > li::before {
+  content: counter(step);
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--control);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--soft);
+}
+
+ol.steps h3 {
+  font-family: var(--font-sans);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+ol.steps p {
+  margin: 2px 0 0;
+  font-size: 0.875rem;
+}
+
+ol.steps .controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+ol.steps .controls button {
+  min-width: 150px;
+  justify-content: center;
+}
+
+ol.steps .span {
+  grid-column: 2 / -1;
+}
+
+@media (max-width: 900px) {
+  ol.steps > li {
+    grid-template-columns: 26px minmax(0, 1fr);
+  }
+
+  ol.steps .controls {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+}
+
+/* Status badges: a dot and a word on a tint of their colour, no border. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--soft);
+  white-space: nowrap;
+}
+
+.pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pill.ok {
+  color: var(--ok);
+}
+
+.pill.warn {
+  color: var(--warn);
+}
+
+.pill.err {
+  color: var(--err);
+}
+
+.pill.info {
+  color: var(--info);
+}
+
+/* The site's progress bar: a gradient fill with a light sweeping across it. */
+.bar {
+  display: flex;
+  height: 14px;
+  overflow: hidden;
+  border-radius: 7px;
+  background: var(--ink-deep);
+}
+
+.bar > i {
+  position: relative;
+  display: block;
+  flex: none;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 6px;
+  background: linear-gradient(to right, var(--tx2, var(--brand)), var(--tx, var(--amber)));
+  transition: width 1.4s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.bar > i::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to right, transparent, rgb(255 255 255 / 0.45), transparent);
+  transform: translateX(-100%);
+  /* A few shines when the bar shows, then it rests. */
+  animation: sweep 2.6s ease-in-out 1.6s 3;
+}
+
+/* Functional C after the matched part: stripes of the game's colour, muted, since it is not
+   progress (ByteMatch's hatching under its Code bar). */
+.bar > b.functional {
+  display: block;
+  flex: none;
+  height: 100%;
+  margin-left: -6px; /* tucked under the matched part's rounded end */
+  padding-left: 6px;
+  box-sizing: content-box;
+  border-radius: 0 6px 6px 0;
+  opacity: 0.85;
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--tx2, var(--brand)) 70%, transparent) 0 4px,
+    color-mix(in srgb, var(--tx2, var(--brand)) 22%, transparent) 4px 8px
+  );
+  transition: width 1.4s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.bar > b.functional.alone {
+  margin-left: 0;
+  padding-left: 0;
+  border-radius: 6px;
+}
+
+@keyframes sweep {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: rise 0.6s var(--ease) both;
+}
+
+/* One page, or the game on it, gives way to the next (motion.ts's slide). Only the page moves:
+   the bar or the rail stays live, its highlight sliding to the tab pressed, and so does the game
+   list beside the page (SideFrame), unless the next page has none. */
+main {
+  view-transition-name: page;
+}
+
+::view-transition-old(root),
+::view-transition-new(root),
+::view-transition-group(side),
+::view-transition-image-pair(side),
+::view-transition-old(side),
+::view-transition-new(side) {
+  animation: none;
+}
+
+::view-transition-old(side):only-child {
+  animation: page-fade 0.2s ease-in both;
+}
+
+::view-transition-new(side):only-child {
+  animation: page-fade 0.3s var(--ease) reverse both;
+}
+
+/* Which way: the tabs of the bar go sideways, those of Android's rail and the games of the list
+   up and down. */
+html[data-nav="forward"] {
+  --page-in: 48px 0;
+  --page-out: -28px 0;
+}
+
+html[data-nav="back"] {
+  --page-in: -48px 0;
+  --page-out: 28px 0;
+}
+
+html[data-platform="android"][data-nav="forward"],
+html[data-nav="down"] {
+  --page-in: 0 48px;
+  --page-out: 0 -28px;
+}
+
+html[data-platform="android"][data-nav="back"],
+html[data-nav="up"] {
+  --page-in: 0 -48px;
+  --page-out: 0 28px;
+}
+
+html[data-nav="down"],
+html[data-nav="up"] {
+  --page-in-time: 0.32s;
+}
+
+::view-transition-old(page) {
+  animation: page-out 0.14s ease-in both;
+}
+
+::view-transition-new(page) {
+  animation: page-in var(--page-in-time, 0.38s) var(--ease) both;
+}
+
+@keyframes page-out {
+  to {
+    opacity: 0;
+    translate: var(--page-out, 0);
+  }
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    translate: var(--page-in, 0);
+  }
+}
+
+@keyframes page-fade {
+  to {
+    opacity: 0;
+  }
+}
+
+/* A page's sections arrive one after another when it opens. */
+.page > :is(section, .panel, h1):not(.rise) {
+  animation: rise var(--slow) var(--ease) both;
+}
+
+.page > :nth-child(2) {
+  animation-delay: 40ms;
+}
+
+.page > :nth-child(3) {
+  animation-delay: 80ms;
+}
+
+.page > :nth-child(4) {
+  animation-delay: 120ms;
+}
+
+.page > :nth-child(5) {
+  animation-delay: 160ms;
+}
+
+.page > :nth-child(n + 6) {
+  animation-delay: 200ms;
+}
+
+/* Where the page slides in whole (the view transition above), its sections and game tiles come
+   with it rather than rising again after it, which showed as each one popping in. */
+html[data-motion="slides"] :is(.page > :is(section, .panel, h1), .tile.rise) {
+  animation: none;
+}
+
+/* Android's touch feedback (src/lib/ripple.ts): a wave from the finger, inside the control. */
+.ripples {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.ripple {
+  position: absolute;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.2;
+  transform: translate(-50%, -50%) scale(0);
+  animation: ripple 0.5s var(--ease) forwards;
+}
+
+@keyframes ripple {
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  animation: spin 0.8s linear infinite;
+  flex: none;
+}
+
+/* A thin bar for work under way (ModPage's bake, AddMod's file): filled to its share, or a
+   slice sliding along it while the end is not known. JobProgress draws its own, larger one. */
+.track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.track i {
+  display: block;
+  height: 100%;
+  background: var(--amber);
+  box-shadow: none;
+  transition: width var(--fast) var(--ease);
+}
+
+.track i.moving {
+  width: 30%;
+  animation: track-slide 1.4s var(--ease) infinite;
+}
+
+@keyframes track-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 10px;
+  border: 2px solid var(--ink);
+}
+
+/* A touch screen scrolls by dragging, and Android's own apps show no bars: these styled bars,
+   which the WebView draws all the time, read there as stray strips at a panel's edge. */
+html[data-platform="android"] ::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+html[data-platform="android"] * {
+  scrollbar-width: none;
+}
+
+/* Android's WebView flickers under a blurred backdrop (main.ts): the panels stay translucent. */
+html[data-platform="android"] * {
+  backdrop-filter: none !important;
+}
+
+/* An app's controls are not text to select: a drag or a long press over a button or a label
+   selects nothing, as in a desktop app or Android's own. What is text to copy (fields, paths,
+   logs) still is, unless it is on a button. */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+:is(input, textarea, pre, code, .mono, .selectable):not(button, button *) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* A finger needs 44 px (Material's 48 dp less the space around): every button and field keeps
+   its look and grows to that height, so they all stay the same height. */
+html[data-platform="android"] :is(button, input:not([type="checkbox"], [type="radio"], [type="range"]), select) {
+  min-height: 44px;
+}
+
+/* A segmented choice's strip is the control: it is 44 px, its values 40 px inside it. */
+html[data-platform="android"] .segmented button {
+  min-height: 40px;
+}
+
+/* 16 px text in a field on Android, so the WebView does not zoom in on focus. */
+html[data-platform="android"] :is(input[type="text"], input[type="search"], input[type="number"], textarea, select) {
+  font-size: 1rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* Still says it is working, without anything sliding: the spinner turns slowly, and a bar
+     whose end is not known (JobProgress, Activity, the update) fills its track and fades in and
+     out, rather than standing still at a third as if a third were done. */
+  .spinner {
+    animation: spin 2.4s linear infinite !important;
+  }
+
+  .track i.moving,
+  .progress-fill.indeterminate {
+    width: 100% !important;
+    transform: none !important;
+    animation: breathe 1.6s ease-in-out infinite alternate !important;
+  }
+}
+
+@keyframes breathe {
+  to {
+    opacity: 0.4;
+  }
+}
+
+/* A row's grip, dragged to move it in its list (lib/dragSort.ts: My mods' gameplay mods and packs). */
+[data-grip] {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  margin-right: -2px;
+  color: var(--dim);
+  cursor: grab;
+  touch-action: none;
+}
+@media (hover: hover) {
+  html:where(:not([data-input="pad"])) [data-grip]:hover {
+    color: var(--soft);
+  }
+}
+.dragging {
+  position: relative;
+  z-index: 2;
+  background: var(--card-hi);
+  --control: var(--control-card);
+  --control-hi: var(--control-card-hi);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+  cursor: grabbing;
+}
+.dragging [data-grip] {
+  cursor: grabbing;
+  color: var(--amber);
+}
+.drop-above {
+  box-shadow: inset 0 2px 0 var(--amber);
+}
+.drop-below {
+  box-shadow: inset 0 -2px 0 var(--amber);
+}

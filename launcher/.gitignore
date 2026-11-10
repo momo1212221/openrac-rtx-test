@@ -1,0 +1,16 @@
+# Dependencies and build output
+node_modules/
+# Yarn's record of the last install on this machine
+.yarn/install-state.gz
+.yarn/cache/
+dist/
+target/
+.svelte-check/
+# Tauri writes these when it builds. Its Android project is kept (OpenRAC's Kotlin, the game's
+# activity, the build settings); what a build puts into it is ignored by its own .gitignore files.
+src-tauri/gen/*
+!src-tauri/gen/android/
+# Updater signing keys
+*.key
+*.key.pub
+updater.key

@@ -1,0 +1,555 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 the OpenRAC contributors
+ *
+ * The contract between a game's translated C and the port's runtime.
+ *
+ * The port keeps the game's memory where the game expects it: one 4 GB
+ * reservation whose offsets are the PlayStation 2's own addresses. A pointer
+ * in the game is a 32-bit offset into it (gaddr), the way OpenGOAL keeps
+ * Jak's pointers ("OpenGOAL offsets", docs/port/DESIGN.md). Structures keep
+ * their console layout, globals stay at their retail addresses, and an
+ * address the game computes (an absolute address, a global plus an offset,
+ * an uncached alias) means what it meant on the console.
+ *
+ * port/tools/hostgen writes C against this header: every pointer becomes a
+ * gaddr, every access through one goes through G(), and a call through a
+ * function pointer goes through GFN(). Hand-written host code uses the same
+ * macros. This header is C (C11 with the GNU extensions both GCC and Clang
+ * have), so the generated code is compiled as C, and C++ includes it too.
+ */
+#ifndef OPENRAC_GUEST_H
+#define OPENRAC_GUEST_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* An address in game memory: what a pointer is in the game. */
+typedef uint32_t gaddr;
+
+/* The game's 128-bit integer (gcc's mode(TI)): quadword copies and MMI. */
+__extension__ typedef __int128 openrac_s128;
+__extension__ typedef unsigned __int128 openrac_u128;
+
+/* ---- The memory map, in game addresses ----
+ *
+ * Main RAM and its two uncached aliases share one set of pages, as on the
+ * console. The scratchpad is the EE's 16 KB of fast memory. The register
+ * pages are plain memory: the port never models the hardware behind them;
+ * where the game hands work to the hardware (a DMA send, a vsync wait), the
+ * runtime's replacement of that library call takes over. The port's own
+ * region holds what translated code needs that the console kept elsewhere
+ * (locals whose address is taken, string literals). Everything else in the
+ * reservation is inaccessible, so a stray access stops with its address. */
+#define GUEST_RAM 0x00000000u
+#define GUEST_RAM_SIZE 0x02000000u /* 32 MB */
+#define GUEST_RAM_EXPANDED_SIZE 0x10000000u /* modded arena for virtual streams */
+#define GUEST_RAM_UNCACHED 0x20000000u
+#define GUEST_RAM_UNCACHED_ACCEL 0x30000000u
+#define GUEST_EE_REGS 0x10000000u
+#define GUEST_EE_REGS_SIZE 0x00010000u
+#define GUEST_VU_MEM 0x11000000u
+#define GUEST_VU_MEM_SIZE 0x00010000u
+#define GUEST_GS_REGS 0x12000000u
+#define GUEST_GS_REGS_SIZE 0x00002000u
+#define GUEST_SCRATCHPAD 0x70000000u
+#define GUEST_SCRATCHPAD_SIZE 0x00004000u /* 16 KB */
+#define GUEST_PORT 0xE0000000u
+#define GUEST_PORT_SIZE 0x01000000u /* 16 MB */
+#define GUEST_STACK_TOP (GUEST_PORT + 0x00100000u)
+#define GUEST_STACK_BOTTOM GUEST_PORT
+#define GUEST_STRINGS (GUEST_PORT + 0x00100000u)
+#define GUEST_STRINGS_SIZE 0x00100000u
+#define GUEST_STATICS (GUEST_PORT + 0x00200000u)
+#define GUEST_STATICS_SIZE 0x00100000u
+
+/* ---- Addresses ---- */
+
+/* The runtime's globals that translated code reads all the time (each game
+ * memory access reads openrac_guest_base). On Android the game is a shared
+ * library, whose globals are otherwise reached through its global offset
+ * table, one more load each time: there they are the library's own. */
+/* A game's part on Windows, a DLL (tools/asm_part.py), reads the program's data
+ * through what it exports (asm_part_exports.def). */
+#if defined(_WIN32) && defined(OPENRAC_ASM_PART)
+#define OPENRAC_PART_IMPORT __declspec(dllimport)
+#else
+#define OPENRAC_PART_IMPORT
+#endif
+#if defined(__ANDROID__)
+#define OPENRAC_GUEST_GLOBAL __attribute__((visibility("hidden")))
+#else
+#define OPENRAC_GUEST_GLOBAL OPENRAC_PART_IMPORT
+#endif
+
+/* Those globals, which a game's part built on the device from the disc
+ * (tools/asm_part.py), another library, cannot see on Android: there it reaches
+ * them through pointers the game gives it (openrac_asm_global) on loading. */
+/* clang-format off */
+#define OPENRAC_PART_GLOBALS(X) \
+    X(uint8_t*, guest_base) \
+    X(uint32_t, guest_ram_size) \
+    X(gaddr, guest_sp) \
+    X(gaddr, relocate_low) \
+    X(gaddr, relocate_high) \
+    X(gaddr, guest_last_entry) \
+    X(openrac_host_fn, guest_last_fn)
+/* clang-format on */
+#if defined(__ANDROID__) && defined(OPENRAC_ASM_PART)
+#define openrac_guest_base (*openrac_part_guest_base)
+#define openrac_guest_ram_size (*openrac_part_guest_ram_size)
+#define openrac_guest_sp (*openrac_part_guest_sp)
+#define openrac_relocate_low (*openrac_part_relocate_low)
+#define openrac_relocate_high (*openrac_part_relocate_high)
+#define openrac_guest_last_entry (*openrac_part_guest_last_entry)
+#define openrac_guest_last_fn (*openrac_part_guest_last_fn)
+#endif
+
+/* Where game memory starts in the host's address space. Set once by the
+ * runtime before any game code runs. */
+extern OPENRAC_GUEST_GLOBAL uint8_t* openrac_guest_base;
+/* Active guest RAM size: 32 MiB normally, larger only for an expanded-level mount. */
+extern OPENRAC_GUEST_GLOBAL uint32_t openrac_guest_ram_size;
+
+/* The expanded RAC1 target table lives at the top of guest RAM. Keep a small
+ * gap after it and below the heap; 32,768 moby pointers plus NULL take 0x20004. */
+#define OPENRAC_EXPANDED_TARGET_TABLE_RESERVE 0x00021000u
+#define OPENRAC_EXPANDED_MOBY_GRID_RESERVE 0x01320000u
+#define OPENRAC_EXPANDED_RAC1_RESERVE                                                              \
+    (OPENRAC_EXPANDED_TARGET_TABLE_RESERVE + OPENRAC_EXPANDED_MOBY_GRID_RESERVE)
+
+static inline gaddr openrac_guest_target_table(gaddr original) {
+    if (openrac_guest_ram_size <= GUEST_RAM_SIZE) {
+        return original;
+    }
+    return GUEST_RAM + openrac_guest_ram_size - OPENRAC_EXPANDED_TARGET_TABLE_RESERVE;
+}
+
+#define OPENRAC_TARGET_TABLE(a) openrac_guest_target_table((gaddr)(a))
+
+/* Normalize a direct or aliased RAM pointer to the direct RAM view. Other bus addresses retain
+ * the console's 25-bit physical-address behavior. */
+static inline gaddr openrac_guest_ram_address_for_size(gaddr address, uint32_t ram_size) {
+    if (address < ram_size) {
+        return address;
+    }
+    if (address >= GUEST_RAM_UNCACHED && address - GUEST_RAM_UNCACHED < ram_size) {
+        return address - GUEST_RAM_UNCACHED;
+    }
+    if (address >= GUEST_RAM_UNCACHED_ACCEL && address - GUEST_RAM_UNCACHED_ACCEL < ram_size) {
+        return address - GUEST_RAM_UNCACHED_ACCEL;
+    }
+    return address & 0x01FFFFFFu;
+}
+
+static inline gaddr openrac_guest_ram_address(gaddr address) {
+    return openrac_guest_ram_address_for_size(address, openrac_guest_ram_size);
+}
+
+/* The host pointer for a game address, and an lvalue of type T there. */
+#define G(a) ((void*)(openrac_guest_base + (gaddr)(a)))
+#define GREF(T, a) (*(T*)G(a))
+
+/* The game address of a host pointer into game memory. */
+#define GADDR(p) ((gaddr)((const uint8_t*)(p) - openrac_guest_base))
+
+/* The host compiler does not know that RAM and its uncached aliases are the
+ * same memory: a write through one alias and a read through another in the
+ * same function may be reordered or folded. Code that does that needs
+ * GBARRIER() between the two (the game itself uses the aliases for what it
+ * hands to the hardware, which the port reads after the call). */
+#define GBARRIER() __asm__ __volatile__("" : : : "memory")
+
+/* ---- Locals whose address is taken ----
+ *
+ * On the console such a local lives on the stack in game memory, and the
+ * game passes its address around like any other pointer. Translated code
+ * gives the function a frame on the game stack (GUEST_STACK_*): GFRAME(n)
+ * reserves n bytes, aligned to 16, and gives them back when the function
+ * returns, by whatever path. */
+extern OPENRAC_GUEST_GLOBAL gaddr openrac_guest_sp;
+gaddr openrac_guest_frame(uint32_t size);
+
+static inline void openrac_guest_frame_end(gaddr* saved) {
+    openrac_guest_sp = *saved;
+}
+
+#define GFRAME(name, size)                                                                         \
+    gaddr name##_saved_sp __attribute__((cleanup(openrac_guest_frame_end))) = openrac_guest_sp;    \
+    const gaddr name = openrac_guest_frame(size)
+
+/* The slot an aggregate local gets in such a frame, as the console's compiler
+ * (GCC 2.95 for the R5900) gives it: a local with no machine mode of its own
+ * (an array or record that is not 1, 2, 4, 8 or 16 bytes at that size's
+ * alignment) gets a stack slot aligned to 16 bytes and its size rounded up to
+ * 16. The game relies on it: a `float v[3]` is written with quadword stores
+ * (a copy of a 16-byte point into it), whose fourth word lands in the slot's
+ * padding on the console, not in the next local. T is a type name. */
+#define OPENRAC_FRAME_BLK(T)                                                                       \
+    (!((sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 16) && \
+       _Alignof(T) >= sizeof(T)))
+#define OPENRAC_FRAME_ALIGN(T) (OPENRAC_FRAME_BLK(T) ? 16 : _Alignof(T))
+#define OPENRAC_FRAME_SIZE(T) (OPENRAC_FRAME_BLK(T) ? (sizeof(T) + 15) & ~(size_t)15 : sizeof(T))
+
+/* A static local whose address the game takes: storage in game memory for
+ * the life of the program, zeroed (the port's statics region). */
+gaddr openrac_guest_static(uint32_t size);
+
+/* The append-only ends of the guest string and static regions. Warm restores preserve allocations
+ * newer than the snapshot at their existing addresses because translated call sites cache them in
+ * process memory. */
+typedef struct openrac_guest_allocation_state {
+    gaddr strings_end;
+    gaddr statics_end;
+    gaddr static_sites_begin;
+} openrac_guest_allocation_state;
+
+void openrac_guest_get_allocation_state(openrac_guest_allocation_state* state);
+
+/* Guest static locals generated by hostgen use stable site ids so another process can restore their
+ * addresses and invalidate each generated function's process-local cache. */
+gaddr openrac_guest_static_site(uint32_t size, uint64_t site, int* fresh);
+uint64_t openrac_guest_cache_generation(void);
+
+/* Opaque allocation maps stored beside the guest image in a snapshot. */
+size_t openrac_guest_snapshot_metadata_capacity(void);
+size_t openrac_guest_snapshot_metadata_size(void);
+int openrac_guest_snapshot_metadata_save(void* out, size_t capacity, size_t* used);
+int openrac_guest_snapshot_metadata_load(
+    const void* data, size_t size, const openrac_guest_allocation_state* expected
+);
+
+/* Diagnostic count of guest strings/statics allocated during this process. */
+uint64_t openrac_guest_allocation_generation(void);
+
+/* ---- String literals ----
+ *
+ * A literal in the game's C is data in game memory on the console. GSTR
+ * copies it into the port's string region once, at its first use, and gives
+ * its address. */
+gaddr openrac_guest_string(const char* s, size_t size);
+#define GSTR(lit)                                                                                  \
+    __extension__({                                                                                \
+        static gaddr gstr_cached_;                                                                 \
+        static uint64_t gstr_generation_ = UINT64_MAX;                                             \
+        const uint64_t generation_ = openrac_guest_cache_generation();                             \
+        if (gstr_generation_ != generation_) {                                                     \
+            gstr_cached_ = openrac_guest_string((lit), sizeof(lit));                               \
+            gstr_generation_ = generation_;                                                        \
+        }                                                                                          \
+        gstr_cached_;                                                                              \
+    })
+
+/* ---- Functions ----
+ *
+ * Function pointers in the game are code addresses: in its data (tables of
+ * update functions, vtables) and in what it computes. GFN looks the address
+ * up in the functions the build registered (port/runtime/guest.cpp) and
+ * gives a host function pointer of type T. A level's program is loaded at
+ * the same addresses as every other level's, so a code address means the
+ * function of the level that is loaded (openrac_guest_set_overlay). */
+typedef void (*openrac_host_fn)(void);
+
+typedef struct openrac_fn_entry {
+    gaddr address;
+    openrac_host_fn fn;
+    const char* name;
+} openrac_fn_entry;
+
+/* Overlay -1 is the executable; 0..n are the level programs. */
+#define OPENRAC_OVERLAY_EXE (-1)
+void openrac_guest_register(int overlay, const openrac_fn_entry* entries, size_t count);
+void openrac_guest_set_overlay(int overlay);
+int openrac_guest_overlay(void);
+openrac_host_fn openrac_guest_function(gaddr address);
+const char* openrac_guest_function_name(gaddr address);
+/* A registered function by its name (the executable's first, then each level program's), or null;
+ * a name with hostgen's "game_" prefix is found too. A linear search: for set-up (mods), not for
+ * calls the game makes. */
+openrac_host_fn openrac_guest_function_named(const char* name);
+#define GFN(T, a) ((T)openrac_guest_function(a))
+
+/* A call through a code address with the EE's argument registers as they are, which C written
+ * from assembly makes (hostgen's asmc.py: a jalr, a jump through a register). Casting the
+ * function to eight integer and eight float parameters hands each its register on the System V
+ * and AArch64 conventions, which keep integers and floats in registers of their own; on Windows
+ * x64 an argument's position decides its register whatever its type, so a float, and an integer
+ * after one, would arrive in the wrong place. There each function of the game has a thunk
+ * (hostgen's functions.c) that gives the registers to its definition's parameters as the EE
+ * passes them: integers from `ints` in order, floats from `floats`. The call returns the integer
+ * result and puts a float result in *result; a function with no thunk (the port's own) is called
+ * by the cast. OPENRAC_REGS_THUNKS turns this on elsewhere too (hostgen's tests). */
+#ifndef OPENRAC_REGS_THUNKS
+#ifdef _WIN32
+#define OPENRAC_REGS_THUNKS 1
+#else
+#define OPENRAC_REGS_THUNKS 0
+#endif
+#endif
+typedef uint64_t (*openrac_regs_thunk)(const uint64_t* ints, const float* floats, float* result);
+typedef struct openrac_thunk_entry {
+    openrac_host_fn fn;
+    openrac_regs_thunk thunk;
+} openrac_thunk_entry;
+void openrac_guest_register_thunks(const openrac_thunk_entry* entries, size_t count);
+uint64_t openrac_guest_call_regs(gaddr address, const uint64_t* ints, const float* floats, float* result,
+                                 int float_result);
+
+/* A call through a code address with a0 set, which matched C writes as inline assembly
+ * (`move $4, %A; jal $31, %F`: rac2-decomp's call_hook, each object's update hook; hostgen's
+ * lower.py). The other argument registers are 0, the result is dropped. */
+static inline void openrac_guest_call_a0(gaddr address, gaddr a0) {
+    const uint64_t ints[8] = {a0, 0, 0, 0, 0, 0, 0, 0};
+    const float floats[8] = {0};
+    float result;
+    (void)openrac_guest_call_regs(address, ints, floats, &result, 0);
+}
+
+/* Which overlay is loaded, asked at each call through a code address when
+ * set: the game knows (rac1 keeps its current level in a global). */
+void openrac_guest_set_overlay_source(int (*current)(void));
+
+/* ---- Per-level relocation ----
+ *
+ * A level's program carries its own copy of much of the executable's code,
+ * whose globals sit at other addresses (rac1: each level's copy of the engine).
+ * The port has one host function for both, written with the executable's
+ * addresses, so an executable function's global address goes through
+ * OPENRAC_DATA and a function address it takes through OPENRAC_CODE: with a
+ * level loaded, an address in the relocated range becomes that level's. The
+ * tables are built when a level's code is first used, by pairing the address
+ * operands of each function's executable code with its copy in the level's
+ * code (the two differ only in addresses), so nothing of the game is stored. */
+void openrac_guest_set_relocation(gaddr low, gaddr high, gaddr gp, const uint8_t* exe_code,
+                                  gaddr exe_base, uint32_t exe_size);
+extern OPENRAC_GUEST_GLOBAL gaddr openrac_relocate_low, openrac_relocate_high;
+/* The executable as its loader placed it before the game ran (load_elf keeps a copy, openrac/elf.h):
+ * its bytes in [low, high) copied back into memory; returns how many. For a game that loads its boot
+ * program again over a level's in another build of it (rac1: Quit Game reads one from the disc whose
+ * code sits elsewhere, and whose data points there): the port's C is the executable's, so the
+ * executable's own program is what it has to find in memory. */
+uint32_t openrac_guest_restore_executable(gaddr low, gaddr high);
+gaddr openrac_relocate_data(gaddr address);
+gaddr openrac_relocate_code(gaddr address);
+static inline gaddr OPENRAC_DATA(gaddr a) {
+    return a - openrac_relocate_low < openrac_relocate_high - openrac_relocate_low
+               ? openrac_relocate_data(a)
+               : a;
+}
+static inline gaddr OPENRAC_CODE(gaddr a) {
+    return openrac_relocate_high != 0 ? openrac_relocate_code(a) : a;
+}
+
+/* Of a function the catalogue folded (one name for tiny functions at several addresses of one
+ * program), the loaded program's place nearest `caller`; places are (overlay + 1) << 24 |
+ * address. A call through that place goes where its code calls (openrac_guest_function). */
+gaddr openrac_guest_nearest(const uint32_t* places, int count, gaddr caller);
+/* The place of a folded function a call goes to: the k-th call in the caller's code (at `caller`,
+ * `size` bytes, in the program loaded) to any of `places`; when the code has fewer such calls than
+ * its C (branches the compiler merged), the place they all call if they agree; else
+ * openrac_guest_nearest's (also when its size is not known). */
+gaddr openrac_folded_call(const uint32_t* places, int count, gaddr caller, uint32_t size, int k);
+/* The address of a folded function a function takes (a draw callback it registers): the k-th
+ * address of any of `places` the caller's code forms (a lui and an addiu or ori on its register,
+ * in the program loaded); `fallback` when it forms none (or its size is not known). The places of a
+ * folded wrapper call other functions (rac1's Umbris sea: each class registers its own wrapper of
+ * the liquid grid's draw), so the address of the first in the level is not the one retail takes. */
+gaddr openrac_folded_address(const uint32_t* places, int count, gaddr caller, uint32_t size, int k,
+                             gaddr fallback);
+
+/* Level to level: a function several levels' programs carry is written with the addresses of the
+ * level its name gives (rac1: func_L05_... has level 5's). OPENRAC_LDATA and OPENRAC_LCODE give
+ * the loaded level's address for one of that level's; the tables come from pairing the function's
+ * code in that level's program with its copy in the loaded one. The game says where a level's
+ * program is (openrac_guest_set_level_programs: called with a level, it hands each piece of the
+ * program over with openrac_guest_add_level_program, at the address the piece is loaded to). */
+void openrac_guest_set_level_programs(void (*load)(int level));
+/* The addresses level programs use, for the level-to-level pairs: rac1's unless a game says. Going
+ * Commando's programs run past 0x400000. A game that sets it also has functions the catalogue left out
+ * paired through their neighbours, and a global paired from its own lui and low half wins over a
+ * pair formed by an offset from another address (a loop's end pointer) when the two disagree. */
+void openrac_guest_set_level_range(gaddr low, gaddr high);
+void openrac_guest_add_level_program(int level, gaddr base, const uint8_t* bytes, uint32_t size);
+int openrac_guest_prepare_level_program(int level);
+int openrac_guest_restore_level_program(int level);
+/* Drops program bytes cached only for the process; the configured source can reload them. */
+void openrac_guest_clear_level_programs(void);
+gaddr openrac_relocate_level_data(int from, gaddr address);
+gaddr openrac_relocate_level_code(int from, gaddr address);
+#define OPENRAC_LDATA(from, a) openrac_relocate_level_data((from), (a))
+#define OPENRAC_LCODE(from, a) openrac_relocate_level_code((from), (a))
+
+/* One C function for copies of the same code at several places, each copy taking the address of
+ * its own neighbour (rac1: a moby's update, the same code in each class, passing that class's
+ * draw callback). The function asks at entry which place it was called at (openrac_guest_entry:
+ * the place of the last call through a code address, when that call came to it; 0 otherwise), and
+ * a code address it takes is read from that copy's own instructions: openrac_code_in_copy finds
+ * where the copy at `canon` (in level `from`'s program, `size` bytes) forms `target` (or, where it
+ * forms that nowhere, another place of target's function in that program: a place the catalogue
+ * folded into it), and reads the same instructions at `self`. Without a place, or one that does
+ * not form it, it is OPENRAC_LCODE's. */
+extern OPENRAC_GUEST_GLOBAL gaddr openrac_guest_last_entry;
+extern OPENRAC_GUEST_GLOBAL openrac_host_fn openrac_guest_last_fn;
+static inline gaddr openrac_guest_entry(openrac_host_fn self) {
+    return openrac_guest_last_fn == self ? openrac_guest_last_entry : 0;
+}
+gaddr openrac_code_in_copy(int from, gaddr canon, uint32_t size, gaddr self, gaddr target);
+/* The address of a function taken by name in code written for a level, where the name may stand for
+ * several places of that level (a function the catalogue folded: one name for the same small code at
+ * several places, each a routine of its own, rac1's `return 0` leaf func_001E97C8): the place of it the
+ * code at `canon` forms (target, or any place of target's function, in level `from`'s program), read at
+ * the same instructions of the copy at `self` (0: the copy of canon in the program loaded; in level
+ * `from`'s own program, canon itself). Retail's Suck Cannon (func_L00_002DB810) skips the mobys whose
+ * class function is the leaf next to it, a place of that name. `fallback` where no copy forms one. */
+gaddr openrac_code_formed(int from, gaddr canon, uint32_t size, gaddr self, gaddr target, gaddr fallback);
+/* The same for a global: where the copy at `self` reads or writes what the copy at `canon` does at
+ * `target` (folded copies of one function in one program, each on its own globals: a lui and the
+ * addiu, ori, load or store that completes it, or such an instruction on $gp for a small global,
+ * $gp being the same in every program; an address within 0x100 of one formed there keeps its
+ * offset from it). Without a place, `target` relocated as OPENRAC_LDATA; `from` -1 is the
+ * executable (its code read from the executable, `target` relocated as OPENRAC_DATA). */
+gaddr openrac_data_in_copy(int from, gaddr canon, uint32_t size, gaddr self, gaddr target);
+/* The same for a call: the function the copy at `self` calls where the copy at `canon` calls
+ * `target` (a small wrapper the catalogue folded, whose copies call different functions); `from`
+ * -1 is the executable. Without a place, `target` (OPENRAC_CODE's or OPENRAC_LCODE's). */
+gaddr openrac_call_in_copy(int from, gaddr canon, uint32_t size, gaddr self, gaddr target);
+
+/* A call from the executable's own engine code to one of its empty hook stubs (stub.c: functions
+ * that only return), which every level's program fills with a function of its own. The executable's
+ * copy of the caller (`exe_fn`, `size` bytes) calls the stub at its k-th such call; the copy the
+ * loaded level carries (the place of the caller in level `home`, `home_fn`, relocated to the loaded
+ * program) calls that level's function at the same instruction; a k past the code's calls (the
+ * compiler merged two of the C's into one jal) is its first. In the executable's own program, or
+ * where the copy does not call at that place, it is the stub (OPENRAC_CODE's). */
+gaddr openrac_hook_in_copy(gaddr exe_fn, uint32_t size, int home, gaddr home_fn, gaddr stub, uint32_t k);
+
+/* The EE FPU's divide, for the game's float `/`: no infinities or NaNs. A divisor of zero (or a
+ * denormal, which the EE reads as zero) gives +-FLT_MAX with the operands' signs XORed, and a
+ * quotient too large saturates the same way, where the host would give infinity (and NaN from
+ * there on: an animation loop that never ends). */
+static inline float openrac_fdiv(float a, float b) {
+    uint32_t ua, ub;
+    memcpy(&ua, &a, 4);
+    memcpy(&ub, &b, 4);
+    if ((ub & 0x7F800000u) == 0) {
+        return ((ua ^ ub) & 0x80000000u) != 0 ? -3.40282347e38f : 3.40282347e38f;
+    }
+    const float q = a / b;
+    if (__builtin_isinf(q)) {
+        return q < 0.0f ? -3.40282347e38f : 3.40282347e38f;
+    }
+    return q;
+}
+
+/* The EE FPU's float to integer (cvt.w.s, trunc.w.s), for the game's conversions to an integer
+ * type: toward zero, saturating at the int's limits (the EE has no NaN). A narrower target keeps
+ * the low bits of that int, as the console's code stored them. C leaves a value out of range
+ * undefined and the hosts disagree there: x86 wraps -1.0 into an unsigned 0xFFFFFFFF as the EE
+ * did, ARM gives 0. */
+static inline int32_t openrac_f2i(double x) {
+    if (x >= 2147483647.0) {
+        return 2147483647;
+    }
+    if (x > -2147483648.0) {
+        return (int32_t)x;
+    }
+    return (int32_t)-2147483647 - 1;  /* and a NaN, which the EE never makes */
+}
+
+/* To a 32-bit unsigned int, as the console's compiler wrote it: below 2^31 the signed conversion
+ * (a negative value wraps), above it the signed conversion of the value less 2^31 with the top
+ * bit set. */
+static inline uint32_t openrac_f2u(double x) {
+    if (x >= 2147483648.0) {
+        return (uint32_t)openrac_f2i(x - 2147483648.0) ^ 0x80000000u;
+    }
+    return (uint32_t)openrac_f2i(x);
+}
+
+/* A function the game calls that has no C in the port yet: still assembly in
+ * the decompilation, or a library the port has not replaced. Logged once per
+ * function and counted (openrac_guest_report_missing at exit). While the
+ * port is being brought up the program stops at the first one instead
+ * (openrac_guest_stop_on_missing), so the log ends with what to do next. */
+void openrac_guest_missing(const char* name);
+void openrac_guest_report_missing(void);
+void openrac_guest_stop_on_missing(int stop);
+
+/* For the debugging tools: every call so far to a function without C (the
+ * return value) and how many such functions there are; then each of them, in
+ * the order of their names, with its calls (null past the last). The names
+ * stay valid for the life of the program. */
+unsigned long openrac_guest_missing_calls(unsigned* functions);
+const char* openrac_guest_missing_at(unsigned index, unsigned long* calls);
+
+/* ---- What a run reached that the port does not have right yet ----
+ *
+ * hostgen gives each place it could not write as the game's C a site of its own: every stub
+ * (kind "asm": still assembly in the decompilation; "no-c": declared, defined nowhere;
+ * "untranslated": C hostgen cannot write) and every call it had to fill an argument of with 0
+ * ("zero-args": the site is the caller, detail names the callee and the argument). The site counts
+ * its calls itself, a static word in the generated C, so only those paths pay for it; the first
+ * call registers it (and, for a stub, logs it as openrac_guest_missing does). OPENRAC_REACH=FILE
+ * writes the sites a run called (openrac_guest_write_reach, port/tools/regress). */
+typedef struct openrac_reach_site {
+    const char* name;   /* the game function: the stub, or the caller of a zero-filled call */
+    const char* kind;   /* "asm", "no-c", "untranslated", "zero-args" */
+    const char* detail; /* zero-args: "callee argument N"; NULL otherwise */
+    unsigned long calls;
+    struct openrac_reach_site* next; /* the runtime's list of sites called */
+} openrac_reach_site;
+
+void openrac_guest_reach_first(openrac_reach_site* site);
+
+static inline void openrac_guest_reach(openrac_reach_site* site) {
+    if (site->calls++ == 0) {
+        openrac_guest_reach_first(site);
+    }
+}
+
+/* The reached sites as JSON at `path` (the game's id and the frame count in its header), and the
+ * functions without C called through openrac_guest_missing alone (hand C). 0 when it cannot. */
+int openrac_guest_write_reach(const char* path, const char* game, long frames);
+
+/* ---- The host's stack, for the debugging aids ----
+ *
+ * Host code is built on Linux, macOS and Windows, and only the first two have
+ * backtrace (execinfo.h): a debugging aid that names who called it asks here
+ * instead. `text` gets the function `depth` calls above the caller of this one
+ * (0: who called the caller) as the host can name it: its symbol on Linux and
+ * macOS, the module and the offset in it on Windows (which a symbolizer
+ * resolves with the program's PDB), "?" when the stack does not reach it. */
+void openrac_host_caller(int depth, char* text, size_t size);
+
+/* ---- What the game's own inline assembly did ----
+ *
+ * The decompilation keeps three quadword helpers as inline assembly
+ * (games/rac1/decomp/include/common.h): qcopy, qcopy_nc and qzero. Their lq and sq
+ * ignore the low four bits of the address, as every quadword load and store
+ * of the EE does: matched C that copies from `&moby->pos.z` (an lq at +0x18,
+ * Moby1259Update) gets the quadword at +0x10, the whole position. That holds
+ * where the layout is the console's (RAM, its aliases, the scratchpad); the
+ * port's own region (locals whose address is taken) is laid out by hostgen,
+ * which may put a quadword local at 8 mod 16 where the console's frame had it
+ * aligned (func_L00_0026A7F8), so an address there is taken as it is. */
+static inline gaddr openrac_quadword_address(gaddr a) {
+    return (a - GUEST_PORT) < GUEST_PORT_SIZE ? a : (a & ~(gaddr)15u);
+}
+
+static inline void openrac_qcopy(gaddr dst, gaddr src) {
+    memmove(G(openrac_quadword_address(dst)), G(openrac_quadword_address(src)), 16);
+}
+
+static inline void openrac_qzero(gaddr p) {
+    memset(G(openrac_quadword_address(p)), 0, 16);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OPENRAC_GUEST_H */

@@ -1,0 +1,3265 @@
+// OpenRAC Launcher: the desktop app. Every file and process operation lives
+// in openrac-launcher-core (../core); this file only exposes it to the UI
+// (../src) as Tauri commands and forwards job output as events. The list of
+// commands and events is docs/ARCHITECTURE.md's; keep them in step with
+// src/lib/api.ts and src/lib/mock.ts.
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+mod android;
+mod mod_tool;
+
+use openrac_launcher_core::actions::{Platform, Scope};
+use openrac_launcher_core::config::{self, Config};
+use openrac_launcher_core::detect::{self, Check, Detected, Tool};
+use openrac_launcher_core::disc_choice::{self, DiscChoice};
+use openrac_launcher_core::discs::{self, FoundDisc};
+use openrac_launcher_core::editor_state;
+use openrac_launcher_core::install;
+use openrac_launcher_core::jobs::{Event, Jobs, Started};
+use openrac_launcher_core::launcher_log;
+use openrac_launcher_core::library::{self, Library};
+use openrac_launcher_core::mod_error::{ModError, ModErrorKind};
+use openrac_launcher_core::modset;
+use openrac_launcher_core::overrides::{self, PackView};
+use openrac_launcher_core::plugins::{self, Installed, PluginView};
+use openrac_launcher_core::profile;
+use openrac_launcher_core::remote;
+use openrac_launcher_core::reports::{self, ReportEntry};
+use openrac_launcher_core::reset;
+use openrac_launcher_core::{deeplink, index, index_apply, resolver};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
+
+struct AppState {
+    config: Mutex<Config>,
+    config_file: Option<PathBuf>,
+    jobs: Jobs,
+    discord: Arc<Mutex<DiscordState>>,
+    /// The copy of OpenRAC this launcher carries, if it was built with one (detect::bundled_root).
+    bundled: Option<PathBuf>,
+    /// A mod code's link that came before the page could listen (modset_take_link).
+    modset_link: Arc<Mutex<Option<String>>>,
+    /// The mod index last fetched and checked (index_fetch), which index_resolve and index_apply read.
+    mod_index: Mutex<Option<index::ModIndex>>,
+}
+
+struct DiscordState {
+    ipc: openrac_launcher_core::discord::DiscordIpc,
+    app_start: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+    version: String,
+    platform: Platform,
+    /// Where launcher.json is.
+    config_file: Option<PathBuf>,
+    /// The launcher works on the copy of OpenRAC it carries: nothing to find or to build, and
+    /// only what a player does is offered.
+    standalone: bool,
+    /// Where its updates come from: the repository that built it (core/src/update.rs).
+    updates: openrac_launcher_core::update::UpdateSource,
+    /// That repository's two channels, which the player chooses between (Settings, `updateChannel`).
+    update_channels: UpdateChannels,
+    /// WebKitGTK draws without its accelerated compositing mode (a Steam Deck, or the player's
+    /// WEBKIT_DISABLE_COMPOSITING_MODE): the page gives its page slides up, whose view transitions
+    /// crashed the webview there whenever a page was opened (src/lib/motion.ts).
+    no_compositing: bool,
+    /// The last start's window crashed before it drew a click, and this start turned Safe
+    /// rendering on for it (Config::safe_rendering): the page says so once.
+    safe_rendering_after_crash: bool,
+}
+
+#[derive(Serialize)]
+struct UpdateChannels {
+    stable: openrac_launcher_core::update::UpdateSource,
+    dev: openrac_launcher_core::update::UpdateSource,
+}
+
+/// A build of a branch: `dev.<run>`, which its updates are compared with (update::effective_version).
+const LAUNCHER_BUILD: Option<&str> = option_env!("OPENRAC_LAUNCHER_BUILD");
+
+/// The version updates are compared with, and the one shown.
+fn launcher_version<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> String {
+    openrac_launcher_core::update::effective_version(&app.package_info().version.to_string(), LAUNCHER_BUILD)
+}
+
+/// The update manifest's address (tauri.conf.json's `plugins.updater.endpoints`, which the build
+/// sets to its own repository's releases).
+fn update_source<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> openrac_launcher_core::update::UpdateSource {
+    let endpoint =
+        app.config().plugins.0.get("updater").and_then(|c| c["endpoints"][0].as_str()).unwrap_or_default().to_string();
+    openrac_launcher_core::update::source(&endpoint)
+}
+
+/// Where the launcher looks for its updates: CHANNEL and a fork's BRANCH (the Settings page's,
+/// before they are saved), else the ones the player chose, else the one it was built from.
+fn chosen_update_source<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    channel: Option<openrac_launcher_core::update::Channel>,
+    branch: Option<String>,
+) -> openrac_launcher_core::update::UpdateSource {
+    let built = update_source(app);
+    let (channel, branch) = match channel {
+        Some(channel) => (Some(channel), branch),
+        None => app.try_state::<AppState>().map_or((None, None), |state| {
+            let config = state.config.lock().unwrap();
+            (config.update_channel, config.update_branch.clone())
+        }),
+    };
+    built.chosen(channel.unwrap_or(built.kind()), branch.as_deref())
+}
+
+/// Whether SOURCE is the other channel than the one this launcher was built for: its build is then
+/// offered whatever its version (update::offered), so a development build can go back to Stable.
+fn switching_channel<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    source: &openrac_launcher_core::update::UpdateSource,
+) -> bool {
+    source.kind() != update_source(app).kind()
+}
+
+#[tauri::command]
+fn app_info(app: AppHandle, state: State<'_, AppState>) -> AppInfo {
+    use openrac_launcher_core::update::Channel;
+    let updates = update_source(&app);
+    AppInfo {
+        version: launcher_version(&app),
+        platform: Platform::current(),
+        config_file: state.config_file.clone(),
+        standalone: state
+            .bundled
+            .as_deref()
+            .is_some_and(|copy| detect::on_the_copy(state.config.lock().unwrap().root.as_deref(), copy)),
+        update_channels: UpdateChannels { stable: updates.on(Channel::Stable), dev: updates.on(Channel::Dev) },
+        updates,
+        no_compositing: cfg!(target_os = "linux") && std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some(),
+        safe_rendering_after_crash: SAFE_AFTER_CRASH.load(Ordering::Relaxed),
+    }
+}
+
+/// A newer launcher on the player's channel, or None: Tauri's updater asked at that channel's
+/// manifest, and the update kept for its own download and install (plugin-updater's `Update`,
+/// rebuilt in the page from `rid`). A desktop's; Android's launcher has android::update_check.
+#[tauri::command]
+async fn launcher_update_check(
+    webview: tauri::Webview,
+    channel: Option<openrac_launcher_core::update::Channel>,
+    branch: Option<String>,
+) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_updater::UpdaterExt;
+        let source = chosen_update_source(webview.app_handle(), channel, branch);
+        let url = tauri::Url::parse(&source.manifest).map_err(|e| format!("{}: {e}", source.manifest))?;
+        let mut builder = webview.updater_builder();
+        if switching_channel(webview.app_handle(), &source) {
+            // The other channel's build, also when it is older (the release a development build came after).
+            builder = builder.version_comparator(|current, release| {
+                let current = openrac_launcher_core::update::effective_version(&current.to_string(), LAUNCHER_BUILD);
+                openrac_launcher_core::update::offered(&current, &release.version.to_string(), true)
+            });
+        }
+        let updater = builder.endpoints(vec![url]).and_then(|b| b.build()).map_err(|e| e.to_string())?;
+        let Some(update) = updater.check().await.map_err(|e| e.to_string())? else { return Ok(None) };
+        let date = update.raw_json.get("pub_date").cloned();
+        let (current_version, version, body, raw_json) =
+            (update.current_version.clone(), update.version.clone(), update.body.clone(), update.raw_json.clone());
+        let rid = webview.resources_table().add(update);
+        Ok(Some(serde_json::json!({
+            "rid": rid,
+            "currentVersion": current_version,
+            "version": version,
+            "date": date,
+            "body": body,
+            "rawJson": raw_json,
+        })))
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (webview, channel, branch);
+        Err("on Android the launcher updates through update_check".into())
+    }
+}
+
+#[tauri::command]
+fn relaunch_app(app: AppHandle) {
+    tauri::process::restart(&app.env());
+}
+
+/// The app's identifier (tauri.conf.json), which names its per-user config folder.
+#[cfg(target_os = "linux")]
+const IDENTIFIER: &str = "dev.openrac.launcher";
+
+/// This start's draw check (core webkit.rs), when it has one: Linux, Safe rendering off, and not a
+/// second start.
+static DRAW_CHECK: OnceLock<openrac_launcher_core::webkit::DrawCheck> = OnceLock::new();
+/// The player clicked in the window: a quit from now on does not end the draw check.
+static CLICKED: AtomicBool = AtomicBool::new(false);
+/// This start turned Safe rendering on, after the last one crashed (AppInfo).
+static SAFE_AFTER_CRASH: AtomicBool = AtomicBool::new(false);
+/// The game a `--play` start could not start (startup_game).
+static PENDING_GAME: Mutex<Option<String>> = Mutex::new(None);
+
+/// The page saw the player's first click, before it is drawn.
+#[tauri::command]
+fn webview_clicked() {
+    CLICKED.store(true, Ordering::Relaxed);
+}
+
+/// The page drew the player's first click: the window draws, and the draw check ends.
+#[tauri::command]
+fn webview_drew() {
+    if let Some(check) = DRAW_CHECK.get() {
+        check.end();
+    }
+}
+
+#[tauri::command]
+fn get_config(state: State<'_, AppState>) -> Config {
+    state.config.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn save_config(state: State<'_, AppState>, mut config: Config) -> Result<Config, String> {
+    let file = state.config_file.as_deref().ok_or("no per-user config folder")?;
+    // The page checks the name as it is typed; one that still is not valid is not written.
+    if !openrac_launcher_core::multiplayer::is_valid(&config.multiplayer_name) {
+        return Err(format!(
+            "the multiplayer name must be {} to {} letters, digits or underscores",
+            openrac_launcher_core::multiplayer::MIN_LEN,
+            openrac_launcher_core::multiplayer::MAX_LEN
+        ));
+    }
+    // Developer tools switched off: back to the carried copy (detect::settle).
+    detect::settle(&mut config, state.bundled.as_deref());
+    // The page sends the settings back without the paths the launcher keeps its own files
+    // in; they are set again here.
+    config.progress_cache = progress_cache(state.config_file.as_deref());
+    // Another save folder: the saves in the one used until now come along (copied, never
+    // replacing one there), before anything reads or writes the new one.
+    use openrac_launcher_core::saves;
+    config.save_dir = config.save_dir.take().filter(|dir| !dir.as_os_str().is_empty());
+    let was = state.config.lock().unwrap().save_dir.clone();
+    if config.save_dir != was {
+        let home = saves::data_home();
+        let from = was.clone().unwrap_or_else(|| home.join("memcard"));
+        let to = config.save_dir.clone().unwrap_or_else(|| home.join("memcard"));
+        let copied = saves::copy_cards(&from, &to)?;
+        launcher_log::line(&format!("saves: {copied} files copied from {} to {}", from.display(), to.display()));
+    }
+
+    // Nor the images the set-ups were made from, which the launcher records (disc_choice.rs) and
+    // a page holding the settings from before would forget.
+    config.disc_images = state.config.lock().unwrap().disc_images.clone();
+    config::save(file, &config)?;
+    saves::set_card_root(config.save_dir.clone());
+    *state.config.lock().unwrap() = config.clone();
+
+    let discord = state.discord.clone();
+    let target_id = config
+        .discord_client_id
+        .clone()
+        .unwrap_or_else(|| openrac_launcher_core::discord::DEFAULT_CLIENT_ID.to_string());
+    let rpc_enabled = config.discord_rpc;
+    tauri::async_runtime::spawn(async move {
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let mut discord = discord.lock().unwrap();
+            discord.ipc.set_client_id(target_id);
+            if !rpc_enabled {
+                let _ = discord.ipc.clear();
+            }
+        })
+        .await;
+    });
+
+    Ok(config)
+}
+
+/// Where to look for a checkout: next to the launcher and the folder it was started from.
+fn start_folders() -> Vec<PathBuf> {
+    let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from));
+    exe.into_iter().chain(std::env::current_dir().ok()).collect()
+}
+
+/// The file the launcher keeps its own copy of the figures it fetched from bytematch.dev in:
+/// in the per-user folder beside its settings, which the launcher can always write. A
+/// checkout it does not own (the copy an installed launcher carries) is read-only.
+fn progress_cache(config_file: Option<&std::path::Path>) -> Option<PathBuf> {
+    config_file.and_then(|file| file.parent()).map(|dir| dir.join("progress.json"))
+}
+
+#[tauri::command]
+async fn detect(state: State<'_, AppState>) -> Result<Detected, String> {
+    let bundled = state.bundled.clone();
+    Ok(tauri::async_runtime::spawn_blocking(move || detect::detect_all(&start_folders(), bundled.as_deref()))
+        .await
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn check_root(path: PathBuf) -> Check {
+    detect::check_root(&path)
+}
+
+#[tauri::command]
+async fn check_tool(tool: Tool, path: PathBuf) -> Result<Check, String> {
+    tauri::async_runtime::spawn_blocking(move || detect::check_tool(tool, &path)).await.map_err(|e| e.to_string())
+}
+
+/// Takes a Godot that works when none is set, or the one set is gone: the first run looks only
+/// once, and a player often gets Godot later, from the Mods page's link. The config as it is.
+#[tauri::command]
+async fn adopt_godot(state: State<'_, AppState>) -> Result<Config, String> {
+    if state.config.lock().unwrap().godot.as_deref().is_some_and(Path::is_file) {
+        return Ok(state.config.lock().unwrap().clone());
+    }
+    let found = tauri::async_runtime::spawn_blocking(|| {
+        let first = detect::tool_candidates(Tool::Godot).into_iter().next()?;
+        detect::check_tool(Tool::Godot, &first.path).ok.then_some(first.path)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut config = state.config.lock().unwrap();
+    if let (Some(godot), Some(file)) = (found, state.config_file.as_deref()) {
+        if !config.godot.as_deref().is_some_and(Path::is_file) {
+            let mut next = config.clone();
+            next.godot = Some(godot);
+            config::save(file, &next)?;
+            *config = next;
+        }
+    }
+    Ok(config.clone())
+}
+
+#[tauri::command]
+async fn library(state: State<'_, AppState>) -> Result<Library, String> {
+    let config = state.config.lock().unwrap().clone();
+    tauri::async_runtime::spawn_blocking(move || library::library(&config)).await.map_err(|e| e.to_string())?
+}
+
+/// Runs action `id` of `scope`: a job whose output streams as `job-output`
+/// and `job-exit` events, or a detached launch (id 0).
+#[tauri::command]
+async fn run_action(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    scope: Scope,
+    id: String,
+    level: Option<u32>,
+    path: Option<String>,
+    option: Option<String>,
+) -> Result<Started, String> {
+    let config = state.config.lock().unwrap().clone();
+    let inputs = openrac_launcher_core::actions::Inputs { level, path, option };
+    let mut plan = library::plan(&config, &scope, &id, &inputs)?;
+    let mut bake_mods = None;
+    if let (openrac_launcher_core::enhanced::BAKE_ACTION, Scope::Version(key)) = (id.as_str(), &scope) {
+        let config = config.clone();
+        let key = key.clone();
+        bake_mods = tauri::async_runtime::spawn_blocking(move || {
+            openrac_launcher_core::enhanced::assemble_bake_mods(&config, &key, true)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if let Some(snapshot) = &bake_mods {
+            plan.args.extend(["--mods-dir".into(), snapshot.path().to_string_lossy().into_owned()]);
+        }
+    }
+    let is_play = library::is_play(&config, &scope, &id);
+
+    // The play job's Discord presence (core discord.rs): its status now, its game for its log.
+    let play = match (is_play, &config.root) {
+        (true, Some(root)) => {
+            openrac_launcher_core::discord::play(root, &scope, openrac_launcher_core::discord::now_sec())
+        }
+        _ => None,
+    };
+    if let (Some(play), true) = (&play, config.discord_rpc) {
+        let discord = state.discord.clone();
+        let status = play.status.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut discord = discord.lock().unwrap();
+            let app_start = discord.app_start;
+            let _ = discord.ipc.set_status(&status, app_start);
+        });
+    }
+    let play_game = play.map(|p| p.game);
+    // On Android the game is an activity of the launcher's own, not a program it runs.
+    if is_play && Platform::current() == Platform::Android {
+        launcher_log::line(&format!("play: {}", openrac_launcher_core::jobs::command_line(&plan)));
+        return android::launch(&app, &plan);
+    }
+    let app_handle = app.clone();
+    let title = plan.title.clone();
+    launcher_log::line(&format!("run: {}", openrac_launcher_core::jobs::command_line(&plan)));
+    let started = state.jobs.start(&plan, config.root.as_deref(), move |event| {
+        // Keep the assembled files alive through native baking, including cancellation.
+        let _snapshot = &bake_mods;
+        let _ = match &event {
+            Event::Output { line, .. } => {
+                // The planet and bolts the game logs.
+                if let Some(log) =
+                    play_game.as_deref().and_then(|game| openrac_launcher_core::discord::read_game_log(game, line))
+                {
+                    if let Some(st) = app_handle.try_state::<AppState>() {
+                        if st.config.lock().unwrap().discord_rpc {
+                            let discord = st.discord.clone();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let _ = discord.lock().unwrap().ipc.on_game_log(log);
+                            });
+                        }
+                    }
+                }
+                app.emit("job-output", &event)
+            }
+            Event::Exit { code, cancelled, .. } => {
+                launcher_log::line(&format!(
+                    "ended: {title}: {}",
+                    if *cancelled {
+                        "cancelled".to_string()
+                    } else {
+                        code.map_or("stopped by a signal (no exit code)".to_string(), |c| format!("exit code {c}"))
+                    }
+                ));
+                if is_play {
+                    if let Some(st) = app_handle.try_state::<AppState>() {
+                        let cfg = st.config.lock().unwrap().clone();
+                        if cfg.discord_rpc {
+                            let discord = st.discord.clone();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let mut discord = discord.lock().unwrap();
+                                let app_start = discord.app_start;
+                                let _ = discord.ipc.end_play(app_start);
+                            });
+                        }
+                    }
+                }
+                app.emit("job-exit", &event)
+            }
+        };
+    });
+    if let Err(e) = &started {
+        launcher_log::line(&format!("could not start: {e}"));
+    }
+    started
+}
+
+// ---- Differences from the original (core/src/differences.rs) ----
+
+/// The Mods tab's built-in Enhanced graphics entry for a version (core enhanced.rs), or None for a
+/// version that has none.
+#[tauri::command]
+async fn enhanced_view(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+) -> Result<Option<openrac_launcher_core::enhanced::EnhancedView>, String> {
+    use openrac_launcher_core::enhanced;
+    if !enhanced::supported(&game, &version) {
+        return Ok(None);
+    }
+    let config = state.config.lock().unwrap().clone();
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bake = enhanced::version_bake_status(&config, &format!("{game}/{version}"));
+        Some(enhanced::view(&home, &game, &version, bake))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Switches Enhanced graphics on or off for a version, in its settings file.
+#[tauri::command]
+async fn enhanced_set_enabled(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    enabled: bool,
+) -> Result<Option<openrac_launcher_core::enhanced::EnhancedView>, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    let (g, v) = (game.clone(), version.clone());
+    tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::enhanced::set_enabled(&home, &g, &v, enabled))
+        .await
+        .map_err(|e| e.to_string())??;
+    launcher_log::line(&format!("{game}/{version}: enhanced graphics {}", if enabled { "on" } else { "off" }));
+    enhanced_view(state, game, version).await
+}
+
+// ---- Texture packs (core/src/texture_packs.rs) ----
+
+/// The game's folder in the install folder (`{data}`), where its texture pack lives.
+fn game_data_dir(state: &State<'_, AppState>, game: &str) -> Result<PathBuf, String> {
+    let install = state.config.lock().unwrap().install_dir.clone().ok_or("the install folder is not set (Settings)")?;
+    Ok(install::data_dir(&install, game))
+}
+
+/// A game version's Texture packs section.
+#[tauri::command]
+async fn texture_packs_view(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+) -> Result<openrac_launcher_core::texture_packs::View, String> {
+    let data = game_data_dir(&state, &game)?;
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::texture_packs::view(&home, &data, &game, &version)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Switches the texture pack (`enabled`) or saving the textures at the next Play (`dumping`).
+#[tauri::command]
+async fn texture_packs_set(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    enabled: Option<bool>,
+    dumping: Option<bool>,
+) -> Result<openrac_launcher_core::texture_packs::View, String> {
+    use openrac_launcher_core::texture_packs;
+    let home = openrac_launcher_core::saves::data_home();
+    if let Some(on) = enabled {
+        texture_packs::set_enabled(&home, &game, &version, on)?;
+        launcher_log::line(&format!("{game}/{version}: texture pack {}", if on { "on" } else { "off" }));
+    }
+    if let Some(on) = dumping {
+        texture_packs::set_dumping(&home, &game, &version, on)?;
+        launcher_log::line(&format!("{game}/{version}: saving textures {}", if on { "on" } else { "off" }));
+    }
+    texture_packs_view(state, game, version).await
+}
+
+/// Opens a folder of the pack (`dump` false) or of the saved textures, made if it is not there.
+#[tauri::command]
+fn texture_packs_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    dump: bool,
+    folder: String,
+) -> Result<(), String> {
+    let data = game_data_dir(&state, &game)?;
+    let home = openrac_launcher_core::saves::data_home();
+    let dir = openrac_launcher_core::texture_packs::folder(&home, &data, &game, &version, dump, &folder)?;
+    open_path_with_system(&app, &dir.to_string_lossy())
+}
+
+/// What a pack's .zip holds, refused for another game's or one that is not a pack.
+#[tauri::command]
+async fn texture_packs_preview(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    source: String,
+) -> Result<openrac_launcher_core::texture_packs::Preview, String> {
+    let data = game_data_dir(&state, &game)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::texture_packs::preview_import(&data, &game, &version, Path::new(&source))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Imports a pack's .zip into the game's pack folder, replacing the pack there (kept beside it) or
+/// merged into it.
+#[tauri::command]
+async fn texture_packs_import(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    source: String,
+    mode: openrac_launcher_core::texture_packs::ImportMode,
+) -> Result<openrac_launcher_core::texture_packs::Imported, String> {
+    use openrac_launcher_core::texture_packs;
+    let data = game_data_dir(&state, &game)?;
+    let label = format!("{game}/{version}");
+    let (textures, kept) = tauri::async_runtime::spawn_blocking(move || {
+        texture_packs::import(&data, &game, &version, Path::new(&source), mode)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    launcher_log::line(&format!("{label}: imported a texture pack of {textures} picture(s) ({mode:?})"));
+    let kept = kept.and_then(|k| k.file_name().map(|n| n.to_string_lossy().into_owned()));
+    Ok(texture_packs::Imported { textures, kept })
+}
+
+/// Exports the game's pack as a .zip where the player chooses (Android: its "save as" screen).
+/// `saved` is empty when they backed out.
+#[tauri::command]
+async fn texture_packs_export(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+) -> Result<openrac_launcher_core::texture_packs::Exported, String> {
+    use openrac_launcher_core::texture_packs::{self, Exported};
+    let data = game_data_dir(&state, &game)?;
+    let home = openrac_launcher_core::saves::data_home();
+    let name = texture_packs::export_name(&texture_packs::id(&game, &version)?);
+    let launcher_version = app.package_info().version.to_string();
+    let backed_out = || Exported { saved: String::new(), textures: 0, left_out: 0 };
+    #[cfg(target_os = "android")]
+    let dest = {
+        let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("texture-pack-exports");
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        cache.join(&name)
+    };
+    #[cfg(not(target_os = "android"))]
+    let dest = {
+        use tauri_plugin_dialog::DialogExt;
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Share my texture pack")
+            .set_file_name(&name)
+            .add_filter("Texture pack", &["zip"]);
+        if let Some(dir) = reports::save_folder() {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_save_file())
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(picked) = picked else { return Ok(backed_out()) };
+        picked.into_path().map_err(|e| e.to_string())?
+    };
+    let out = dest.clone();
+    let (textures, left_out) = tauri::async_runtime::spawn_blocking(move || {
+        texture_packs::export(&home, &data, &game, &version, &launcher_version, &out)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if cfg!(target_os = "android") {
+        let saved = android::save_as(&app, &dest, &name).await;
+        let _ = std::fs::remove_file(&dest);
+        let Some(saved) = saved? else { return Ok(backed_out()) };
+        launcher_log::line(&format!("exported a texture pack: {saved}"));
+        return Ok(Exported { saved, textures, left_out });
+    }
+    launcher_log::line(&format!("exported a texture pack: {}", dest.display()));
+    Ok(Exported { saved: reports::tidy(&dest.to_string_lossy(), reports::home().as_deref()), textures, left_out })
+}
+
+/// Deletes every lighting bake of a version (Enhanced graphics' "Delete the lighting"): the game
+/// keeps the original lighting until it is prepared again.
+#[tauri::command]
+async fn enhanced_delete_bakes(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+) -> Result<Option<openrac_launcher_core::enhanced::EnhancedView>, String> {
+    let config = state.config.lock().unwrap().clone();
+    let key = format!("{game}/{version}");
+    let k = key.clone();
+    tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::enhanced::delete_bakes(&config, &k))
+        .await
+        .map_err(|e| e.to_string())??;
+    launcher_log::line(&format!("{key}: lighting bakes deleted"));
+    enhanced_view(state, game, version).await
+}
+
+/// Sets one of Enhanced graphics' settings for a version, in its settings file.
+#[tauri::command]
+async fn enhanced_set_setting(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    key: String,
+    value: serde_json::Value,
+) -> Result<Option<openrac_launcher_core::enhanced::EnhancedView>, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    let (g, v) = (game.clone(), version.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::enhanced::set_setting(&home, &g, &v, &key, &value)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    enhanced_view(state, game, version).await
+}
+
+/// The checkout a game's list of differences is read from: the one set, else the copy carried.
+fn differences_root(state: &State<'_, AppState>) -> Option<PathBuf> {
+    state.config.lock().unwrap().root.clone().or_else(|| state.bundled.clone())
+}
+
+/// What the port does otherwise than the PS2 game for one version, with the fixes' values.
+#[tauri::command]
+async fn differences(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+) -> Result<openrac_launcher_core::differences::Differences, String> {
+    let root = differences_root(&state);
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::differences::view(root.as_deref(), &home, &game, &version)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Switches a game fix on (the port's) or off (the console's behaviour) in the version's settings.
+#[tauri::command]
+async fn set_game_fix(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+    on: bool,
+) -> Result<openrac_launcher_core::differences::Differences, String> {
+    let root = differences_root(&state);
+    let home = openrac_launcher_core::saves::data_home();
+    let what = format!("{game}/{version}: game fix {id} {}", if on { "on" } else { "off (the original's)" });
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::differences::set_fix(root.as_deref(), &home, &game, &version, &id, on)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        launcher_log::line(&what);
+    }
+    result
+}
+
+// ---- The controls files (core/src/controls.rs) ----
+//
+// No page shows them yet; these are what a controls page will call. The game reads a changed
+// file within a second, so they may run while it plays.
+
+/// The controls as `game` reads them (over every game's), or every game's alone; for every player,
+/// or as `player` (0 or 1) reads them.
+#[tauri::command]
+async fn controls_view(
+    game: Option<String>,
+    player: Option<u8>,
+) -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::controls::view(&home, game.as_deref(), player))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Sets a control, a controller setting or a player in `scope`'s file; None removes it.
+#[tauri::command]
+async fn controls_set(
+    scope: openrac_launcher_core::controls::Scope,
+    key: String,
+    value: Option<String>,
+) -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    let what = format!("controls: {key} = {} ({scope:?})", value.as_deref().unwrap_or("(inherited)"));
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::controls::set(&home, &scope, &key, value.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        launcher_log::line(&what);
+    }
+    result
+}
+
+/// Puts `scope` back to what it inherits.
+#[tauri::command]
+async fn controls_reset(
+    scope: openrac_launcher_core::controls::Scope,
+) -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    let what = format!("controls: reset {scope:?}");
+    let result = tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::controls::reset(&home, &scope))
+        .await
+        .map_err(|e| e.to_string())?;
+    if result.is_ok() {
+        launcher_log::line(&what);
+    }
+    result
+}
+
+/// One player's own controls out of `scope`'s file: they read every player's again.
+#[tauri::command]
+async fn controls_reset_player(
+    scope: openrac_launcher_core::controls::Scope,
+    player: u8,
+) -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::controls::reset_player(&home, &scope, player))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The players back to the defaults.
+#[tauri::command]
+async fn controls_reset_players() -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::controls::reset_players(&home))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Writes `scope`'s bindings and controller settings to a file of the player's choosing.
+#[tauri::command]
+async fn controls_export(scope: openrac_launcher_core::controls::Scope, path: String) -> Result<(), String> {
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::controls::export(&home, &scope, std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Replaces `scope`'s bindings and controller settings with a file's.
+#[tauri::command]
+async fn controls_import(
+    scope: openrac_launcher_core::controls::Scope,
+    path: String,
+) -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::controls::import(&home, &scope, std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Copies one game's own controls over another's.
+#[tauri::command]
+async fn controls_copy(from: String, to: String) -> Result<openrac_launcher_core::controls::ControlsView, String> {
+    let home = openrac_launcher_core::saves::data_home();
+    tauri::async_runtime::spawn_blocking(move || openrac_launcher_core::controls::copy_game(&home, &from, &to))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// ---- Logs and crash reports (core/src/reports.rs) ----
+
+/// A game's data folder, where its logs and crash reports are.
+fn game_data(state: &State<'_, AppState>, game: &str) -> Result<PathBuf, String> {
+    if game.is_empty() || game.contains(['/', '\\', '.']) {
+        return Err(format!("{game} is not a game"));
+    }
+    let install = state.config.lock().unwrap().install_dir.clone().ok_or("no install folder (Settings)")?;
+    Ok(install::data_dir(&install, game))
+}
+
+#[tauri::command]
+async fn reports_list(state: State<'_, AppState>, game: String) -> Result<Vec<ReportEntry>, String> {
+    let data = game_data(&state, &game)?;
+    tauri::async_runtime::spawn_blocking(move || reports::list(&data)).await.map_err(|e| e.to_string())
+}
+
+/// Deletes one log or crash report of a game from its data folder (core checks the name).
+#[tauri::command]
+async fn report_delete(state: State<'_, AppState>, game: String, file: String) -> Result<(), String> {
+    let data = game_data(&state, &game)?;
+    let name = file.clone();
+    let g = game.clone();
+    tauri::async_runtime::spawn_blocking(move || reports::delete(&data, &g, &file))
+        .await
+        .map_err(|e| e.to_string())??;
+    launcher_log::line(&format!("deleted a report of {game}: {name}"));
+    Ok(())
+}
+
+/// Deletes every log and crash report of a game; returns how many files went.
+#[tauri::command]
+async fn reports_delete_all(state: State<'_, AppState>, game: String) -> Result<usize, String> {
+    let data = game_data(&state, &game)?;
+    let g = game.clone();
+    let count = tauri::async_runtime::spawn_blocking(move || reports::delete_all(&data, &g))
+        .await
+        .map_err(|e| e.to_string())??;
+    launcher_log::line(&format!("deleted all {count} reports of {game}"));
+    Ok(count)
+}
+
+/// The newest crash report written since `since` (seconds since 1970): after the game stopped.
+#[tauri::command]
+async fn latest_crash(state: State<'_, AppState>, game: String, since: u64) -> Result<Option<ReportEntry>, String> {
+    let data = game_data(&state, &game)?;
+    let found = tauri::async_runtime::spawn_blocking(move || reports::latest_crash(&data, since))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(e) = &found {
+        launcher_log::line(&format!(
+            "the game stopped unexpectedly: {} ({})",
+            e.file,
+            e.reason.as_deref().unwrap_or("?")
+        ));
+    }
+    Ok(found)
+}
+
+#[tauri::command]
+async fn report_text(app: AppHandle, state: State<'_, AppState>, game: String, file: String) -> Result<String, String> {
+    let data = game_data(&state, &game)?;
+    let version = app.package_info().version.to_string();
+    tauri::async_runtime::spawn_blocking(move || reports::copy_text(&data, &file, &version))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Saves the .zip for `file` in the player's Downloads folder and shows it there; returns its path.
+#[tauri::command]
+async fn report_save(app: AppHandle, state: State<'_, AppState>, game: String, file: String) -> Result<String, String> {
+    let data = game_data(&state, &game)?;
+    let version = app.package_info().version.to_string();
+    // Android: made in the launcher's cache, then saved where the player chooses.
+    let folder = if cfg!(target_os = "android") {
+        let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("reports");
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        cache
+    } else {
+        reports::save_folder().ok_or("no folder to save in")?
+    };
+    let name = reports::bundle_name(&file);
+    let out = folder.join(&name);
+    let target = out.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        reports::bundle(&data, &file, launcher_log::path().as_deref(), &version, &target)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if cfg!(target_os = "android") {
+        let saved = android::save_as(&app, &out, &name).await;
+        let _ = std::fs::remove_file(&out);
+        return match saved? {
+            Some(name) => {
+                launcher_log::line(&format!("saved a report: {name}"));
+                Ok(name)
+            }
+            None => Ok(String::new()), // backed out: nothing to say
+        };
+    }
+    launcher_log::line(&format!("saved a report: {}", out.display()));
+    let _ = app.opener().reveal_item_in_dir(&out);
+    Ok(reports::tidy(&out.to_string_lossy(), reports::home().as_deref()))
+}
+
+/// Opens the folder a game's logs are in (its crash reports' folder when `crashes`).
+#[tauri::command]
+fn open_reports_folder(app: AppHandle, state: State<'_, AppState>, game: String, crashes: bool) -> Result<(), String> {
+    let data = game_data(&state, &game)?;
+    let dir = if crashes && data.join("crashes").is_dir() { data.join("crashes") } else { data };
+    if !dir.is_dir() {
+        return Err("nothing has been logged for this game yet".into());
+    }
+    open_path_with_system(&app, &dir.to_string_lossy())
+}
+
+#[tauri::command]
+fn set_discord_status(
+    state: State<'_, AppState>,
+    status: openrac_launcher_core::discord::DiscordStatus,
+) -> Result<(), String> {
+    let config = state.config.lock().unwrap().clone();
+    let discord = state.discord.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let mut discord = discord.lock().unwrap();
+            if !config.discord_rpc {
+                let _ = discord.ipc.clear();
+                return;
+            }
+            let app_start = discord.app_start;
+            let _ = discord.ipc.set_status(&status, app_start);
+        })
+        .await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_job(state: State<'_, AppState>, id: u32) -> Result<(), String> {
+    state.jobs.cancel(id)
+}
+
+/// Opens a file or folder of the checkout (a README, baserom/) with the
+/// system's default app. Paths outside the checkout are refused.
+#[tauri::command]
+fn open_path(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let (root, install) = {
+        let c = state.config.lock().unwrap();
+        (c.root.clone().ok_or("the OpenRAC folder is not set")?, c.install_dir.clone())
+    };
+    let rel = path.split('#').next().unwrap_or_default();
+    // An installed launcher's own folder is read-only (an AppImage, the macOS app): the folders a
+    // checkout keeps under assets/ are the game's, in the per-user install folder.
+    let on_copy = state.bundled.as_deref().is_some_and(|copy| detect::on_the_copy(Some(&root), copy));
+    if let (true, Some(install)) = (on_copy, install.as_deref()) {
+        if let Some(folder) = install::player_folder(install, rel) {
+            std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+            return open_path_with_system(&app, &folder.to_string_lossy());
+        }
+    }
+    let root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+    let wanted = openrac_launcher_core::under(&root, rel);
+    if rel.starts_with("assets/") && !rel.split('/').any(|part| part == "..") && !wanted.exists() {
+        // A folder the tools write (the level editor's projects, packed levels) before they first
+        // have: opened empty rather than refused.
+        std::fs::create_dir_all(&wanted).map_err(|e| format!("{path}: {e}"))?;
+    }
+    let target = std::fs::canonicalize(wanted).map_err(|e| format!("{path}: {e}"))?;
+    if !target.starts_with(&root) {
+        return Err(format!("{path} is outside the OpenRAC folder"));
+    }
+    open_path_with_system(&app, &target.to_string_lossy())
+}
+
+/// Opens a web page in the browser: https only.
+#[tauri::command]
+fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(format!("not an https address: {url}"));
+    }
+    open_url_with_system(&app, &url)
+}
+
+/// Sets `game` up from the image of the player's own disc, OpenGOAL's way:
+/// runs the extractor (extract and validate) as a job whose output streams
+/// like any other job's. Returns the job.
+#[tauri::command]
+fn install_game(app: AppHandle, state: State<'_, AppState>, game: String, image: PathBuf) -> Result<Started, String> {
+    let config = state.config.lock().unwrap().clone();
+    let install_dir = config.install_dir.clone().ok_or("no install folder (Settings)")?;
+    let plan = install::plan_extract(&config, &install_dir, &game, &image)?;
+    // A developer's other disc set up before is kept aside, not replaced, and the image is
+    // remembered as its version's, for the disc switch (disc_choice.rs).
+    if config.developer {
+        let catalog = openrac_launcher_core::catalog::load(config.root()?)?;
+        disc_choice::before_set_up(&config, &catalog, &game, &image)?;
+        let mut current = state.config.lock().unwrap();
+        if let (true, Some(file)) =
+            (disc_choice::remember(&mut current, &catalog, &game, &image), state.config_file.as_deref())
+        {
+            config::save(file, &current)?;
+        }
+    }
+    state.jobs.start(&plan, config.root.as_deref(), move |event| {
+        let _ = match &event {
+            Event::Output { .. } => app.emit("job-output", &event),
+            Event::Exit { .. } => app.emit("job-exit", &event),
+        };
+    })
+}
+
+/// The plain image setting a game up reads: an .iso as it is; a CHD unpacked once into
+/// `<install>/discs/<name>.iso` (core/src/chd.rs), with `disc-copy` events as it goes.
+#[tauri::command]
+async fn prepare_disc(app: AppHandle, state: State<'_, AppState>, image: PathBuf) -> Result<PathBuf, String> {
+    use openrac_launcher_core::chd;
+    if !chd::is_chd(&image) {
+        return Ok(image);
+    }
+    let install_dir = state.config.lock().unwrap().install_dir.clone().ok_or("no install folder (Settings)")?;
+    let name = image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dest = install_dir.join("discs").join(chd::iso_name(&name));
+    let unpacked = dest.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = std::fs::File::open(&image).map_err(|e| format!("{}: {e}", image.display()))?;
+        chd::to_iso(file, &unpacked, |copied, total| {
+            let _ = app.emit("disc-copy", android::DiscCopy { name: name.clone(), copied, total });
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("cannot unpack the CHD image: {e}"))?;
+    Ok(dest)
+}
+
+/// The games folder looked through: the games OpenRAC knows among its images, and, for a
+/// developer, the games the launcher knows more than one disc of, in the games folder or not
+/// (disc_choice.rs).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscScan {
+    found: Vec<FoundDisc>,
+    choices: Vec<DiscChoice>,
+}
+
+fn scan(config: &Config) -> Result<(openrac_launcher_core::catalog::Catalog, Vec<FoundDisc>), String> {
+    let catalog = openrac_launcher_core::catalog::load(config.root()?)?;
+    let mut found = config.discs_dir.as_deref().map(|dir| discs::scan(dir, &catalog)).unwrap_or_default();
+    // A developer's checkout keeps its discs in `baserom/` (and each game's `games/<game>/baserom/`):
+    // those count too, after the games folder's, so the disc switch sees them without one.
+    if config.developer {
+        let root = config.root()?;
+        let mut dirs = vec![root.join("baserom")];
+        if let Ok(games) = std::fs::read_dir(root.join("games")) {
+            let mut games: Vec<_> = games.flatten().map(|e| e.path().join("baserom")).collect();
+            games.sort();
+            dirs.extend(games);
+        }
+        for dir in dirs.iter().filter(|d| d.is_dir()) {
+            for disc in discs::scan(dir, &catalog) {
+                if !found.iter().any(|f| f.version == disc.version) {
+                    found.push(disc);
+                }
+            }
+        }
+    }
+    Ok((catalog, found))
+}
+
+/// The games OpenRAC knows among the images in the player's games folder (none when no folder
+/// is chosen), and the discs a developer can choose between: also without a games folder, from
+/// the images and set-ups of each version (disc_choice.rs).
+#[tauri::command]
+async fn scan_discs(state: State<'_, AppState>) -> Result<DiscScan, String> {
+    let config = state.config.lock().unwrap().clone();
+    if config.root.is_none() || (config.discs_dir.is_none() && !config.developer) {
+        return Ok(DiscScan { found: Vec::new(), choices: Vec::new() });
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let (catalog, found) = scan(&config)?;
+        let choices = disc_choice::choices(&config, &catalog, &found);
+        Ok(DiscScan { found, choices })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Developers only: plays `version`'s disc of its game from now on. Its set-up is put in place
+/// and the other kept aside (disc_choice.rs); the choice is saved in the settings.
+#[tauri::command]
+async fn choose_disc(state: State<'_, AppState>, version: String) -> Result<Config, String> {
+    let file = state.config_file.clone().ok_or("no per-user config folder")?;
+    let mut config = state.config.lock().unwrap().clone();
+    let config = tauri::async_runtime::spawn_blocking(move || {
+        let (catalog, found) = scan(&config)?;
+        disc_choice::choose(&mut config, &catalog, &found, &version)?;
+        config::save(&file, &config)?;
+        Ok::<_, String>(config)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *state.config.lock().unwrap() = config.clone();
+    Ok(config)
+}
+
+/// Removes what setting `game` up made (OpenGOAL's uninstall); the player's
+/// disc image and saves are left alone.
+#[tauri::command]
+async fn uninstall_game(state: State<'_, AppState>, game: String) -> Result<(), String> {
+    let install_dir = state.config.lock().unwrap().install_dir.clone().ok_or("no install folder (Settings)")?;
+    tauri::async_runtime::spawn_blocking(move || install::uninstall(&install_dir, &game))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sync_progress_from_web(state: State<'_, AppState>) -> Result<Library, String> {
+    let config = state.config.lock().unwrap().clone();
+    let root = config.root.clone().ok_or("the OpenRAC folder is not set")?;
+    let cache = config.progress_cache.clone().ok_or("no per-user folder for the launcher's own files")?;
+
+    // Every project's latest progress from bytematch.dev, with curl (core progress_sync.rs).
+    // Offline, or when the site cannot be read, the kept copy is read as it was.
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = openrac_launcher_core::progress_sync::sync(&root, &cache, &remote::QuickCurl);
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    tauri::async_runtime::spawn_blocking(move || library::library(&config)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn apply_progress_json(state: State<'_, AppState>, json: String) -> Result<Library, String> {
+    let config = state.config.lock().unwrap().clone();
+    let root = config.root.clone().ok_or("the OpenRAC folder is not set")?;
+    let cache = config.progress_cache.clone().ok_or("no per-user folder for the launcher's own files")?;
+    openrac_launcher_core::catalog::update_progress_from_bytematch(&root, &cache, &json, &Default::default())?;
+    tauri::async_runtime::spawn_blocking(move || library::library(&config)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn inspect_saves(serial: String) -> openrac_launcher_core::saves::GameSaveStatus {
+    openrac_launcher_core::saves::inspect_saves(&serial)
+}
+
+#[tauri::command]
+fn backup_saves(serial: String, note: Option<String>) -> Result<openrac_launcher_core::saves::SaveBackupInfo, String> {
+    openrac_launcher_core::saves::backup_saves(&serial, note.as_deref())
+}
+
+/// Whether the game runs with a memory card (the name to show when it does), for an edit or a
+/// restore: on a desktop from the process list when asked, on Android from the game's activity,
+/// asked here before (android.rs, game_holding_card).
+async fn card_check(app: &AppHandle) -> Result<impl Fn(&Path, &str) -> Result<Option<String>, String>, String> {
+    #[cfg(target_os = "android")]
+    let running = android::game_holding_card(app).await?;
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    Ok(move |card: &Path, serial: &str| {
+        #[cfg(target_os = "android")]
+        {
+            let _ = (card, serial);
+            Ok(running.clone())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            openrac_launcher_core::save_edit::card_in_use(card, serial)
+        }
+    })
+}
+
+/// Restores a backup of the card; refused while the game runs with it, as an edit is.
+#[tauri::command]
+async fn restore_backup(app: AppHandle, serial: String, backup_name: String) -> Result<(), String> {
+    let in_use = card_check(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        if let Some(game) = in_use(&card, &serial)? {
+            return Err(format!("{game} is running with this memory card: close it first"));
+        }
+        openrac_launcher_core::saves::restore_backup(&serial, &backup_name)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Copies the game's saves from a PCSX2 memory card (a card file, or a folder card) onto its card,
+/// after a backup; refused while the game runs with it, as a restore is.
+#[tauri::command]
+async fn import_pcsx2_saves(
+    app: AppHandle,
+    serial: String,
+    source: String,
+) -> Result<openrac_launcher_core::pcsx2_card::ImportedSaves, String> {
+    let in_use = card_check(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        if let Some(game) = in_use(&card, &serial)? {
+            return Err(format!("{game} is running with this memory card: close it first"));
+        }
+        openrac_launcher_core::pcsx2_card::import_saves(&serial, Path::new(&source))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Exports the game's saves (all, or the slot `slot`) to an OpenRAC saves file
+/// (core/src/save_transfer.rs) where the player chooses: the system's save dialog, opening in
+/// Downloads, or on Android its "save as" screen. `saved` is empty when they backed out.
+#[tauri::command]
+async fn export_saves(
+    app: AppHandle,
+    serial: String,
+    slot: Option<usize>,
+) -> Result<openrac_launcher_core::save_transfer::ExportedSaves, String> {
+    use openrac_launcher_core::save_transfer::{self, ExportedSaves};
+    let version = app.package_info().version.to_string();
+    let name = save_transfer::export_name(&serial, slot);
+    let backed_out = || ExportedSaves { saved: String::new(), slots: Vec::new() };
+    // Android: made in the launcher's cache, then saved where the player chooses.
+    #[cfg(target_os = "android")]
+    let dest = {
+        let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("save-exports");
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        cache.join(&name)
+    };
+    #[cfg(not(target_os = "android"))]
+    let dest = {
+        use tauri_plugin_dialog::DialogExt;
+        let mut dialog =
+            app.dialog().file().set_title("Export saves").set_file_name(&name).add_filter("OpenRAC saves", &["zip"]);
+        if let Some(dir) = reports::save_folder() {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_save_file())
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(picked) = picked else { return Ok(backed_out()) };
+        picked.into_path().map_err(|e| e.to_string())?
+    };
+    let out = dest.clone();
+    let manifest =
+        tauri::async_runtime::spawn_blocking(move || save_transfer::export_saves(&serial, slot, &version, &out))
+            .await
+            .map_err(|e| e.to_string())??;
+    let slots = manifest.slots.into_iter().filter(|s| !s.empty).collect();
+    if cfg!(target_os = "android") {
+        let saved = android::save_as(&app, &dest, &name).await;
+        let _ = std::fs::remove_file(&dest);
+        let Some(saved) = saved? else { return Ok(backed_out()) };
+        launcher_log::line(&format!("exported saves: {saved}"));
+        return Ok(ExportedSaves { saved, slots });
+    }
+    launcher_log::line(&format!("exported saves: {}", dest.display()));
+    Ok(ExportedSaves { saved: reports::tidy(&dest.to_string_lossy(), reports::home().as_deref()), slots })
+}
+
+/// What an OpenRAC saves file holds, before importing it: refused for another game's file or a
+/// damaged one.
+#[tauri::command]
+async fn preview_save_import(
+    serial: String,
+    source: String,
+) -> Result<openrac_launcher_core::save_transfer::SaveImportPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        openrac_launcher_core::save_transfer::preview_import(&serial, Path::new(&source))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Imports an OpenRAC saves file onto the game's card, after a backup: every save folder replaced,
+/// or the chosen slots merged. Refused while the game runs with the card, as a restore is.
+#[tauri::command]
+async fn import_saves(
+    app: AppHandle,
+    serial: String,
+    source: String,
+    choice: openrac_launcher_core::save_transfer::SaveImportChoice,
+) -> Result<openrac_launcher_core::pcsx2_card::ImportedSaves, String> {
+    let in_use = card_check(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        if let Some(game) = in_use(&card, &serial)? {
+            return Err(format!("{game} is running with this memory card: close it first"));
+        }
+        let done = openrac_launcher_core::save_transfer::import_saves(&serial, Path::new(&source), &choice)?;
+        launcher_log::line(&format!("imported saves into {serial}: {} files", done.files));
+        Ok(done)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Where PCSX2 keeps its memory cards, for the file picker to open there; None when not found.
+#[tauri::command]
+fn pcsx2_memcards_dir() -> Option<String> {
+    openrac_launcher_core::pcsx2_card::pcsx2_memcards_dir().map(|p| p.to_string_lossy().to_string())
+}
+
+/// The skill points' names from the set-up rac1 disc (`<install>/active/rac1/data/iso_data/rac1/
+/// disc.iso`; both rac1 discs hold the same names at the same text ids), or none.
+fn skill_names(install: Option<PathBuf>) -> Vec<String> {
+    install
+        .map(|i| install::data_dir(&i, "rac1").join("iso_data").join("rac1").join("disc.iso"))
+        .and_then(|iso| openrac_launcher_core::save_edit::skill_point_names(&iso))
+        .unwrap_or_default()
+}
+
+/// One save slot for the save editor (core/src/save_edit.rs), with the skill points' names.
+#[tauri::command]
+async fn read_save(
+    state: State<'_, AppState>,
+    serial: String,
+    slot: usize,
+) -> Result<openrac_launcher_core::save_edit::SaveView, String> {
+    let install = state.config.lock().unwrap().install_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        let mut view = openrac_launcher_core::save_edit::read_save(&card, &serial, slot)?;
+        view.skill_names = skill_names(install);
+        Ok(view)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Writes the save editor's change into a slot: refused while the game runs with the card or if
+/// the file changed since it was read; the card is backed up first. Raw chunk edits only with the
+/// advanced save editor switched on in Settings.
+#[tauri::command]
+async fn write_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    serial: String,
+    slot: usize,
+    fingerprint: String,
+    change: openrac_launcher_core::save_edit::SaveChange,
+) -> Result<openrac_launcher_core::save_edit::WriteResult, String> {
+    use openrac_launcher_core::save_edit;
+    let (advanced, install) = {
+        let c = state.config.lock().unwrap();
+        (c.save_editor_advanced, c.install_dir.clone())
+    };
+    if matches!(change, save_edit::SaveChange::Raw { .. }) && !advanced {
+        return Err("raw edits need the advanced save editor (Settings)".into());
+    }
+    let in_use = card_check(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        let mut result = save_edit::write_save(&card, &serial, slot, &fingerprint, &change, || in_use(&card, &serial))?;
+        result.view.skill_names = skill_names(install);
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One Going Commando save slot for its save editor (core/src/save_edit_rac2.rs).
+#[tauri::command]
+async fn read_save_rac2(
+    serial: String,
+    slot: usize,
+) -> Result<openrac_launcher_core::save_edit_rac2::Rac2SaveView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        openrac_launcher_core::save_edit_rac2::read_save(&card, &serial, slot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Writes the Going Commando save editor's fields into a slot, with write_save's guards: refused
+/// while the game runs with the card or if the file changed since it was read; backed up first.
+#[tauri::command]
+async fn write_save_rac2(
+    app: AppHandle,
+    serial: String,
+    slot: usize,
+    fingerprint: String,
+    fields: openrac_launcher_core::save_edit_rac2::Rac2SaveFields,
+) -> Result<openrac_launcher_core::save_edit_rac2::Rac2WriteResult, String> {
+    let in_use = card_check(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        openrac_launcher_core::save_edit_rac2::write_save(&card, &serial, slot, &fingerprint, &fields, || {
+            in_use(&card, &serial)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The Going Commando save editor's advanced fields of a slot (core/src/save_edit_rac2_extra.rs).
+#[tauri::command]
+async fn read_save_rac2_extra(
+    serial: String,
+    slot: usize,
+) -> Result<openrac_launcher_core::save_edit_rac2_extra::Rac2ExtraView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        openrac_launcher_core::save_edit_rac2_extra::read_save(&card, &serial, slot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Writes the advanced fields into a slot, with write_save_rac2's guards.
+#[tauri::command]
+async fn write_save_rac2_extra(
+    app: AppHandle,
+    serial: String,
+    slot: usize,
+    fingerprint: String,
+    fields: openrac_launcher_core::save_edit_rac2_extra::Rac2ExtraFields,
+) -> Result<openrac_launcher_core::save_edit_rac2_extra::Rac2ExtraWriteResult, String> {
+    let in_use = card_check(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let card = openrac_launcher_core::saves::get_memcard_dir(&serial);
+        openrac_launcher_core::save_edit_rac2_extra::write_save(&card, &serial, slot, &fingerprint, &fields, || {
+            in_use(&card, &serial)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A game's overrides folder (`<data>/overrides`), from the install folder in Settings.
+fn overrides_dir(state: &State<'_, AppState>, game: &str) -> Result<PathBuf, String> {
+    let install = state.config.lock().unwrap().install_dir.clone().ok_or("no install folder (Settings)")?;
+    Ok(overrides::dir(&install, game))
+}
+
+/// The game's overrides packs, in the order they apply.
+#[tauri::command]
+fn overrides_list(state: State<'_, AppState>, game: String) -> Result<Vec<PackView>, String> {
+    overrides::list(&overrides_dir(&state, &game)?)
+}
+
+/// Existing level/asset pack records; this does not prepare or launch the game.
+#[tauri::command]
+fn overrides_summary(
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<openrac_launcher_core::mod_summary::ModLoadSummary, String> {
+    let edition = match version.as_str() {
+        "rac1/pal" => "pal",
+        "rac1/ntsc" => "ntsc",
+        _ => return Err("Choose a supported RAC1 disc version".into()),
+    };
+    let config = state.config.lock().unwrap().clone();
+    let root = config.root.as_deref().ok_or("the OpenRAC folder is not set")?;
+    let data = game_data(&state, "rac1")?;
+    let standalone = state.bundled.as_deref().is_some_and(|copy| detect::on_the_copy(Some(root), copy));
+    let packed =
+        if standalone { data.join("packed").join(edition) } else { root.join("assets/packed/rac1").join(edition) };
+    openrac_launcher_core::mod_summary::read(&data, &packed, edition)
+}
+
+#[tauri::command]
+fn overrides_set_enabled(
+    state: State<'_, AppState>,
+    game: String,
+    id: String,
+    enabled: bool,
+) -> Result<Vec<PackView>, String> {
+    overrides::set_enabled(&overrides_dir(&state, &game)?, &id, enabled)
+}
+
+#[tauri::command]
+fn overrides_move(state: State<'_, AppState>, game: String, id: String, up: bool) -> Result<Vec<PackView>, String> {
+    overrides::move_pack(&overrides_dir(&state, &game)?, &id, up)
+}
+
+#[tauri::command]
+fn overrides_remove(state: State<'_, AppState>, game: String, id: String) -> Result<Vec<PackView>, String> {
+    overrides::remove(&overrides_dir(&state, &game)?, &id)
+}
+
+/// Where `version`'s level editor data is (core reset.rs), from the checkout and the install folder
+/// in Settings; the version must be one the checkout's catalogue knows.
+pub(crate) fn reset_layout(state: &State<'_, AppState>, version: &str) -> Result<reset::Layout, String> {
+    let config = state.config.lock().unwrap().clone();
+    let root = config.root()?.to_path_buf();
+    let install = config.install_dir.clone().ok_or("no install folder (Settings)")?;
+    let catalog = openrac_launcher_core::catalog::load(&root)?;
+    let v = catalog.version(version).ok_or_else(|| format!("{version} is not a version OpenRAC knows"))?;
+    let installed = state.bundled.as_deref().is_some_and(|copy| detect::on_the_copy(Some(&root), copy));
+    reset::Layout::new(&root, &install, &v.game, &v.name, installed)
+}
+
+/// What a reset of `version`'s level editor data would remove, and how much (the Mods page's
+/// Your levels section asks with it).
+#[tauri::command]
+async fn reset_preview(
+    state: State<'_, AppState>,
+    version: String,
+    reset: reset::Reset,
+) -> Result<reset::ResetPreview, String> {
+    let layout = reset_layout(&state, &version)?;
+    tauri::async_runtime::spawn_blocking(move || reset::preview(&layout, reset)).await.map_err(|e| e.to_string())?
+}
+
+/// Removes it: never while a job runs (an extraction writing those folders, the game reading them).
+#[tauri::command]
+async fn reset_apply(
+    state: State<'_, AppState>,
+    version: String,
+    reset: reset::Reset,
+    with_edits: bool,
+) -> Result<reset::ResetDone, String> {
+    if !state.jobs.running().is_empty() {
+        return Err("busy: wait for what is running to end".into());
+    }
+    let layout = reset_layout(&state, &version)?;
+    launcher_log::line(&format!("reset: {version} {reset:?} with_edits={with_edits}"));
+    let done = tauri::async_runtime::spawn_blocking(move || reset::apply(&layout, reset, with_edits))
+        .await
+        .map_err(|e| e.to_string())?;
+    match &done {
+        Ok(d) => launcher_log::line(&format!("reset: removed {} folder(s), {} file(s)", d.folders, d.files)),
+        Err(e) => launcher_log::line(&format!("reset: {e}")),
+    }
+    done
+}
+
+/// Where the player is with `version`'s level editor (core editor_state.rs): the Mods page's status
+/// panel asks on opening, on focus and when an editor job ends.
+#[tauri::command]
+async fn editor_state(state: State<'_, AppState>, version: String) -> Result<editor_state::EditorState, String> {
+    let layout = reset_layout(&state, &version)?;
+    let root = state.config.lock().unwrap().root()?.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let format = editor_state::ProjectFormat::load(&root);
+        editor_state::inspect(&layout, format.as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// A game's native mods' folder (`<data>/plugins`, docs/port/MODS.md), from the install folder in
+/// Settings.
+fn plugins_dir(state: &State<'_, AppState>, game: &str) -> Result<PathBuf, String> {
+    let install = state.config.lock().unwrap().install_dir.clone().ok_or("no install folder (Settings)")?;
+    Ok(plugins::dir(&install, game))
+}
+
+/// Runs a change to a game's native mods away from the window's thread.
+async fn on_plugins<T: Send + 'static>(
+    state: State<'_, AppState>,
+    game: &str,
+    work: impl FnOnce(&Path) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let dir = plugins_dir(&state, game)?;
+    tauri::async_runtime::spawn_blocking(move || work(&dir)).await.map_err(|e| e.to_string())?
+}
+
+/// The game's native mods in load order, as they stand for its disc `version` (`pal`).
+#[tauri::command]
+async fn plugins_list(state: State<'_, AppState>, game: String, version: String) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| {
+        let mut views = plugins::list(dir, &g, &version)?;
+        plugins::show_player_name(&mut views, &name);
+        Ok(views)
+    })
+    .await
+}
+
+/// Whether a mod that is on in one of `games` uses the Multiplayer name (Settings shows the
+/// field only then).
+#[tauri::command]
+async fn player_name_used(state: State<'_, AppState>, games: Vec<String>) -> Result<bool, String> {
+    let Some(install) = state.config.lock().unwrap().install_dir.clone() else {
+        return Ok(false);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        games.iter().any(|g| plugins::uses_player_name(&plugins::dir(&install, g)))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The launcher's Multiplayer name, for the mod settings that default to it (empty when invalid).
+fn player_name(state: &State<'_, AppState>) -> String {
+    let name = state.config.lock().unwrap().multiplayer_name.clone();
+    if openrac_launcher_core::multiplayer::is_valid(&name) {
+        name
+    } else {
+        String::new()
+    }
+}
+
+#[tauri::command]
+async fn plugins_set_enabled(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+    enabled: bool,
+) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| {
+        let mut views = plugins::set_enabled(dir, &g, &version, &id, enabled)?;
+        plugins::show_player_name(&mut views, &name);
+        Ok(views)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn plugins_move(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+    up: bool,
+) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| {
+        let mut views = plugins::move_mod(dir, &g, &version, &id, up)?;
+        plugins::show_player_name(&mut views, &name);
+        Ok(views)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn plugins_set_setting(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+    key: String,
+    value: serde_json::Value,
+) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| plugins::set_setting(dir, &g, &version, &id, &key, value, &name)).await
+}
+
+#[tauri::command]
+async fn plugins_remove(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| {
+        let mut left = plugins::remove(dir, &g, &version, &id)?;
+        remote::forget(dir, &id)?;
+        plugins::show_player_name(&mut left, &name);
+        Ok(left)
+    })
+    .await
+}
+
+/// Adds a mod from a .zip or a folder: a native mod to the store, or the answer that it is a data
+/// pack (the page then adds it to the overrides with `overrides-add`).
+#[tauri::command]
+async fn plugins_install(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    path: PathBuf,
+) -> Result<Installed, String> {
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| plugins::install(dir, &g, &version, &path)).await
+}
+
+/// The mods a chosen folder holds (one mod, or a repository's checkout of several).
+#[tauri::command]
+fn plugins_mod_folders(path: PathBuf) -> Result<Vec<PathBuf>, String> {
+    plugins::mod_folders(&path)
+}
+
+/// What the port did with the game's mods at its last start (`status.json`), if it wrote it.
+/// A game's mods from a repository's address (docs/port/MODS.md, section 10): what it holds,
+/// installing one, newer versions, keeping one at its version. Through curl, no git needed; on
+/// Android, which has no curl, through the Kotlin side's download (android::KotlinFetch).
+fn with_remote<T>(
+    app: &AppHandle,
+    dir: &Path,
+    game: &str,
+    version: &str,
+    work: impl FnOnce(&remote::Context) -> T,
+) -> T {
+    // GitHub's API answers are shared for a few minutes (remote::ApiCache): a look for updates and
+    // the updates of a repository's several mods read it once.
+    #[cfg(target_os = "android")]
+    let fetch = remote::Cached::shared(android::KotlinFetch { app: app.clone() });
+    #[cfg(not(target_os = "android"))]
+    let fetch = {
+        let _ = app;
+        remote::Cached::shared(remote::Curl)
+    };
+    work(&remote::Context {
+        dir,
+        game,
+        version,
+        platform: plugins::platform_key(),
+        fetch: &fetch,
+        hosts: remote::Hosts::default(),
+    })
+}
+
+#[tauri::command]
+async fn plugins_preview(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    url: String,
+) -> Result<remote::Preview, String> {
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| with_remote(&app, dir, &g, &version, |c| remote::preview(c, &url))).await
+}
+
+#[tauri::command]
+async fn plugins_install_remote(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    url: String,
+    id: String,
+) -> Result<remote::RemoteInstalled, String> {
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| with_remote(&app, dir, &g, &version, |c| remote::install(c, &url, &id))).await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    updates: Vec<remote::Update>,
+    errors: Vec<String>,
+}
+
+/// A game's mod codes (core/src/modset.rs): what sharing would hold, making a code, what a code would
+/// change, applying it, and the saved sets to go back to.
+#[tauri::command]
+async fn modset_share_preview(state: State<'_, AppState>, game: String) -> Result<modset::SharePreview, String> {
+    on_plugins(state, &game, modset::share_preview).await
+}
+
+#[tauri::command]
+async fn modset_share(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    extras: Vec<String>,
+) -> Result<modset::Shared, String> {
+    let (player, install) = {
+        let config = state.config.lock().unwrap();
+        (config.multiplayer_name.clone(), config.install_dir.clone())
+    };
+    let name = if openrac_launcher_core::multiplayer::is_valid(&player) {
+        format!("{player}'s mods")
+    } else {
+        "Shared mods".to_string()
+    };
+    let packs_dir = install.map(|i| overrides::dir(&i, &game));
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| {
+        // Packs a code names and cannot fetch: the ones that are on, by a name it can carry.
+        let packs = packs_dir
+            .and_then(|d| overrides::list(&d).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.enabled && plugins::valid_id(&p.id))
+            .take(modset::MAX_MODS)
+            .map(|p| modset::SetPack { id: p.id, digest: None })
+            .collect();
+        let set = with_remote(&app, dir, &g, &version, |c| {
+            modset::build(c, &extras, &name, &modset::port_version(dir), packs, &modset::now_utc())
+        })?;
+        modset::share(dir, &modset::HttpStore::default(), &set)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn modset_review(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    text: String,
+) -> Result<modset::Review, String> {
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| {
+        let (entered, party) = modset::split_party(&text);
+        let (set, code) = modset::resolve(&modset::HttpStore::default(), &entered)?;
+        with_remote(&app, dir, &g, &version, |c| {
+            modset::review(c, &set, code, &modset::port_version(dir)).map(|mut r| {
+                r.party = party.clone();
+                r
+            })
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn modset_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    set: String,
+    code: Option<String>,
+    choices: modset::Choices,
+) -> Result<modset::Applied, String> {
+    if !state.jobs.running().is_empty() {
+        return Err("The game is running: close it, then apply the code.".into());
+    }
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| {
+        with_remote(&app, dir, &g, &version, |c| {
+            modset::apply(c, &set, code.as_deref(), &choices, &modset::port_version(dir), &modset::now_utc())
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn modset_profiles(state: State<'_, AppState>, game: String) -> Result<Vec<profile::View>, String> {
+    on_plugins(state, &game, |dir| Ok(profile::list(dir))).await
+}
+
+#[tauri::command]
+async fn modset_restore(state: State<'_, AppState>, game: String, id: String) -> Result<(), String> {
+    // The game reads its mods as it runs: they change only once it has closed.
+    if !state.jobs.running().is_empty() {
+        return Err("The game is running: close it, then put the mods back.".into());
+    }
+    on_plugins(state, &game, move |dir| modset::restore(dir, &id)).await
+}
+
+/// The link that opened the launcher, once: the page asks when it is ready for it.
+/// The game joins this party when it next starts: the player asked, the mods applied.
+#[tauri::command]
+async fn modset_join(state: State<'_, AppState>, game: String, party: String) -> Result<(), String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    on_plugins(state, &game, move |dir| modset::write_join_file(dir, &party, now)).await
+}
+
+#[tauri::command]
+fn modset_take_link(state: State<'_, AppState>) -> Option<String> {
+    state.modset_link.lock().unwrap().take()
+}
+
+#[tauri::command]
+async fn plugins_check_updates(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+) -> Result<UpdateCheck, String> {
+    let g = game.clone();
+    // Mods the index lists are updated from it (mods_auto_update): this per-repository look is
+    // for the ones added from a link only.
+    let listed: Vec<String> = state
+        .mod_index
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|i| i.mods.iter().map(|m| m.id.clone()).collect())
+        .unwrap_or_default();
+    on_plugins(state, &game, move |dir| {
+        let (mut updates, errors) = with_remote(&app, dir, &g, &version, remote::check_updates);
+        updates.retain(|u| !listed.contains(&u.id));
+        Ok(UpdateCheck { updates, errors })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn plugins_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+) -> Result<remote::RemoteInstalled, String> {
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| with_remote(&app, dir, &g, &version, |c| remote::update(c, &id))).await
+}
+
+#[tauri::command]
+async fn plugins_sources(state: State<'_, AppState>, game: String) -> Result<remote::Sources, String> {
+    on_plugins(state, &game, |dir| Ok(remote::read_sources(dir))).await
+}
+
+#[tauri::command]
+async fn plugins_set_pin(
+    state: State<'_, AppState>,
+    game: String,
+    id: String,
+    pin: bool,
+) -> Result<remote::Sources, String> {
+    on_plugins(state, &game, move |dir| remote::set_pin(dir, &id, pin)).await
+}
+
+#[tauri::command]
+async fn plugins_status(state: State<'_, AppState>, game: String) -> Result<Option<plugins::Status>, String> {
+    on_plugins(state, &game, |dir| Ok(plugins::read_status(dir))).await
+}
+
+// ---- The mod hub: the signed index, change sets, openrac:// links (core index.rs, resolver.rs,
+// index_apply.rs, deeplink.rs). Their errors are ModError, so the page can offer the exact fix.
+
+/// What fetches for the mod hub: curl, or on Android the Kotlin side's download.
+fn hub_fetch(app: &AppHandle) -> Box<dyn remote::Fetch> {
+    #[cfg(target_os = "android")]
+    return Box::new(remote::Cached::shared(android::KotlinFetch { app: app.clone() }));
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Box::new(remote::Cached::shared(remote::Curl))
+    }
+}
+
+/// Reads an openrac:// link: the mods it asks for. Nothing is installed from a link without a click.
+#[tauri::command]
+fn deeplink_parse(url: String) -> Result<deeplink::Install, ModError> {
+    deeplink::parse(&url)
+}
+
+/// The Steam folders to look in; Windows keeps its own in the registry.
+#[cfg(not(target_os = "android"))]
+fn steam_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    let registry = windows_registry::CURRENT_USER
+        .open("Software\\Valve\\Steam")
+        .and_then(|key| key.get_string("SteamPath"))
+        .ok()
+        .map(std::path::PathBuf::from);
+    #[cfg(not(windows))]
+    let registry = None;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    openrac_launcher_core::steam::roots(home.as_deref(), registry)
+}
+
+/// A game's entry in Steam: what it is, its icon (from the checkout the launcher plays from) and
+/// its own pictures, if it has them.
+#[cfg(not(target_os = "android"))]
+type SteamGame = (openrac_launcher_core::steam::Target, Vec<u8>, Option<[&'static [u8]; 4]>);
+
+/// What a Steam entry is for: the launcher, or the game `version` names (its title, its id, its
+/// icon and its pictures).
+#[cfg(not(target_os = "android"))]
+fn steam_target(config: &Config, version: Option<&str>) -> Result<SteamGame, String> {
+    use openrac_launcher_core::steam::Target;
+    let Some(key) = version else { return Ok((Target::launcher(), Vec::new(), None)) };
+    let (title, id, icon) = game_for_shortcut(config, key)?;
+    let pictures = game_pictures(&id);
+    let target = Target::game(&title, &id);
+    let target = if pictures.is_some() { target.with_pictures() } else { target };
+    Ok((target, icon.unwrap_or_default(), pictures))
+}
+
+/// A game's own pictures for Steam's library (scripts/steam_game_art.sh): cover, wide, hero and
+/// logo, by the game of the id (`rac2-ntsc`: rac2). None for a game without them.
+#[cfg(not(target_os = "android"))]
+fn game_pictures(id: &str) -> Option<[&'static [u8]; 4]> {
+    macro_rules! pictures {
+        ($game:literal) => {
+            [
+                include_bytes!(concat!("../steam/games/", $game, "/cover.jpg")).as_slice(),
+                include_bytes!(concat!("../steam/games/", $game, "/wide.jpg")).as_slice(),
+                include_bytes!(concat!("../steam/games/", $game, "/hero.jpg")).as_slice(),
+                include_bytes!(concat!("../steam/games/", $game, "/logo.png")).as_slice(),
+            ]
+        };
+    }
+    match id.split('-').next()? {
+        "rac1" => Some(pictures!("rac1")),
+        "rac2" => Some(pictures!("rac2")),
+        "rac3" => Some(pictures!("rac3")),
+        "rac4" => Some(pictures!("rac4")),
+        _ => None,
+    }
+}
+
+/// A game's title (the port's, as its menu entries carry), its id and its icon, if the checkout
+/// has one. `key` must be a version of the catalogue.
+#[cfg(not(target_os = "android"))]
+fn game_for_shortcut(config: &Config, key: &str) -> Result<(String, String, Option<Vec<u8>>), String> {
+    use openrac_launcher_core::{catalog, desktop, shortcut};
+    let root = config.root()?;
+    let catalog = catalog::load(root)?;
+    let key = shortcut::version_for_arg(&catalog, key).ok_or_else(|| format!("no game {key}"))?;
+    let id = shortcut::game_id(&key);
+    let icon = std::fs::read(root.join("port/game").join(&id).join("icon.png")).ok();
+    Ok((desktop::game_title(&catalog, &id), id, icon))
+}
+
+/// Where the launcher, or with `version` that game, stands in the player's Steam library. Android
+/// has no Steam.
+#[tauri::command]
+fn steam_state(
+    state: State<'_, AppState>,
+    version: Option<String>,
+) -> Result<openrac_launcher_core::steam::State, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (&state, &version);
+        return Ok(openrac_launcher_core::steam::State::NoSteam);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let config = state.config.lock().unwrap().clone();
+        let (target, _, _) = steam_target(&config, version.as_deref())?;
+        let program = openrac_launcher_core::desktop::LauncherProgram::from_env().path;
+        Ok(openrac_launcher_core::steam::state_for(&steam_roots(), &program, &target))
+    }
+}
+
+/// Adds the launcher, or with `version` that game, to Steam's library, with its pictures
+/// (scripts/steam_art.mjs; a game's own from scripts/steam_game_art.sh, and its icon), or
+/// updates it. Steam may be open. A game's entry starts this launcher with `--play`, by the
+/// same stable path as the launcher's own.
+#[tauri::command]
+fn steam_add(
+    state: State<'_, AppState>,
+    version: Option<String>,
+) -> Result<openrac_launcher_core::steam::State, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (&state, &version);
+        return Err("Steam isn't on Android.".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use openrac_launcher_core::steam;
+        let config = state.config.lock().unwrap().clone();
+        let (target, icon, pictures) = steam_target(&config, version.as_deref())?;
+        let program = openrac_launcher_core::desktop::LauncherProgram::from_env().path;
+        if version.is_some() {
+            let [cover, wide, hero, logo] = pictures.unwrap_or([&[]; 4]);
+            let art = steam::Art { cover, wide, hero, logo, icon: &icon };
+            return steam::add_for(&steam_roots(), &program, &target, &art);
+        }
+        let art = steam::Art {
+            cover: include_bytes!("../steam/cover.jpg"),
+            wide: include_bytes!("../steam/wide.jpg"),
+            hero: include_bytes!("../steam/hero.jpg"),
+            logo: include_bytes!("../steam/logo.png"),
+            icon: include_bytes!("../icons/icon.png"),
+        };
+        steam::add(&steam_roots(), &program, &art)
+    }
+}
+
+/// A desktop shortcut that starts the game `version` names (`--play`): a `.desktop` file on the
+/// Desktop, by the launcher's stable path (an AppImage's own file, not its mount). Linux only.
+/// The path it wrote.
+#[tauri::command]
+fn shortcut_create(state: State<'_, AppState>, version: String) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&state, &version);
+        Err("Shortcuts are made on Linux only.".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use openrac_launcher_core::{desktop, shortcut};
+        let config = state.config.lock().unwrap().clone();
+        let (title, id, icon) = game_for_shortcut(&config, &version)?;
+        let places = desktop::Places::from_env().ok_or("No home folder.")?;
+        let home = detect::home_dir().ok_or("No home folder.")?;
+        let program = desktop::LauncherProgram::from_env().path;
+        let dir = shortcut::desktop_dir(&home);
+        let path = shortcut::write_shortcut(&dir, &places, &title, &id, &program, icon.as_deref())?;
+        desktop::refresh(&places, desktop::Changed { icons: icon.is_some(), entries: false });
+        Ok(path.display().to_string())
+    }
+}
+
+/// The game a `--play` start could not start, once: the page shows it. None otherwise.
+#[tauri::command]
+fn startup_game() -> Option<String> {
+    PENDING_GAME.lock().unwrap().take()
+}
+
+/// Starts the game `arg` (`--play`) as the Play button does, with no window: the same plan (data
+/// folder, mods, build checks). With `exit_after` the launcher ends with the game, for a start
+/// that opened it only for this. Err: the version to show instead, if it is known, and why.
+#[cfg(desktop)]
+fn play_from_shortcut<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    arg: &str,
+    exit_after: bool,
+) -> Result<(), (Option<String>, String)> {
+    use openrac_launcher_core::{catalog, jobs, shortcut};
+    let state = app.try_state::<AppState>().ok_or((None, "the launcher is still starting".to_string()))?;
+    let config = state.config.lock().unwrap().clone();
+    let root = config.root().map_err(|e| (None, e))?.to_path_buf();
+    let catalog = catalog::load(&root).map_err(|e| (None, e))?;
+    let key = shortcut::version_to_play(&config, &catalog, arg).ok_or_else(|| (None, format!("no game {arg}")))?;
+    let shown = |e: String| (Some(key.clone()), e);
+    let plan = library::direct_play(&config, &key).map_err(shown)?;
+    launcher_log::line(&format!("play: {}", jobs::command_line(&plan)));
+    let mut child = jobs::spawn_detached(&plan, Some(&root)).map_err(shown)?;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        if exit_after {
+            app.exit(0);
+        }
+    });
+    Ok(())
+}
+
+/// A `--play` request: the game starts and the window stays away; if it cannot start, the window
+/// comes up on that game. `own` is a start made for this (the window is hidden, and the launcher
+/// ends with the game); otherwise the launcher was open already.
+#[cfg(desktop)]
+fn handle_play_request<R: tauri::Runtime>(app: &AppHandle<R>, arg: &str, own: bool) {
+    let window = app.get_webview_window("main");
+    match play_from_shortcut(app, arg, own) {
+        Ok(()) => {
+            if own {
+                // Nothing will be drawn: not a crash if it is killed with the game.
+                if let Some(check) = DRAW_CHECK.get() {
+                    check.end();
+                }
+            }
+        }
+        Err((key, why)) => {
+            launcher_log::line(&format!("could not play {arg}: {why}"));
+            if let Some(key) = key {
+                *PENDING_GAME.lock().unwrap() = Some(key.clone());
+                let _ = app.emit("open-game", key);
+            }
+            if let Some(window) = window {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    }
+}
+
+fn hub_error(e: impl std::fmt::Display) -> ModError {
+    ModError::new(ModErrorKind::Bug, e.to_string())
+}
+
+/// Fetches and checks every mod index (or uses the cached copies), keeps the result for the next
+/// commands, and with a game turns off the installed mods whose version was revoked. The change set
+/// (a link from openrac.dev) and Share use it; the launcher lists no mods itself.
+#[tauri::command]
+async fn index_fetch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: Option<String>,
+    version: Option<String>,
+) -> Result<index::IndexView, ModError> {
+    let urls = index::urls(&state.config.lock().unwrap().mod_indexes);
+    let cache = state
+        .config_file
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(index::CACHE_DIR))
+        .ok_or_else(|| hub_error("no config folder for the mod list's copy"))?;
+    let plugins = match &game {
+        Some(g) => Some(plugins_dir(&state, g).map_err(hub_error)?),
+        None => None,
+    };
+    let handle = app.clone();
+    let mut view = tauri::async_runtime::spawn_blocking(move || {
+        let fetch = hub_fetch(&handle);
+        let mut view = index::fetch(&index::Sources {
+            urls,
+            fetch: fetch.as_ref(),
+            cache,
+            key: index::INDEX_PUBLIC_KEY,
+            now: index::now(),
+        })?;
+        if let (Some(dir), Some(g), Some(v)) = (plugins, game, version) {
+            view.turned_off = index::turn_off_revoked(&dir, &g, &v, &view.index);
+        }
+        Ok::<_, ModError>(view)
+    })
+    .await
+    .map_err(hub_error)??;
+    *state.mod_index.lock().unwrap() = Some(view.index.clone());
+    for m in &mut view.index.mods {
+        let cut = m.readme.floor_char_boundary(64 * 1024);
+        m.readme.truncate(cut);
+    }
+    Ok(view)
+}
+
+/// Pre-release mods: the player's setting, else on for a dev build (or a local `tauri dev` run).
+fn allow_prerelease(app: &AppHandle, state: &State<'_, AppState>) -> bool {
+    use openrac_launcher_core::update::Channel;
+    let dev = cfg!(debug_assertions) || update_source(app).kind() == Channel::Dev;
+    state.config.lock().unwrap().prerelease_mods.unwrap_or(dev)
+}
+
+/// The change set for `wanted` on GAME's disc VERSION, with the mods in `turn_off` counted as off.
+fn plan_for(
+    index: &index::ModIndex,
+    dir: &Path,
+    game: &str,
+    version: &str,
+    wanted: &[deeplink::WantedMod],
+    turn_off: &[String],
+    prerelease: bool,
+) -> resolver::InstallPlan {
+    let mut installed = resolver::installed_mods(dir, game, version);
+    for m in installed.iter_mut().filter(|m| turn_off.contains(&m.id)) {
+        m.enabled = false;
+    }
+    resolver::resolve(&resolver::Request {
+        index,
+        installed: &installed,
+        game,
+        disc: version,
+        platform: plugins::platform_key(),
+        api: (plugins::API_MAJOR, plugins::API_MINOR),
+        allow_prerelease: prerelease,
+        wanted,
+    })
+}
+
+fn current_index(state: &State<'_, AppState>) -> Result<index::ModIndex, ModError> {
+    state.mod_index.lock().unwrap().clone().ok_or_else(|| {
+        ModError::new(ModErrorKind::Transient, "The mod list is not loaded yet.")
+            .with(openrac_launcher_core::mod_error::ModAction::Retry)
+    })
+}
+
+#[tauri::command]
+async fn index_resolve(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    wanted: Vec<deeplink::WantedMod>,
+    turn_off: Vec<String>,
+) -> Result<resolver::InstallPlan, ModError> {
+    if wanted.is_empty() || wanted.len() > deeplink::MAX_MODS {
+        return Err(ModError::new(ModErrorKind::UserFixable, "Pick between 1 and 32 mods."));
+    }
+    let index = current_index(&state)?;
+    let prerelease = allow_prerelease(&app, &state);
+    let dir = plugins_dir(&state, &game).map_err(hub_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_for(&index, &dir, &game, &version, &wanted, &turn_off, prerelease)
+    })
+    .await
+    .map_err(hub_error)
+}
+
+/// Resolves `wanted` again from the signed index (the page's copy of a plan is never trusted for
+/// hashes) and applies it: `index-apply` events say how far it got.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn index_apply(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    wanted: Vec<deeplink::WantedMod>,
+    turn_off: Vec<String>,
+    serial: Option<String>,
+    shared: Option<bool>,
+) -> Result<index_apply::ApplyResult, ModError> {
+    // A shared setup's link names exact versions: those mods are kept at them.
+    let pin_shared: Vec<String> = if shared.unwrap_or(false) {
+        wanted.iter().filter(|w| w.version.is_some()).map(|w| w.id.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    let index = current_index(&state)?;
+    let prerelease = allow_prerelease(&app, &state);
+    let dir = plugins_dir(&state, &game).map_err(hub_error)?;
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = plan_for(&index, &dir, &game, &version, &wanted, &turn_off, prerelease);
+        let data_home = openrac_launcher_core::saves::data_home();
+        let options = index_apply::Options {
+            serial: serial.as_deref(),
+            data_home: &data_home,
+            turn_off: &turn_off,
+            pin_shared: &pin_shared,
+            all_or_nothing: false,
+        };
+        with_remote(&handle, &dir, &game, &version, |ctx| {
+            index_apply::apply(ctx, &plan, &options, |p| {
+                let _ = handle.emit("index-apply", p);
+            })
+        })
+    })
+    .await
+    .map_err(hub_error)?
+}
+
+/// The mod index for the commands below: the one fetched this session, else fetched now.
+async fn index_now(app: &AppHandle, state: &State<'_, AppState>, fresh: bool) -> Result<index::ModIndex, ModError> {
+    if !fresh {
+        if let Some(index) = state.mod_index.lock().unwrap().clone() {
+            return Ok(index);
+        }
+    }
+    let urls = index::urls(&state.config.lock().unwrap().mod_indexes);
+    let cache = state
+        .config_file
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(index::CACHE_DIR))
+        .ok_or_else(|| hub_error("no config folder for the mod list's copy"))?;
+    let handle = app.clone();
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        let fetch = hub_fetch(&handle);
+        index::fetch(&index::Sources {
+            urls,
+            fetch: fetch.as_ref(),
+            cache,
+            key: index::INDEX_PUBLIC_KEY,
+            now: index::now(),
+        })
+    })
+    .await
+    .map_err(hub_error)??;
+    *state.mod_index.lock().unwrap() = Some(view.index.clone());
+    Ok(view.index)
+}
+
+fn here_for<'a>(game: &'a str, version: &'a str, prerelease: bool) -> openrac_launcher_core::mod_updates::Here<'a> {
+    openrac_launcher_core::mod_updates::Here {
+        game,
+        disc: version,
+        platform: plugins::platform_key(),
+        api: (plugins::API_MAJOR, plugins::API_MINOR),
+        prerelease,
+    }
+}
+
+/// The updates the index offers for a game's mods: in by themselves, waiting, held back. With
+/// `fresh` (the Mods tab's "Check for updates") the index is fetched again rather than the copy
+/// this session already read, so versions published since show at once.
+#[tauri::command]
+async fn mods_updates(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    fresh: Option<bool>,
+) -> Result<openrac_launcher_core::mod_updates::UpdatePlan, ModError> {
+    let index = index_now(&app, &state, fresh.unwrap_or(false)).await?;
+    let prerelease = allow_prerelease(&app, &state);
+    let dir = plugins_dir(&state, &game).map_err(hub_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // A revoked version is turned off first, so the plan sees it off.
+        let turned_off = index::turn_off_revoked(&dir, &game, &version, &index);
+        let installed = resolver::installed_mods(&dir, &game, &version);
+        let mut plan = openrac_launcher_core::mod_updates::plan(
+            &index,
+            &installed,
+            &remote::read_sources(&dir),
+            &here_for(&game, &version, prerelease),
+        );
+        plan.turned_off = turned_off;
+        plan
+    })
+    .await
+    .map_err(hub_error)
+}
+
+/// Updates a game's mods from one fresh fetch of the index: the ones that go in by themselves, or
+/// with `ids` the ones the player clicked (waiting ones too). Refused while the game runs.
+#[tauri::command]
+async fn mods_auto_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    ids: Option<Vec<String>>,
+    running: bool,
+) -> Result<openrac_launcher_core::mod_updates::UpdateRun, ModError> {
+    use openrac_launcher_core::mod_updates;
+    if running {
+        return Err(ModError::new(ModErrorKind::UserFixable, "Mods are not updated while the game runs.")
+            .with(openrac_launcher_core::mod_error::ModAction::CloseGame));
+    }
+    let index = index_now(&app, &state, ids.is_none()).await?;
+    let prerelease = allow_prerelease(&app, &state);
+    let dir = plugins_dir(&state, &game).map_err(hub_error)?;
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let here = here_for(&game, &version, prerelease);
+        // A revoked version is turned off first, so the plan sees it off.
+        let turned_off = index::turn_off_revoked(&dir, &game, &version, &index);
+        let installed = resolver::installed_mods(&dir, &game, &version);
+        let mut plan = mod_updates::plan(&index, &installed, &remote::read_sources(&dir), &here);
+        plan.turned_off = turned_off;
+        let items: Vec<mod_updates::UpdateItem> = match &ids {
+            None => plan.silent.clone(),
+            Some(ids) => plan.silent.iter().chain(&plan.waiting).filter(|i| ids.contains(&i.id)).cloned().collect(),
+        };
+        let data_home = openrac_launcher_core::saves::data_home();
+        let (updated, result) = with_remote(&handle, &dir, &game, &version, |ctx| {
+            mod_updates::apply(ctx, &index, &installed, &here, &items, false, &data_home)
+        })?;
+        Ok(mod_updates::UpdateRun { updated, plan, result: Some(result) })
+    })
+    .await
+    .map_err(hub_error)?
+}
+
+/// The last run of updates (for the crash notice's "Roll back").
+#[tauri::command]
+async fn mods_last_update(
+    state: State<'_, AppState>,
+    game: String,
+) -> Result<Option<openrac_launcher_core::mod_updates::LastUpdate>, String> {
+    on_plugins(state, &game, |dir| Ok(openrac_launcher_core::mod_updates::last_update(dir))).await
+}
+
+/// After a crash: the mod back at the version its update replaced, kept there.
+#[tauri::command]
+async fn mods_crash_rollback(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    on_plugins(state, &game, move |dir| openrac_launcher_core::mod_updates::crash_rollback(dir, &g, &version, &id))
+        .await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnedOn {
+    views: Vec<PluginView>,
+    /// The dependencies turned on with it, by name.
+    also_on: Vec<String>,
+}
+
+/// Switches a mod on with the dependencies it needs.
+#[tauri::command]
+async fn plugins_turn_on(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+) -> Result<TurnedOn, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| {
+        let (mut views, also_on) = plugins::turn_on(dir, &g, &version, &id)?;
+        plugins::show_player_name(&mut views, &name);
+        Ok(TurnedOn { views, also_on })
+    })
+    .await
+}
+
+/// The mods that are on and need this one: turning it off asks about them first.
+#[tauri::command]
+async fn plugins_dependents(
+    state: State<'_, AppState>,
+    game: String,
+    id: String,
+) -> Result<Vec<(String, String)>, String> {
+    on_plugins(state, &game, move |dir| plugins::dependents(dir, &id)).await
+}
+
+/// The dependencies removing this mod (or mod pack) leaves unused.
+#[tauri::command]
+async fn plugins_orphans(
+    state: State<'_, AppState>,
+    game: String,
+    id: String,
+) -> Result<Vec<openrac_launcher_core::mod_updates::Orphan>, String> {
+    on_plugins(state, &game, move |dir| Ok(openrac_launcher_core::mod_updates::orphans(dir, &id))).await
+}
+
+/// Removes a mod (or mod pack) and the unused dependencies in `also`.
+#[tauri::command]
+async fn plugins_remove_with(
+    state: State<'_, AppState>,
+    game: String,
+    version: String,
+    id: String,
+    also: Vec<String>,
+) -> Result<Vec<PluginView>, String> {
+    let g = game.clone();
+    let name = player_name(&state);
+    on_plugins(state, &game, move |dir| {
+        let mut left = openrac_launcher_core::mod_updates::remove_with(dir, &g, &version, &id, &also)?;
+        plugins::show_player_name(&mut left, &name);
+        Ok(left)
+    })
+    .await
+}
+
+/// Opens a folder inside a game's set-up folder (an export, the overrides): folders only, and
+/// only there, so the page cannot open anything else with it.
+#[tauri::command]
+fn open_game_folder(app: AppHandle, state: State<'_, AppState>, game: String, path: String) -> Result<(), String> {
+    let install = state.config.lock().unwrap().install_dir.clone().ok_or("no install folder (Settings)")?;
+    let data = install::data_dir(&install, &game);
+    let _ = std::fs::create_dir_all(data.join("exports"));
+    let data = std::fs::canonicalize(&data).map_err(|e| format!("{}: {e}", data.display()))?;
+    let wanted = Path::new(&path);
+    if !wanted.exists()
+        && !wanted.components().any(|c| c == std::path::Component::ParentDir)
+        && detect::plain(wanted).starts_with(detect::plain(&data))
+    {
+        // A folder of the set-up a tool writes (the level editor's projects, packed levels)
+        // before it first has: opened empty rather than refused.
+        std::fs::create_dir_all(wanted).map_err(|e| format!("{path}: {e}"))?;
+    }
+    let target = std::fs::canonicalize(wanted).map_err(|e| format!("{path}: {e}"))?;
+    if !target.starts_with(&data) || !target.is_dir() {
+        return Err(format!("{path} is not a folder of the game's set-up"));
+    }
+    open_path_with_system(&app, &target.to_string_lossy())
+}
+
+/// Opens a folder a job wrote (a `job-exit`'s `outputs`, a `Started`'s `output`) with the system's
+/// file manager; a file opens its folder. Only the folders the launcher's tools write: the
+/// checkout's assets/ and build/, and the per-user install folder with the games' set-up folders.
+#[tauri::command]
+fn open_output(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let (root, install) = {
+        let c = state.config.lock().unwrap();
+        (c.root.clone(), c.install_dir.clone())
+    };
+    let target = std::fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
+    let target = if target.is_dir() { target } else { target.parent().map(Path::to_path_buf).unwrap_or(target) };
+    let mut allowed = Vec::new();
+    if let Some(root) = root.and_then(|r| std::fs::canonicalize(r).ok()) {
+        allowed.push(root.join("assets"));
+        allowed.push(root.join("build"));
+    }
+    if let Some(install) = install.and_then(|i| std::fs::canonicalize(i).ok()) {
+        allowed.push(install);
+    }
+    if !allowed.iter().any(|folder| target.starts_with(folder)) {
+        return Err(format!("{path} is not a folder the launcher's tools write"));
+    }
+    open_path_with_system(&app, &target.to_string_lossy())
+}
+
+/// Open a lighting diagnostic in the system's text viewer, only after checking its owning cache.
+#[tauri::command]
+fn open_bake_log(app: AppHandle, state: State<'_, AppState>, version: String, path: String) -> Result<(), String> {
+    let config = state.config.lock().unwrap().clone();
+    let log = openrac_launcher_core::enhanced::bake_log(&config, &version, Path::new(&path))?;
+    open_path_with_system(&app, &log.to_string_lossy())
+}
+
+/// Opens one level's Godot project in the Godot editor (the version's `editor-open` action, with
+/// its checks: Godot set up, the level extracted), for a job's result or a level's row.
+#[tauri::command]
+fn open_level_in_godot(state: State<'_, AppState>, version: String, level: u32) -> Result<Started, String> {
+    let config = state.config.lock().unwrap().clone();
+    let inputs = openrac_launcher_core::actions::Inputs { level: Some(level), path: None, option: None };
+    let plan = library::plan(&config, &Scope::Version(version), "editor-open", &inputs)?;
+    launcher_log::line(&format!("run: {}", openrac_launcher_core::jobs::command_line(&plan)));
+    state.jobs.start(&plan, config.root.as_deref(), |_| {})
+}
+
+#[tauri::command]
+fn open_saves_folder(app: AppHandle, serial: String) -> Result<(), String> {
+    let dir = openrac_launcher_core::saves::get_memcard_dir(&serial);
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    open_path_with_system(&app, &dir.to_string_lossy())
+}
+
+/// The launcher's icons in each size the desktop's icon theme takes (core desktop.rs).
+#[cfg(target_os = "linux")]
+const LAUNCHER_ICONS: &[openrac_launcher_core::desktop::Icon] = &[
+    ("32x32", include_bytes!("../icons/32x32.png")),
+    ("64x64", include_bytes!("../icons/64x64.png")),
+    ("128x128", include_bytes!("../icons/128x128.png")),
+    ("256x256", include_bytes!("../icons/128x128@2x.png")),
+    ("512x512", include_bytes!("../icons/icon.png")),
+];
+
+/// What an AppImage's AppRun hands over: its own PYTHONHOME, its own paths,
+/// its own libraries. They are of no use to anything the launcher starts (a
+/// Qt program told to look for its platform plugin in the AppImage's
+/// directories, which hold no Qt, stops with "Could not find the Qt platform
+/// plugin"), so they go. The launcher's own webview keeps the AppImage's
+/// libraries; everything else gets the system's (core/src/appimage.rs).
+#[cfg(target_os = "linux")]
+fn clean_appimage_env() {
+    openrac_launcher_core::appimage::clean_process_env();
+}
+
+/// Whether the window draws in Safe rendering (Config::safe_rendering), read before the app
+/// exists. A last start that crashed before it drew a click turns it on, and it is saved; a start
+/// without it begins a draw check of its own (core webkit.rs).
+#[cfg(target_os = "linux")]
+fn settle_safe_rendering() -> bool {
+    use openrac_launcher_core::webkit::{self, DrawCheck, LastStart};
+    let Some(dir) = webkit::config_dir(IDENTIFIER) else { return false };
+    let file = dir.join("launcher.json");
+    let mut config = config::load(&file);
+    let check = DrawCheck::new(&dir);
+    match check.last_start() {
+        // A second start shows the first launcher's window and goes.
+        LastStart::Running => return config.safe_rendering,
+        LastStart::Crashed if !config.safe_rendering => {
+            config.safe_rendering = true;
+            let _ = config::save(&file, &config);
+            SAFE_AFTER_CRASH.store(true, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    if config.safe_rendering {
+        // Nothing is checked: a crashed start's file has done its work.
+        check.clear();
+    } else {
+        check.begin();
+        let _ = DRAW_CHECK.set(check);
+    }
+    config.safe_rendering
+}
+
+/// What WebKitGTK needs changed on this system, before GTK starts: its
+/// DMA-BUF renderer's buffers through shared memory under Wayland with
+/// NVIDIA's own driver, and its
+/// accelerated compositing mode there and on a Steam Deck, where the window opens empty
+/// unless the launcher is started with WEBKIT_DISABLE_COMPOSITING_MODE=1, and wherever Safe
+/// rendering is on. A
+/// value the player set is left as it is (core/src/webkit.rs).
+#[cfg(target_os = "linux")]
+fn tune_webkit(safe: bool) {
+    for (name, value) in openrac_launcher_core::webkit::webkit_env(safe) {
+        if std::env::var_os(name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+/// GTK 3's Wayland backend aborts on startup with an assertion failure in
+/// _gdk_wayland_display_get_scaled_cursor_theme (`display_wayland->cursor_theme_name`) if no
+/// cursor theme name can be resolved from GSettings (common in AppImages on GNOME Wayland or
+/// when cursor themes are misconfigured). Set safe fallbacks for XCURSOR_THEME and XCURSOR_SIZE.
+#[cfg(target_os = "linux")]
+fn ensure_wayland_cursor_fallback() {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if wayland {
+        if std::env::var("XCURSOR_THEME").map_or(true, |v| v.trim().is_empty()) {
+            std::env::set_var("XCURSOR_THEME", "default");
+        }
+        if std::env::var("XCURSOR_SIZE").map_or(true, |v| v.trim().is_empty()) {
+            std::env::set_var("XCURSOR_SIZE", "24");
+        }
+    }
+}
+
+/// Opens a path or a folder with the system's own program.
+///
+/// On Linux the program that opens it (xdg-open, and on KDE the Qt program it
+/// calls) would get the AppImage's environment, in which a Qt program cannot
+/// find its platform plugin and says so. So xdg-open is started here, with the
+/// system's environment instead of the AppImage's.
+#[cfg_attr(target_os = "linux", allow(unused_variables))]
+fn open_path_with_system(app: &AppHandle, path: &str) -> Result<(), String> {
+    // Android's own file manager shows no app's private folders: the Files app, through OpenRAC's
+    // place in it, does.
+    if Platform::current() == Platform::Android {
+        return android::show_folder(app, Some(path));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        open_with_system(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        app.opener().open_path(path, None::<&str>).map_err(|e| e.to_string())
+    }
+}
+
+/// Opens a web page in the system's own browser, the way
+/// [`open_path_with_system`] opens a folder.
+#[cfg_attr(target_os = "linux", allow(unused_variables))]
+fn open_url_with_system(app: &AppHandle, url: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        open_with_system(url)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+    }
+}
+
+/// Starts the system's own opener for a path or a link, in the environment the
+/// system expects: the AppImage's libraries are ours, not the system's.
+#[cfg(target_os = "linux")]
+fn open_with_system(target: &str) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(target);
+    openrac_launcher_core::appimage::sanitize(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("cannot start xdg-open: {e}"))?;
+    // Reaped when it ends (xdg-open hands over to the desktop's program and exits): a child
+    // that is not waited for stays a zombie until the launcher exits.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// On a screen too small for the window (a 1080p screen at 150 % or 200 %), the window opens at
+/// what the screen has room for and can be made that small (core/src/window.rs).
+#[cfg(desktop)]
+fn fit_to_screen(window: &tauri::WebviewWindow) {
+    let (Ok(Some(monitor)), Ok(size)) = (window.current_monitor(), window.inner_size()) else { return };
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area().size.to_logical::<f64>(scale);
+    let size = size.to_logical::<f64>(scale);
+    let floor =
+        window.config().app.windows.first().and_then(|w| w.min_width.zip(w.min_height)).unwrap_or((960.0, 560.0));
+    if let Some(((width, height), (min_width, min_height))) =
+        openrac_launcher_core::window::fit((size.width, size.height), floor, (area.width, area.height))
+    {
+        let _ = window.set_min_size(Some(tauri::LogicalSize::new(min_width, min_height)));
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+        let _ = window.center();
+    }
+}
+
+// On Android and iOS the launcher is a library the app's activity starts through this entry point.
+// It starts in steps, in this order: the process's environment, the plugins, the app's setup once
+// it exists, then the commands the page calls (docs/ARCHITECTURE.md lists them).
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    prepare_environment();
+    with_plugins(tauri::Builder::default())
+        .setup(setup)
+        .invoke_handler(tauri::generate_handler![
+            app_info,
+            relaunch_app,
+            webview_clicked,
+            webview_drew,
+            get_config,
+            save_config,
+            detect,
+            check_root,
+            check_tool,
+            adopt_godot,
+            library,
+            run_action,
+            cancel_job,
+            open_path,
+            open_url,
+            install_game,
+            prepare_disc,
+            uninstall_game,
+            scan_discs,
+            choose_disc,
+            sync_progress_from_web,
+            apply_progress_json,
+            set_discord_status,
+            inspect_saves,
+            backup_saves,
+            restore_backup,
+            import_pcsx2_saves,
+            pcsx2_memcards_dir,
+            export_saves,
+            preview_save_import,
+            import_saves,
+            open_saves_folder,
+            read_save,
+            write_save,
+            read_save_rac2,
+            write_save_rac2,
+            read_save_rac2_extra,
+            write_save_rac2_extra,
+            overrides_list,
+            overrides_summary,
+            overrides_set_enabled,
+            overrides_move,
+            overrides_remove,
+            reset_preview,
+            editor_state,
+            reset_apply,
+            plugins_list,
+            player_name_used,
+            enhanced_view,
+            enhanced_set_enabled,
+            texture_packs_view,
+            texture_packs_set,
+            texture_packs_open,
+            texture_packs_preview,
+            texture_packs_import,
+            texture_packs_export,
+            mod_tool::mod_tool_list,
+            mod_tool::mod_tool_read,
+            mod_tool::mod_tool_store_get,
+            mod_tool::mod_tool_store_set,
+            mod_tool::mod_tool_save,
+            mod_tool::mod_tool_save_start,
+            mod_tool::mod_tool_save_write,
+            mod_tool::mod_tool_save_end,
+            mod_tool::mod_tool_open,
+            enhanced_set_setting,
+            enhanced_delete_bakes,
+            plugins_set_enabled,
+            plugins_move,
+            plugins_set_setting,
+            plugins_remove,
+            plugins_install,
+            plugins_mod_folders,
+            plugins_status,
+            modset_share_preview,
+            modset_share,
+            modset_review,
+            modset_apply,
+            modset_profiles,
+            modset_restore,
+            modset_join,
+            modset_take_link,
+            plugins_preview,
+            plugins_install_remote,
+            plugins_check_updates,
+            plugins_update,
+            plugins_sources,
+            plugins_set_pin,
+            deeplink_parse,
+            steam_state,
+            steam_add,
+            shortcut_create,
+            startup_game,
+            index_fetch,
+            index_resolve,
+            index_apply,
+            mods_updates,
+            mods_auto_update,
+            mods_last_update,
+            mods_crash_rollback,
+            plugins_turn_on,
+            plugins_dependents,
+            plugins_orphans,
+            plugins_remove_with,
+            open_game_folder,
+            open_output,
+            open_bake_log,
+            open_level_in_godot,
+            reports_list,
+            latest_crash,
+            report_text,
+            report_save,
+            report_delete,
+            reports_delete_all,
+            open_reports_folder,
+            differences,
+            set_game_fix,
+            controls_view,
+            controls_set,
+            controls_reset,
+            controls_reset_players,
+            controls_reset_player,
+            controls_export,
+            controls_import,
+            controls_copy,
+            android::pick_disc,
+            android::pick_zip,
+            android::show_files,
+            android::gpu_drivers,
+            android::gpu_driver_import,
+            android::gpu_driver_select,
+            android::gpu_driver_remove,
+            android::gpu_renderer_select,
+            android::background_status,
+            android::tools_ready,
+            launcher_update_check,
+            android::update_check,
+            android::update_install,
+            android::game_status,
+            android::game_window,
+        ])
+        .build(tauri::generate_context!())
+        .expect("the launcher failed to start")
+        .run(|_, event| {
+            // A quit before any click: nothing was drawn that could have crashed.
+            if matches!(event, tauri::RunEvent::Exit) && !CLICKED.load(Ordering::Relaxed) {
+                if let Some(check) = DRAW_CHECK.get() {
+                    check.end();
+                }
+            }
+        });
+}
+
+/// What the process's environment must say before GTK and WebKit start, on Linux: the AppImage's
+/// variables gone, WebKit's renderers tuned to the system, a cursor theme for Wayland.
+fn prepare_environment() {
+    #[cfg(target_os = "linux")]
+    {
+        clean_appimage_env();
+        tune_webkit(settle_safe_rendering());
+        ensure_wayland_cursor_fallback();
+    }
+}
+
+/// The launcher's plugins, registered in this order: one instance, links, the file dialogs, the
+/// system's opener, the launcher's own updates on a desktop, and on Android the app's own plugin
+/// (android.rs).
+fn with_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    // A second start while the launcher is open shows the open one's window and goes. Registered
+    // first, as the plugin asks. Without it, on Linux the GTK application id (enableGTKAppId)
+    // handed the second start to the first launcher, which set its window up again and stopped:
+    // "a webview with label `main` already exists".
+    //
+    // With its deep-link feature, a second start's lone `openrac://` argument reaches the open
+    // launcher's page (onOpenUrl); a link after `--`, as the launcher's own entries pass it, is
+    // handed on here, by the same rule (forward_link).
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        // A shortcut's game starts in this launcher, and its window stays as it is.
+        if let Some(game) = openrac_launcher_core::shortcut::play_arg(&args) {
+            handle_play_request(app, &game, false);
+            return;
+        }
+        forward_link(app, &args);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+    // A mod's own page (mod_tool.rs), served from its folder under an address of its own.
+    let builder = builder.register_asynchronous_uri_scheme_protocol(mod_tool::SCHEME, |ctx, request, responder| {
+        let app = ctx.app_handle().clone();
+        tauri::async_runtime::spawn_blocking(move || responder.respond(mod_tool::serve(&app, &request)));
+    });
+    let builder = builder
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(desktop)]
+    let builder = builder.plugin(
+        tauri_plugin_updater::Builder::new()
+            // A build of a branch carries the release's plain version and its run (LAUNCHER_BUILD):
+            // compared as X.Y.Z-dev.<run>, so each build of the branch updates the one before.
+            .default_version_comparator(|current, release| {
+                let current = openrac_launcher_core::update::effective_version(&current.to_string(), LAUNCHER_BUILD);
+                openrac_launcher_core::update::is_newer(&current, &release.version.to_string())
+            })
+            .build(),
+    );
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android::init());
+    builder
+}
+
+/// What the launcher sets up once the app exists, before the page asks for anything, in this
+/// order: the desktop's entries and the window, launcher.json, the install folder, the copy of
+/// OpenRAC it carries, the folder and Python it works with, Discord, its log; then the state every
+/// command shares ([`AppState`]).
+fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    set_up_desktop(app);
+    // A start for one game (`--play`, a shortcut) keeps the window away until it fails to start.
+    #[cfg(desktop)]
+    let play = openrac_launcher_core::shortcut::play_arg(&std::env::args().collect::<Vec<_>>());
+    #[cfg(desktop)]
+    if play.is_some() {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+    }
+    let config_file = app.path().app_config_dir().ok().map(|dir| dir.join("launcher.json"));
+    let mut config = config_file.as_deref().map(config::load).unwrap_or_default();
+    config.progress_cache = progress_cache(config_file.as_deref());
+    // Settings, "Save folder": where the save manager reads the cards, as Play gives the game.
+    openrac_launcher_core::saves::set_card_root(config.save_dir.clone());
+    settle_install_dir(app, &mut config, config_file.as_deref());
+    // The first start (or a settings file from before it): a made-up multiplayer name, kept.
+    if openrac_launcher_core::multiplayer::settle(&mut config) {
+        if let Some(file) = config_file.as_deref() {
+            let _ = config::save(file, &config);
+        }
+    }
+    let bundled = bundled_copy(app, &mut config);
+    settle_root(&mut config, bundled.as_deref());
+    let discord = start_discord(&config);
+    start_log(app, config_file.as_deref());
+    migrate_install_saves(&config);
+    let modset_link = Arc::new(Mutex::new(None));
+    listen_for_links(app, &modset_link);
+    app.manage(AppState {
+        config: Mutex::new(config),
+        config_file,
+        jobs: Jobs::default(),
+        discord,
+        bundled,
+        modset_link,
+        mod_index: Mutex::new(None),
+    });
+    set_up_deep_links(app);
+    #[cfg(desktop)]
+    if let Some(game) = play {
+        handle_play_request(app.handle(), &game, true);
+    }
+    Ok(())
+}
+
+/// A mod code's link (openrac://modset/CODE) goes to the page, which opens the review: never more
+/// than that. One that came with the launcher's start waits for the page to ask (modset_take_link).
+fn listen_for_links(app: &tauri::App, pending: &Arc<Mutex<Option<String>>>) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+    let keep = |urls: Vec<String>| urls.into_iter().find(|u| u.starts_with(modset::LINK_PREFIX));
+    if let Some(link) =
+        app.deep_link().get_current().ok().flatten().and_then(|u| keep(u.iter().map(ToString::to_string).collect()))
+    {
+        *pending.lock().unwrap() = Some(link);
+    }
+    let (handle, pending) = (app.handle().clone(), pending.clone());
+    app.deep_link().on_open_url(move |event| {
+        let Some(link) = keep(event.urls().iter().map(ToString::to_string).collect()) else { return };
+        *pending.lock().unwrap() = Some(link);
+        let _ = handle.emit("modset-link", ());
+        #[cfg(desktop)]
+        if let Some(window) = handle.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    });
+}
+
+/// A link after `--` in a start's arguments (`Exec=â€¦ -- %u`), handed to the deep-link plugin as
+/// it takes one: the program, then the link alone. Only the one argument after `--` that starts
+/// with openrac:// is taken (deeplink::link_from_args); any other argument means no link. A lone
+/// link is the plugin's own to read, by the same rule, so it is not handed on twice.
+#[cfg(desktop)]
+fn forward_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, args: &[String]) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+    if args.get(1).map(String::as_str) != Some("--") {
+        return;
+    }
+    if let Some(link) = deeplink::link_from_args(args) {
+        let program = args.first().cloned().unwrap_or_default();
+        app.deep_link().handle_cli_arguments([program, link].iter());
+    }
+}
+
+/// openrac:// opens this launcher: registered at every start on Linux and Windows, so an
+/// AppImage, a portable copy or a dev run works too (macOS and Android register through the
+/// bundle). A link this start was given after `--` is read. Failures are logged, never fatal.
+#[cfg_attr(mobile, allow(unused_variables))]
+fn set_up_deep_links(app: &tauri::App) {
+    #[cfg(desktop)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        forward_link(app.handle(), &args);
+    }
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        use tauri_plugin_deep_link::DeepLinkExt;
+        if let Err(e) = app.deep_link().register_all() {
+            launcher_log::line(&format!("openrac:// links could not be registered: {e}"));
+        }
+        // On Linux the launcher's own menu entry (desktop.rs, link after `--`) stays the handler.
+        #[cfg(target_os = "linux")]
+        openrac_launcher_core::desktop::claim_scheme();
+    }
+    // The plugin registers `"â€¦" "%1"`; the launcher's own form puts the link after `--`.
+    #[cfg(windows)]
+    {
+        let fix = || -> Result<(), String> {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let key = windows_registry::CURRENT_USER
+                .create("Software\\Classes\\openrac\\shell\\open\\command")
+                .map_err(|e| e.to_string())?;
+            key.set_string("", format!("\"{}\" -- \"%1\"", exe.display())).map_err(|e| e.to_string())
+        };
+        if let Err(e) = fix() {
+            launcher_log::line(&format!("openrac:// handler could not be set: {e}"));
+        }
+    }
+}
+
+/// The menu entry and icons the desktop finds the launcher by, and Discord's socket where a
+/// Flatpak Discord hides it, on Linux (core desktop.rs, discord.rs); the window's icon and its size
+/// on the screen, on a desktop.
+#[cfg_attr(mobile, allow(unused_variables))]
+fn set_up_desktop(app: &tauri::App) {
+    #[cfg(target_os = "linux")]
+    {
+        openrac_launcher_core::desktop::ensure_launcher(LAUNCHER_ICONS);
+        openrac_launcher_core::discord::link_flatpak_socket();
+    }
+
+    #[cfg(desktop)]
+    if let Some(window) = app.get_webview_window("main") {
+        if let Some(icon) = app.default_window_icon() {
+            let _ = window.set_icon(icon.clone());
+        }
+        fit_to_screen(&window);
+    }
+}
+
+/// The install folder: ~/OpenRAC, made at first start, with what older launchers set up in the
+/// data folder moved into it (core install.rs). Android keeps the games' set-up, the saves and the
+/// settings in the app's own folders, the ones the Files app shows (FilesProvider.kt), and asks
+/// nothing at the first start (the Games page asks for the disc): a set-up from an earlier version
+/// (in the launcher's data folder, or OpenRAC/ in the shared storage) moves into place.
+fn settle_install_dir(app: &tauri::App, config: &mut Config, config_file: Option<&Path>) {
+    let home_dir = app.path().home_dir().ok().or_else(detect::home_dir);
+    let local_data = app.path().app_local_data_dir().ok();
+    if Platform::current() != Platform::Android {
+        install::settle_install_dir(config, home_dir.as_deref(), local_data.as_deref(), config_file);
+        return;
+    }
+    if let Some(games) = android::games_dir() {
+        let earlier: Vec<PathBuf> = [config.install_dir.clone(), local_data.clone()]
+            .into_iter()
+            .chain([home_dir.as_ref().map(|home| home.join("OpenRAC"))])
+            .flatten()
+            .collect();
+        config.install_dir = Some(install::settle_games_dir(&games, &earlier));
+    } else if config.install_dir.is_none() {
+        config.install_dir = local_data;
+    }
+    config.setup_complete = true;
+    if let Some(file) = config_file {
+        let _ = config::save(file, config);
+    }
+}
+
+/// The copy of OpenRAC the launcher carries: what a player plays from (detect::settle).
+/// A copy whose Python does not run here is not for this machine (an Intel Mac has the
+/// Apple silicon one): the launcher then works on a checkout, as it did.
+/// On Android the copy is unpacked from the APK into the app's files (OpenracSetup.kt),
+/// maybe still now: the page waits for it (tools_ready) before it reads anything there.
+/// `tauri dev` works on its checkout: a copy in its resources is a leftover of an
+/// installer built there, as old as that build (detect::leave_copy). OPENRAC_STANDALONE
+/// set makes a debug build an installed launcher, to try the copy.
+fn bundled_copy(app: &tauri::App, config: &mut Config) -> Option<PathBuf> {
+    let resources_copy = app.path().resource_dir().ok().and_then(|dir| detect::bundled_root(&dir));
+    let contributor = cfg!(debug_assertions) && std::env::var_os("OPENRAC_STANDALONE").is_none();
+    if Platform::current() == Platform::Android {
+        android::bundled_root()
+    } else if contributor {
+        if let Some(copy) = &resources_copy {
+            detect::leave_copy(config, copy, &start_folders());
+        }
+        None
+    } else {
+        resources_copy.filter(|dir| {
+            detect::bundled_python(dir).is_some_and(|python| detect::check_tool(Tool::Python, &python).ok)
+        })
+    }
+}
+
+/// The folder and Python the launcher works with (detect::settle), and on Linux the games' entries
+/// and icons in that folder, so the taskbar shows a game's own icon (core desktop.rs).
+fn settle_root(config: &mut Config, bundled: Option<&Path>) {
+    // Android's picker gives no paths: the disc images the player picks are copied into
+    // one folder of the app's, which is then the games folder.
+    if config.discs_dir.is_none() && Platform::current() == Platform::Android {
+        config.discs_dir = android::discs_dir();
+    }
+    detect::settle(config, bundled);
+
+    #[cfg(target_os = "linux")]
+    if let Some(root) = &config.root {
+        openrac_launcher_core::desktop::ensure_games(root);
+    }
+}
+
+/// Discord's connection, shared by the commands that change the status (`set_discord_status`,
+/// `run_action`). Discord can take seconds to answer: with the setting on, it is connected and
+/// shown idle without holding up the window.
+fn start_discord(config: &Config) -> Arc<Mutex<DiscordState>> {
+    let client_id = config
+        .discord_client_id
+        .clone()
+        .unwrap_or_else(|| openrac_launcher_core::discord::DEFAULT_CLIENT_ID.to_string());
+    let ipc = openrac_launcher_core::discord::DiscordIpc::new(client_id);
+    let app_start = openrac_launcher_core::discord::now_sec();
+    let discord = Arc::new(Mutex::new(DiscordState { ipc, app_start }));
+    if config.discord_rpc {
+        let discord = discord.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut discord = discord.lock().unwrap();
+            let _ = discord.ipc.set_status(&openrac_launcher_core::discord::DiscordStatus::Idle, app_start);
+        });
+    }
+    discord
+}
+
+/// Memory cards and settings that some development builds kept in the install folder go to the
+/// data folder's migrated/ (core saves.rs). Android never kept them there.
+fn migrate_install_saves(config: &Config) {
+    let Some(install) = config.install_dir.as_deref().filter(|_| Platform::current() != Platform::Android) else {
+        return;
+    };
+    match openrac_launcher_core::saves::migrate_install_saves(install, &openrac_launcher_core::saves::data_home()) {
+        Ok(0) => {}
+        Ok(copied) => launcher_log::line(&format!("saves: {copied} files from {} are in migrated/", install.display())),
+        Err(e) => launcher_log::line(&format!("saves: not migrated: {e}")),
+    }
+}
+
+/// The launcher's own log, beside launcher.json (core launcher_log.rs), opened with the version and
+/// the platform it started on.
+fn start_log(app: &tauri::App, config_file: Option<&Path>) {
+    if let Some(dir) = config_file.and_then(Path::parent) {
+        launcher_log::init(dir);
+        launcher_log::line(&format!(
+            "the launcher {} started on {:?}",
+            app.package_info().version,
+            Platform::current()
+        ));
+    }
+}

@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// Native hardware ray-tracing pipeline (RTX) for Enhanced Graphics:
+// - Apple Silicon native Metal Ray Tracing (MTLAccelerationStructure + MSL raytracing::intersector)
+// - NVIDIA native CUDA / RTX Ray Tracing (CUDA Driver API + NVRTC PTX BVH kernel)
+// - Vulkan Compute / Ray-Query graph pass (enhanced::run_compute_graph + rtx_trace.comp)
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "renderer/renderer.h"
+#include "renderer/rtx_settings.h"
+#include "renderer/shader.h"
+#include "scene/level.h"
+
+namespace openrac::enhanced {
+
+// Diagnostic view modes for the Enhanced Settings -> Diagnostics / RTX inspector.
+enum class RtxDebugView {
+    Off,
+    Shadows,
+    AmbientOcclusion,
+    Reflections,
+    GlobalIllumination,
+    BvhHeatmap,
+    Count
+};
+
+// 64-byte aligned triangle record shared across Vulkan SSBO, CUDA device memory, and Metal buffers.
+struct alignas(16) RtxTriangle {
+    std::array<float, 4> v0_mat{};       // xyz: vertex 0 in world space, w: bitcast material index
+    std::array<float, 4> e1_layer{};     // xyz: edge 1 (v1 - v0), w: bitcast scene::Layer
+    std::array<float, 4> e2_flags{};     // xyz: edge 2 (v2 - v0), w: roughness / flags
+    std::array<float, 4> normal_albedo{};  // xyz: unit geometric normal, w: packed RGB8 albedo
+};
+static_assert(sizeof(RtxTriangle) == 64);
+
+// 32-byte aligned flattened SAH BVH node for GPU stackless/short-stack traversal.
+struct alignas(16) RtxBvhNode {
+    std::array<float, 3> bbox_min{};
+    std::int32_t left_or_first = 0;  // >= 0: left child node index; < 0: ~(first triangle index)
+    std::array<float, 3> bbox_max{};
+    std::int32_t count = 0;          // 0: internal node (right child is left_or_first + 1); > 0: leaf triangle count
+};
+static_assert(sizeof(RtxBvhNode) == 32);
+
+// Hardware ray query input for batch tracing (baker transport, tests, and hybrid passes).
+struct alignas(16) RtxRay {
+    std::array<float, 3> origin{};
+    float t_min = 0.001f;
+    std::array<float, 3> direction{};
+    float t_max = 1000.0f;
+};
+static_assert(sizeof(RtxRay) == 32);
+
+// Hardware ray intersection result.
+struct alignas(16) RtxHit {
+    float t = -1.0f;                     // < 0 on miss, >= t_min on hit
+    std::int32_t triangle_index = -1;
+    float u = 0.0f;
+    float v = 0.0f;
+    std::array<float, 3> normal{};
+    std::uint32_t packed_albedo = 0;
+};
+static_assert(sizeof(RtxHit) == 32);
+
+// Runtime status snapshot for UI diagnostics and logging.
+struct RtxStatus {
+    bool available = false;
+    bool active = false;
+    renderer::RtxBackend active_backend = renderer::RtxBackend::Auto;
+    std::string device_name;
+    std::size_t triangle_count = 0;
+    std::size_t node_count = 0;
+    std::size_t dynamic_instance_count = 0;
+    bool metal_supported = false;
+    bool cuda_supported = false;
+    bool vulkan_ray_query_supported = false;
+};
+
+// Native hardware backend interface (implemented by Metal on macOS and CUDA on NVIDIA).
+class RtxHardwareBackend {
+public:
+    virtual ~RtxHardwareBackend() = default;
+    virtual renderer::RtxBackend kind() const = 0;
+    virtual std::string_view device_name() const = 0;
+    virtual bool upload_scene(
+        std::span<const RtxTriangle> triangles,
+        std::span<const RtxBvhNode> nodes,
+        std::string& error
+    ) = 0;
+    virtual bool trace_rays(
+        std::span<const RtxRay> rays,
+        std::span<RtxHit> hits,
+        std::string& error
+    ) = 0;
+    // Traces a half-resolution screen grid of primary world positions + normals and writes
+    // 2 RGBA8 words per cell: word 0 = (GI.rgb, shadow_ao), word 1 = (reflection.rgb, confidence).
+    virtual bool trace_screen(
+        int cells_width,
+        int cells_height,
+        std::span<const std::array<float, 4>> world_positions,
+        std::span<const std::array<float, 4>> world_normals,
+        const std::array<float, 3>& camera_pos,
+        const std::array<float, 3>& sun_dir,
+        const std::array<float, 3>& sun_colour,
+        const std::array<float, 3>& sky_colour,
+        const renderer::RtxSettings& settings,
+        std::uint32_t frame_index,
+        std::span<std::uint32_t> out_rgba8_pairs,
+        std::string& error
+    ) = 0;
+};
+
+// Factory functions for the native Apple Metal and NVIDIA CUDA backends.
+std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend();
+std::unique_ptr<RtxHardwareBackend> create_cuda_rtx_backend();
+bool metal_rtx_supported();
+bool cuda_rtx_supported();
+
+// Session-wide RTX status and debug view controls for the Enhanced Settings window.
+RtxStatus rtx_status();
+RtxDebugView rtx_debug_view();
+void set_rtx_debug_view(RtxDebugView view);
+
+// Per-level hardware ray-tracing pipeline owned by lighting::SceneLighting.
+class RtxPipeline {
+public:
+    RtxPipeline();
+    ~RtxPipeline();
+    RtxPipeline(const RtxPipeline&) = delete;
+    RtxPipeline& operator=(const RtxPipeline&) = delete;
+
+    // Extracts static level geometry (terrain, ties, shrubs) and moby meshes, builds the SAH BVH,
+    // and uploads acceleration structures to the active hardware backends.
+    void upload(const scene::LevelData& level);
+
+    // Uploads an explicit triangle list (used by unit/GPU tests and custom scenes) and builds the BVH.
+    bool upload_triangles(std::span<const RtxTriangle> triangles, std::string& error);
+
+    // Captures live moby instances for dynamic TLAS/BVH refit.
+    void prepare_instances(scene::Layer layer, std::span<const scene::Instance> instances);
+
+    // Executes the per-frame RTX ray-tracing pass before EarlyLighting.
+    bool render(
+        unsigned depth,
+        const renderer::FrameInput& input,
+        const renderer::RenderTarget& target,
+        const renderer::Vec3& sun_direction,
+        const renderer::Vec3& sun_colour,
+        const renderer::Vec3& sky_colour,
+        std::string& error
+    );
+
+    // Binds the ray-traced buffer (unit 20) to early_lighting.comp so cached GI and sun shadows
+    // incorporate hardware ray-traced shadows, AO, and 1-bounce GI.
+    void bind_for_early_lighting(
+        const renderer::Shader& shader, const renderer::FrameInput& input
+    ) const;
+
+    // Binds ray-traced reflections and debug visualization uniforms to mesh.frag.
+    void bind_for_mesh(
+        const renderer::Shader& shader,
+        const renderer::FrameInput& input,
+        const renderer::RenderState& state
+    ) const;
+
+    // Traces arbitrary ray batches using the selected hardware backend (Metal / CUDA / CPU SAH BVH).
+    bool trace_rays(
+        std::span<const RtxRay> rays,
+        std::span<RtxHit> hits,
+        renderer::RtxBackend preferred = renderer::RtxBackend::Auto
+    );
+
+    bool active(const renderer::FrameInput& input, const renderer::RenderState& state) const;
+    unsigned output_buffer() const { return m_output_buffer; }
+    unsigned output_texture() const { return m_output_texture; }
+    std::span<const RtxTriangle> triangles() const { return m_triangles; }
+    std::span<const RtxBvhNode> bvh_nodes() const { return m_nodes; }
+    void release();
+
+private:
+    void build_bvh();
+    void ensure_gpu_buffers();
+    RtxHardwareBackend* select_hardware_backend(renderer::RtxBackend requested) const;
+
+    std::vector<RtxTriangle> m_static_triangles;
+    std::vector<RtxBvhNode> m_static_nodes;
+    std::vector<RtxTriangle> m_triangles;
+    std::vector<RtxBvhNode> m_nodes;
+    struct MobyMeshSlice {
+        std::vector<RtxTriangle> local_triangles;
+    };
+    std::vector<MobyMeshSlice> m_moby_meshes;
+    std::size_t m_dynamic_instance_count = 0;
+
+    std::unique_ptr<RtxHardwareBackend> m_metal_backend;
+    std::unique_ptr<RtxHardwareBackend> m_cuda_backend;
+
+    renderer::Shader m_compute;
+    unsigned m_bvh_buffer = 0;
+    unsigned m_bvh_texture = 0;
+    unsigned m_tri_buffer = 0;
+    unsigned m_tri_texture = 0;
+    unsigned m_output_buffer = 0;
+    unsigned m_output_texture = 0;
+    bool m_gpu_scene_dirty = false;
+    bool m_compute_failed = false;
+
+    int m_width = 0;
+    int m_height = 0;
+    unsigned m_target = 0;
+    std::uint64_t m_frame = 0;
+    bool m_ready = false;
+};
+
+}  // namespace openrac::enhanced

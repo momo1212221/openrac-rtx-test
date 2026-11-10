@@ -1,0 +1,40 @@
+# The launcher's Rust side: `core` holds everything that does not need a window
+# (the game catalogue, actions, settings, detection, the job runner) and builds
+# and tests on any machine; `src-tauri` is the desktop app, a thin layer of
+# Tauri commands over `core`. See docs/ARCHITECTURE.md.
+[workspace]
+resolver = "2"
+members = ["core", "ios", "src-tauri"]
+default-members = ["core", "src-tauri"]
+
+[workspace.package]
+version = "1.0.2"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# No LTO across crates (Rust's default, thin LTO inside each one): the launcher is a window around
+# a web page, its speed is the WebView's, and a release links in a fraction of the time (macOS links
+# it twice, once per architecture), for a program a few megabytes larger beside an installer of a
+# hundred.
+[profile.release]
+lto = false
+opt-level = "s"
+strip = true
+
+# Unpacking a CHD disc image (core/src/chd.rs) is gigabytes of decompression: optimised in debug
+# builds too (the Android CI's APK is one), where it is otherwise ten times slower.
+[profile.dev.package]
+chd = { opt-level = 3 }
+lzma-rs-perf-exp = { opt-level = 3 }
+ruzstd = { opt-level = 3 }
+claxon = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+crc = { opt-level = 3 }
+bitreader = { opt-level = 3 }
+
+[patch.crates-io]
+zip = { git = "https://github.com/zip-rs/zip2", tag = "v4.6.1" }

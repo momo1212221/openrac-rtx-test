@@ -1,0 +1,1089 @@
+# The libraries Ratchet & Clank (NTSC-U) calls, by entry point, and what the port does with
+# each: the same columns and port values as port/game/rac1-pal/libraries.tsv, whose rows
+# these are, carried to this version's addresses through the version map
+# (port/tools/versionmap; README.md). The symbol is what the NTSC decomp calls the function
+# at that address (its names are not always the library's); the notes keep PAL's symbol.
+# A row of rac1-pal's whose host C this game does not have yet is not here.
+#
+#   host: the port writes it: the shared replacement of that name
+#         (port/game/common/libraries.tsv, lib/*.c), or this game's own (host/*.c).
+#   game: the decompilation's C runs as it is (it only computes).
+#   wrap: the decompilation's C runs, as <symbol>__game, under a host function (host/*.c).
+#   hook: a hook point for mods (docs/port/MODS.md): the C runs, as <symbol>__game,
+#         unless a mod takes it; hostgen writes <symbol> (hooks.c). The name is
+#         the one mods ask for, the same on both discs.
+#   todo: needs a host version that is not written yet; it stays a stub.
+#
+# symbol	library	name	port	notes	signature (optional)
+memcmp	libc	memcmp	host	PAL func_001151B4
+memcpy	libc	memcpy	host	PAL func_00115248
+memset	libc	memset	host	PAL func_001153FC
+func_001160C8	libc	srand	game	PAL func_001160C8
+rand	libc	rand	game	PAL func_001160D8
+sprintf	libc	sprintf	game	newlib's formatter, translated; PAL func_00116248
+strchr	libc	strchr	host	PAL func_00116428
+strcpy	libc	strcpy	host	PAL func_001166FC
+strlen	libc	strlen	host	PAL func_00116810
+strncpy	libc	strncpy	host	PAL func_00116B00
+FindSubstring	libc	strstr	game	PAL func_00116CC0, paired as called
+AddIntcHandler	kernel	AddIntcHandler	host	the vsync handler is called by the port's frame pacing; PAL func_00118A90
+RemoveIntcHandler	kernel	RemoveIntcHandler	host	PAL func_00118AA0
+AddDmacHandler	kernel	AddDmacHandler	host	PAL func_00118AB0
+RemoveDmacHandler	kernel	RemoveDmacHandler	host	PAL func_00118AD0
+CreateThread	kernel	CreateThread	host	only the movie player makes threads; it is replaced above libmpeg; PAL func_00118B50
+DeleteThread	kernel	DeleteThread	host	PAL func_00118B60
+_StartThread	kernel	StartThread	host	PAL func_00118B70
+TerminateThread	kernel	TerminateThread	host	PAL func_00118B80
+ChangeThreadPriority	kernel	ChangeThreadPriority	host	PAL func_00118BA0
+RotateThreadReadyQueue	kernel	RotateThreadReadyQueue	host	PAL func_00118BC0
+GetThreadId	kernel	GetThreadId	host	PAL func_00118BE0
+CreateSema	kernel	CreateSema	host	PAL func_00118C70
+DeleteSema	kernel	DeleteSema	host	PAL func_00118C80
+SignalSema	kernel	SignalSema	host	PAL func_00118C90
+WaitSema	kernel	WaitSema	host	PAL func_00118CB0
+EnableCache	kernel	EnableCache	host	PAL func_00118D60
+FlushCache	kernel	FlushCache	host	nothing to flush; PAL func_00118D80
+sceSifDmaStat	kernel	sceSifDmaStat	host	no IOP: transfers to it are done at once; PAL func_00118E10
+sceSifSetDma	kernel	sceSifSetDma	host	PAL func_00118E20
+FUN_00119028	kernel	DisableIntc	host	PAL func_00119328 (its jal is _DisableIntc, system call 0x15)
+FUN_00119090	kernel	EnableIntc	host	PAL func_00119390 (its jal is _EnableIntc, system call 0x14)
+FUN_001190f8	kernel	DisableDmac	host	PAL func_001193F8
+FUN_00119160	kernel	EnableDmac	host	PAL func_00119460
+sceSifInitRpc	sif	sceSifInitRpc	host	no IOP: its services are replaced at their EE libraries; PAL func_0011AE20
+sceSifBindRpc	sif	sceSifBindRpc	host	PAL func_0011B2F8
+sceSifCallRpc	sif	sceSifCallRpc	host	PAL func_0011B4C8
+SceSifCheckStatRpc	sif	sceSifCheckStatRpc	host	PAL func_0011B6B8
+sceFsReset	fileio	sceFsReset	host	PAL func_0011BF48
+sceOpen	fileio	sceOpen	host	debug and rom0: config only; no game asset is read this way; PAL func_0011BF80
+sceClose	fileio	sceClose	host	PAL func_0011C208
+sceLseek	fileio	sceLseek	host	PAL func_0011C388
+sceRead	fileio	sceRead	host	PAL func_0011C5C0
+sceWrite	fileio	sceWrite	host	PAL func_0011C820
+sceSifInitIopHeap	sif	sceSifInitIopHeap	host	PAL func_0011CB40
+sceSifAllocIopHeap	sif	sceSifAllocIopHeap	host	PAL func_0011CBC8
+InvokeStateInitializer	sif	sceSifFreeIopHeap	host	PAL func_0011CCB0
+InvokeIopStatus	sif	sceSifLoadModuleBuffer	host	PAL func_0011D078
+sceSifSyncIop	sif	sceSifSyncIop	host	PAL func_0011D210
+sceSifRebootIop	sif	sceSifRebootIop	host	PAL func_0011D248
+DIntr	kernel	DIntr	host	PAL func_0011D960
+EnableInterrupts	kernel	EIntr	host	PAL func_0011D9A8
+FUN_001204b8	vu	sceGsResetPath	host	PAL func_001207B8
+FUN_00120558	vu	sceGsSyncPath	host	PAL func_00120858
+UpdateRfuDispatchState	libgcc	__main	host	the host runs no global constructors for the game: it has none; PAL func_0011DFC8
+fptodp	libgcc	__extendsfdf2	host	float to double; libgcc is the host compiler's; PAL func_00120778
+sceCdSync	cdvd	sceCdSync	host	reads are done at once from the extracted disc image; PAL func_00120F30
+sceCdInit	cdvd	sceCdInit	host	PAL func_001211B0
+FUN_00121190	cdvd	sceCdDiskReady	host	PAL func_00121490
+sceCdMmode	cdvd	sceCdMmode	host	PAL func_00121688
+sceCdRead	cdvd	sceCdRead	host	PAL func_00121750
+sceCdGetError	cdvd	sceCdGetError	host	PAL func_00121930
+sceCdBreak	cdvd	sceCdBreak	host	PAL func_001219C8
+sceCdReadClock	cdvd	sceCdReadClock	host	PAL func_00121A80
+sceGsResetGraph	graph	sceGsResetGraph	host	the renderer's video mode; PAL func_00121B78
+sceGsSetDefDispEnv	graph	sceGsSetDefDispEnv	host	PAL func_00121DC8
+sceGsPutDispEnv	graph	sceGsPutDispEnv	host	the renderer's display state; PAL func_00122140, paired as called
+sceGsSetDefDrawEnv	graph	sceGsSetDefDrawEnv	game	PAL func_001222C8
+sceGsPutDrawEnv	graph	sceGsPutDrawEnv	host	the renderer's drawing state; PAL func_001224B0, paired as called
+sceGsSyncV	graph	sceGsSyncV	host	the end of a frame: present, pace, vsync handlers; PAL func_00122598
+sceGsSetDefLoadImage	graph	sceGsSetDefLoadImage	host	PAL func_00122630, paired as called
+FUN_00122518	graph	sceGsSetDefStoreImage	host	PAL func_00122818, paired as found
+sceGsExecLoadImage	graph	sceGsExecLoadImage	host	texture uploads go to the renderer's texture pool; PAL func_00122958
+FUN_001227d8	graph	sceGsExecStoreImage	host	readback from the renderer; PAL func_00122AD8, paired as found
+sceGsSyncVCallback	graph	sceGsSyncVCallback	host	PAL func_00123168, paired as called
+sceDmaGetChan	dma	sceDmaGetChan	game	PAL func_001232E0
+sceDmaReset	dma	sceDmaReset	host	PAL func_00123308
+sceDmaSend	dma	sceDmaSend	host	the hand-off: the renderer reads the game's display list here; PAL func_001235C8
+sceMcInit	mc	sceMcInit	host	the memory card is a folder of save files; PAL func_001236F0, paired as called
+sceMcOpen	mc	sceMcOpen	host	PAL func_001238B0
+sceMcMkdir	mc	sceMcMkdir	host	PAL func_001239D8
+sceMcClose	mc	sceMcClose	host	PAL func_00123A10
+sceMcSeek	mc	sceMcSeek	host	PAL func_00123AC8
+sceMcRead	mc	sceMcRead	host	PAL func_00123C30
+sceMcWrite	mc	sceMcWrite	host	PAL func_00123D48
+sceMcSync	mc	sceMcSync	host	PAL func_00123F30
+sceMcGetInfo	mc	sceMcGetInfo	host	PAL func_00124068
+sceMcGetDir	mc	sceMcGetDir	host	PAL func_001241F0
+SceMcFormat	mc	sceMcFormat	host	PAL func_00124340
+sceMcDelete	mc	sceMcDelete	host	PAL func_00124410
+SceMcUnformat	mc	sceMcUnformat	host	PAL func_00124528
+sceMcChdir	mc	sceMcChdir	host	the US game enters its save folder before reading it; PAL does not
+sceDbcInit	dbc	sceDbcInit	host	pads come from the platform layer; PAL func_00124650
+scePad2Init	pad2	scePad2Init	host	PAL func_00124B88
+scePad2CreateSocket	pad2	scePad2CreateSocket	host	PAL func_00124BC8
+scePad2Read	pad2	scePad2Read	host	PAL func_00124D18
+scePad2GetButtonProfile	pad2	scePad2GetButtonProfile	host	PAL func_00124DF0
+scePad2GetState	pad2	scePad2GetState	host	PAL func_00124EE0
+sceVibGetProfile	vib	sceVibGetProfile	host	PAL func_00125218, paired as found
+sceVu0UnitMatrix	vu0	(UnitMatrix or InterVector)	todo	which one it is decides its host version; PAL func_00125358, paired as called
+sceVu0RotMatrixZ	vu0	sceVu0RotMatrixZ	host	PAL func_001253F8
+FUN_00125360	vu0	sceVu0RotMatrixX	host	PAL func_001254A0
+FUN_00125408	vu0	sceVu0RotMatrixY	host	PAL func_00125548
+sceMpegDemuxPssRing	mpeg	sceMpegDemuxPssRing	todo	movies: the player above libmpeg is to be replaced as a whole; PAL func_0012AD10
+sceMpegAddStrCallback	mpeg	sceMpegAddStrCallback	todo	PAL func_0012B008
+sceMpegInit	mpeg	sceMpegInit	todo	PAL func_0012B870
+sceMpegCreate	mpeg	sceMpegCreate	todo	PAL func_0012B918
+func_0012B9E0	mpeg	sceMpegDelete	todo	PAL func_0012BB20
+sceMpegGetPicture	mpeg	sceMpegGetPicture	todo	PAL func_0012BB30
+sceMpegReset	mpeg	sceMpegReset?	todo	PAL func_0012BBA8
+AddMpegCallback	mpeg	sceMpegAddCallback	todo	PAL func_0012BC50
+sceScfGetLanguage	scf	sceScfGetLanguage	host	from the port's settings; PAL func_0012D380
+sceScfGetLocalTimefromRTC	scf	sceScfGetLocalTimefromRTC	host	PAL func_0012D818
+FUN_0012da28	989snd	snd_StartSoundSystem	host	the port's sound engine needs no start-up; PAL func_0012DB68
+FUN_0012dc80	989snd	SndFlushPal	host	the shared flush plus the PAL buffers marked sent (rac1/host/hand.c); PAL func_0012DDC0	int (void)
+FUN_0012df20	989snd	snd_BankLoadByLoc	host	PAL func_0012E060
+FUN_0012e088	989snd	snd_BankLoadFromEE_CB	host	PAL func_0012E1C8
+FUN_0012e1a8	989snd	snd_ResolveBankXREFS	host	PAL func_0012E2E8
+FUN_0012e1d8	989snd	snd_UnloadBank	host	PAL func_0012E318
+FUN_0012e208	989snd	snd_SetMasterVolume	host	PAL func_0012E348
+FUN_0012e240	989snd	snd_SetPlaybackMode	host	PAL func_0012E380
+FUN_0012e368	989snd	snd_StopSound	host	PAL func_0012E4A8
+FUN_0012e3b8	989snd	snd_StopAllSounds	host	PAL func_0012E4F8
+FUN_0012e3e8	989snd	snd_PauseAllSoundsInGroup	host	PAL func_0012E528
+FUN_0012e418	989snd	snd_ContinueAllSoundsInGroup	host	PAL func_0012E558
+FUN_0012e448	989snd	snd_SoundIsStillPlaying_CB	host	PAL func_0012E588
+FUN_0012eb00	989snd	snd_reset_state_and_flush_commands	host	PAL func_0012EC40
+FUN_0012eb20	989snd	snd_InitVAGStreamingEx	host	PAL func_0012EC60
+FUN_0012ebd0	989snd	snd_StopAllStreams	host	PAL func_0012ED10
+FUN_0012ec08	989snd	snd_PlayVAGStreamByLocEx_CB	host	PAL func_0012ED48
+FUN_0012ec70	989snd	snd_PauseVAGStream	host	PAL func_0012EDB0
+FUN_0012eca0	989snd	snd_ContinueVAGStream	host	PAL func_0012EDE0
+FUN_0012ecd0	989snd	snd_GetVAGStreamTimeRemaining_CB	host	PAL func_0012EE10
+FUN_0012ed00	989snd	snd_IsVAGStreamBuffered_CB	host	PAL func_0012EE40
+FUN_0012ed30	989snd	snd_StreamSafeCheckCDIdle	host	PAL func_0012EE70
+FUN_0012ed58	989snd	snd_StreamSafeCdRead	host	a disc read, through the cdvd replacement; PAL func_0012EE98
+FUN_0012ee08	989snd	snd_StreamSafeCdSync	host	PAL func_0012EF48
+FUN_0012eea8	989snd	snd_StreamSafeCdBreak	host	PAL func_0012EFE8
+FUN_0012eef0	989snd	snd_StreamSafeCdGetError	host	PAL func_0012F030
+FUN_0012ef28	989snd	snd_StreamSafeCdCallback	host	PAL func_0012F068
+FUN_0012efa8	989snd	snd_PreAllocReverbWorkArea	host	PAL func_0012F0E8
+FUN_0012efe0	989snd	snd_AutoReverb	host	PAL func_0012F120
+FUN_0012f0a8	989snd	snd_ResetMovieSound	host	PAL func_0012F1E8
+FUN_0012f108	989snd	snd_StartMovieSound	host	PAL func_0012F248
+FUN_0012f148	989snd	snd_UpdateMovieADPCM	host	PAL func_0012F288
+FUN_0012f178	989snd	snd_GetMovieNAX	host	PAL func_0012F2B8
+snd_get_doppler_pitch_mod	989snd	snd_GetDopplerPitchMod	host	PAL func_0012F2E0
+FUN_0012d8f8	boot	ParseBin	wrap	copies a level's program in: from then on, level code addresses mean that level's functions; PAL func_0012DA38
+FUN_001f4280	draw	SetupGifPaging	wrap	sets the four draw flags at 0x18A3D0 retail has on before its first frame (nothing in the game's code stores them by name); PAL func_001F4630
+FUN_00209370	memcard	NewGameInit	wrap	a new game starts in level 0; with --level N it starts in level N instead (rac1/host/boot.c); PAL func_00209DC0, paired as near
+FUN_00209298	memcard	memcard_RestoreGame	wrap	a loaded save: the language and the Sound page stay the player's, which the port remembers between runs (rac1/host/options.c); PAL func_00209CE8
+FUN_0022c8d0	sound	initialize_gameplay_sound_system	wrap	the sound's start: the Sound page the port remembers goes in first (rac1/host/options.c); PAL func_0022DBE8
+FUN_0012f208	wad	wad_GetSectors	game	PAL func_0012F348
+FUN_0012f2b8	wad	load_disc_sectors_into_global_buffer	game	PAL func_0012F3F8
+FUN_0012f368	wad	read_file_entry_with_retry	game	PAL func_0012F4A8
+FUN_0020b618	game	WadDecompress	host	the WAD decompressor (hand-written assembly), answered with the asset readers' own; returns the size it made; PAL func_0020C468	int (int, int)
+FUN_001f7580	game	FontPrintWindow (mode 1)	host	the decompilation keeps GetEffectTex's 64-bit TEX0 in an int (matching C: on the console the register keeps all 64 bits); the port's passes it whole, and the colour as the caller's register holds it; PAL func_001F7560	void (unsigned int, long long, unsigned int, int)
+FUN_001f75f0	game	FontPrintWindow (mode 2)	host	as func_001F7560, the small font; PAL func_001F75D0	void (unsigned int, long long, unsigned int, int)
+SetGsCrt	kernel	SetGsCrt	host	system call 0x02; PAL func_00118A50
+_EnableIntc	kernel	EnableIntc	host	system call 0x14; PAL func_00118AE0
+_DisableIntc	kernel	DisableIntc	host	system call 0x15; PAL func_00118AF0
+_EnableDmac	kernel	EnableDmac	host	system call 0x16; PAL func_00118B00
+_DisableDmac	kernel	DisableDmac	host	system call 0x17; PAL func_00118B10
+GsPutIMR	kernel	GsPutIMR	host	system call 0x71; PAL func_00118DE0
+FUN_001f7d30	game	FUN_001f7d30	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F7EF8	void (unsigned int, int, int)
+FUN_001f89a4	game	FUN_001f89a4	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F8B6C	void (void)
+FUN_001f8ff0	game	FUN_001f8ff0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F91B8	void (void)
+FUN_00203b08	game	FUN_00203b08	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00204340	void (unsigned int, unsigned int, unsigned int, unsigned int, int)
+FUN_00211408	game	FUN_00211408	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00212258	void (int)
+FUN_002116b8	game	FUN_002116b8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00212508	void (void)
+FUN_00211728	game	FUN_00211728	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00212578	void (int, int)
+FUN_00211808	game	FUN_00211808	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00212658	int (int, int, int, int)
+FUN_00217c18	game	FUN_00217c18	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00218B10	void (void)
+FUN_00227740	game	FUN_00227740	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00228A58	void (void)
+FUN_00227a08	game	FUN_00227a08	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00228D20	void (unsigned int, int, int)
+FUN_00227d80	game	FUN_00227d80	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00229098	int (void)
+FUN_00227ed0	game	FUN_00227ed0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_002291E8	int (void)
+FUN_00228520	game	FUN_00228520	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00229838	void (unsigned int, unsigned int)
+FUN_00228598	game	FUN_00228598	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_002298B0	void (int, int)
+FUN_00228be8	game	FUN_00228be8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00229F00	void (void)
+FUN_0022a330	game	FUN_0022a330	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022B648	int (int)
+FUN_0022a5e0	game	FUN_0022a5e0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022B8F8	void (unsigned int)
+FUN_0022b6e8	game	FUN_0022b6e8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022CA00	void (unsigned int)
+FUN_0022b928	game	FUN_0022b928	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022CC40	void (unsigned int)
+FUN_0022bba0	game	FUN_0022bba0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022CEB8	void (void)
+FUN_00233fb0	game	FUN_00233fb0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_002352C8	void (void)
+FUN_00234bd8	game	FUN_00234bd8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00235EF0	void (void)
+FUN_00234d48	game	FUN_00234d48	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00236060	int (int)
+FUN_00234f98	game	FUN_00234f98	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_002362B0	void (unsigned int)
+FUN_00235be8	game	FUN_00235be8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00236F00	void (void)
+FUN_002370c0	game	FUN_002370c0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_002383D8	int (int)
+FUN_00237370	game	FUN_00237370	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00238688	void (unsigned int)
+FUN_0020cef8	game	FUN_0020cef8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0020DD48	void (void)
+FUN_00228a30	game	FUN_00228a30	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00229D48	void (void)
+FUN_00233308	game	FUN_00233308	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00234620	void (void)
+FUN_00235780	game	FUN_00235780	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00236A98	void (void)
+FUN_001f7a98	game	FUN_001f7a98	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F7C60	int (void)
+func_001F7C10	game	func_001F7C10	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F7DD8	int (void)
+func_001F7CD0	game	func_001F7CD0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F7E98	int (void)
+FUN_001f82e4	game	FUN_001f82e4	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F84AC	int (void)
+FUN_001f8364	game	FUN_001f8364	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F852C	int (void)
+FUN_001f83a4	game	FUN_001f83a4	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_001F856C	int (void)
+FUN_0022bf94	game	FUN_0022bf94	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022D2AC	int (int, int, int, int)
+FUN_0022c0e0	game	FUN_0022c0e0	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022D3F8	void (int, int, int, int)
+FUN_0022c208	game	FUN_0022c208	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022D520	void (int, int, int, int)
+FUN_0022c4c8	game	FUN_0022c4c8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_0022D7E0	void (unsigned int, int, unsigned int)
+func_L00_001FD228	game	func_L00_001FD228	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_L00_001FD1D8	void (unsigned int, unsigned int, int)
+func_L00_001FE6D8	game	func_L00_001FE6D8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_L00_001FE688	int (void)
+func_L00_0028C680	game	func_L00_0028C680	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_L00_0028D958	int (void)
+func_L00_00295100	game	func_L00_00295100	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_L00_002963D8	int (void)
+FUN_002109b8	game	FUN_002109b8	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_00211808	void (unsigned int, unsigned int)
+func_0020B418	game	func_0020B418	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_0020C268	void (void)
+FUN_002334d8	game	FUN_002334d8	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_002347F0	void (unsigned int)
+FUN_001f9dc8	game	FUN_001f9dc8	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_001F9F90	float (float)
+FUN_001f9de0	game	FUN_001f9de0	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_001F9FA8	float (float)
+FUN_0023a3b8	game	FUN_0023a3b8	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_0023B670, paired as near	int (int, int, int, unsigned int, int)
+func_00233E00	game	func_00233E00	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_00235118	void (void)
+printf	game	printf	host	the port's own (rac1/host/hand.c); its signature decides the prototype; PAL func_00116078	int (unsigned int, ...)
+FUN_002012b8	draw	draw_bootImage	wrap	the picture shown while a level loads goes into the frame buffer by an image transfer, which the 2D path keeps only as a texture: the port also draws it there (rac1/host/boot_picture.c); PAL func_00201AF0
+FUN_001ebe68	game	FUN_001ebe68	host	Camera_handleCollWithHero: a level's copy makes the camera's collision moby (FUN_L00_002a4de0, class 1007), which the C's call of the executable's empty stub lost (rac1/host/camera.c); PAL func_001EC210	void (unsigned int)
+func_L00_0025C368	game	func_L00_0025C368	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_0025D3C0	int (unsigned int)
+func_L00_001EB9D8	game	func_L00_001EB9D8	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001EBD58	void (unsigned int)
+func_L00_00201350	game	func_L00_00201350	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_00201300	void (void)
+func_L00_002A0D90	game	func_L00_002A0D90	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_002A2020	void (void)
+func_L00_002A0EB8	game	func_L00_002A0EB8	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_002A2148	void (void)
+func_L00_0024E01C	game	func_L00_0024E01C	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_0024F054, paired as found	int (void)
+func_L00_00266238	game	func_L00_00266238	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_00267080	void (int, long long)
+func_L02_0020A390	game	func_L02_0020A390	host	a level's draw callback register for list 3, folded into func_001F49B0 by the catalogue (split_places.tsv, rac1/host/callback_lists.c); PAL func_L02_0020A690	void (unsigned int, unsigned int)
+func_L14_0020C760	game	func_L14_0020C760	host	a level's draw callback register for list 4, folded into func_001F49B0 by the catalogue (split_places.tsv, rac1/host/callback_lists.c); PAL func_L14_0020CAE0	void (unsigned int, unsigned int)
+func_L00_002A0DF0	game	func_L00_002A0DF0	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_002A2080	void (void)
+func_L00_002A0E50	game	func_L00_002A0E50	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_002A20E0	void (void)
+FUN_001f5450	draw	DrawTexturedQuad	wrap	the 2D layer's textured quad (rac1/host/ui2d.c), on the way to drawing the HUD and menus natively; PAL func_001F5800
+FUN_001f62b0	draw	FontPrint	wrap	a string, glyph by glyph: its quads are marked as glyphs (rac1/host/ui2d.c), drawn from the font's distance field; PAL func_001F6668
+FUN_001ffc30	hud	FUN_001ffc30	wrap	a HUD texture as a sprite: drawn natively (rac1/host/ui2d.c); PAL func_00200468
+FUN_001ffe18	hud	FUN_001ffe18	wrap	a HUD texture as a sprite turned a quarter: drawn natively (rac1/host/ui2d.c); PAL func_00200650
+FUN_00200080	hud	FUN_00200080	wrap	a HUD texture as a sprite, in 16ths of a pixel: drawn natively (rac1/host/ui2d.c); PAL func_002008B8
+FUN_00200258	hud	FUN_00200258	wrap	a HUD texture as a sprite with a texture window: drawn natively (rac1/host/ui2d.c); PAL func_00200A90
+FUN_00200468	hud	FUN_00200468	wrap	a sprite of a given texture: drawn natively (rac1/host/ui2d.c); PAL func_00200CA0
+FUN_00200600	hud	FUN_00200600	wrap	a rotated sprite: drawn natively (rac1/host/ui2d.c); PAL func_00200E38
+FUN_00200958	hud	FUN_00200958	wrap	a HUD texture as a sprite with explicit texel corners: drawn natively (rac1/host/ui2d.c); PAL func_00201190
+FUN_001efa68	game	FUN_001efa68	host	the port's own (rac1/host/collision.c); its signature decides the prototype; PAL func_001EFE10	int (unsigned int, unsigned int, int, int, int)
+func_L00_001EFC70	game	func_L00_001EFC70	host	the port's own (rac1/host/collision.c); its signature decides the prototype; PAL func_L00_001EFFF0	int (unsigned int, unsigned int, int, int, int)
+FUN_L00_001f0d60	game	FUN_L00_001f0d60	host	the port's own (rac1/host/collision.c); its signature decides the prototype; PAL func_L00_001F10E0	int (float, unsigned int, int, unsigned int)
+FUN_L00_001f19a0	game	FUN_L00_001f19a0	host	the port's own (rac1/host/collision.c); its signature decides the prototype; PAL func_L00_001F1D20	int (float, float, unsigned int, int, int)
+FUN_L00_001f2868	game	FUN_L00_001f2868	host	the port's own (rac1/host/collision.c); its signature decides the prototype; PAL func_L00_001F2BE8	int (float, unsigned int, int, unsigned int, unsigned int)
+FUN_L00_001f3170	game	FUN_L00_001f3170	host	the port's own (rac1/host/collision.c); its signature decides the prototype; PAL func_L00_001F34F0	int (float, unsigned int)
+FUN_00125180	game	FUN_00125180	host	the port's own (rac1/host/vector.c); its signature decides the prototype; PAL func_001252C0, paired as found	void (unsigned int, unsigned int)
+FUN_0020ede8	game	FUN_0020ede8	host	the port's own (rac1/host/anim.c); its signature decides the prototype; PAL func_0020FC38	void (unsigned int, int)
+FUN_0020fa90	game	FUN_0020fa90	host	the port's own (rac1/host/render_native.c); its signature decides the prototype; PAL func_L00_00254218 (the levels' joint pose); the NTSC decomp's catalogue has the executable's copy (PAL func_002108E0, the same instructions) and every level's as this one name	void (unsigned int, short, int)
+func_L00_00251CE8	game	func_L00_00251CE8	host	the port's own (rac1/host/anim.c); its signature decides the prototype; PAL func_L00_00252D20	void (unsigned int, int)
+FUN_L00_0024d8d0	game	WadDecompress (the levels' copy)	host	the NTSC decomp's catalogue lists the levels' copy apart from the executable's FUN_0020b618 (rac1/host/hand.c)	int (int, int)
+FUN_0022f778	space	FlightUpdate	wrap	the flight between planets, each of its frames: marks the flight as playing for the Start skip (rac1/host/boot.c); PAL func_00230A90	void (void)
+FUN_001f2260	draw	BuildViewMatrices	wrap	the view, clip and cull matrices from the camera's eye and rows: with OPENRAC_CAMERA set, that camera written over the game's first, for looking at one exact view (rac1/host/camera_override.c); PAL func_001F2608	void (void)
+FUN_0022b690	draw	SkyDrawShell	wrap	the shell's matrix (D_001D96E0, built by the sky code before each shell) goes to the window, which draws the shells natively (rac1/host/render_native.c); PAL func_0022C9A8	void (int)
+func_L00_002852C0	game	func_L00_002852C0	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_00286598	void (void)
+func_L03_002DC990	game	func_L03_002DC990	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L03_002DDD58	void (void)
+func_L07_002F8038	game	func_L07_002F8038	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L07_002F9418	void (void)
+func_L09_002EF7F8	game	func_L09_002EF7F8	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c): Gaspar's lava draw registration; PAL func_L09_002F0B48	void (unsigned int)
+func_L07_0030D420	game	func_L07_0030D420	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L07_0030E800	void (void)
+func_L08_002DA0D0	game	func_L08_002DA0D0	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L08_002DB448	void (void)
+func_L14_00303350	game	func_L14_00303350	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L14_003047D8	void (void)
+func_L18_002FAD08	game	func_L18_002FAD08	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L18_002FC168	void (void)
+func_L00_001FEEE8	game	func_L00_001FEEE8	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001FEE98	int (int)
+func_L00_001FEF20	game	func_L00_001FEF20	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001FEED0	int (int)
+func_L00_001FEEA0	game	func_L00_001FEEA0	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001FEE50	float (float)
+func_L00_001FEF10	game	func_L00_001FEF10	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001FEEC0	float (float)
+func_L00_001FEF48	game	func_L00_001FEF48	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001FEEF8	float (float)
+func_L00_001FEF58	game	func_L00_001FEF58	host	a place the catalogue folds into another function although its code differs (split_places.tsv, rac1/host/variants.c); PAL func_L00_001FEF08	float (float)
+FUN_001ff780	hud	func_001FFFB8	wrap	the level HUD's draw: with the player's "HUD: Edges" the elements anchored left or right are drawn out at the sides of a picture wider than the game's (rac1/host/hud.c); PAL func_001FFFB8
+FUN_L00_0023a7a8	hud	draw_weapon_ammo_hud_panel	wrap	the weapon's HUD panel: with the player's "HUD: Edges" it is drawn at its own place with the screen moved, as its strip's width counts its place (rac1/host/hud.c); PAL func_L00_0023B140	int (unsigned int)
+FUN_001f4650	draw	dispatch_callback_list_1	wrap	a draw callback list's run: in a picture wider than the game's, the cull matrix and clip constants the callbacks test against (the liquid grid's seas, lava and sand; the overlay layers' bounding spheres) are opened by as much as the picture is wider for the run, and put back after it (rac1/host/wide_view.c); PAL func_001F4A00
+FUN_001f46c8	draw	dispatch_callback_list_2	wrap	a draw callback list's run: in a picture wider than the game's, the cull matrix and clip constants the callbacks test against (the liquid grid's seas, lava and sand; the overlay layers' bounding spheres) are opened by as much as the picture is wider for the run, and put back after it (rac1/host/wide_view.c); PAL func_001F4A78
+FUN_001f4740	draw	dispatch_callback_list_3	wrap	a draw callback list's run: in a picture wider than the game's, the cull matrix and clip constants the callbacks test against (the liquid grid's seas, lava and sand; the overlay layers' bounding spheres) are opened by as much as the picture is wider for the run, and put back after it (rac1/host/wide_view.c); PAL func_001F4AF0
+FUN_001f4808	draw	dispatch_callback_list_4	wrap	a draw callback list's run: in a picture wider than the game's, the cull matrix and clip constants the callbacks test against (the liquid grid's seas, lava and sand; the overlay layers' bounding spheres) are opened by as much as the picture is wider for the run, and put back after it (rac1/host/wide_view.c); PAL func_001F4BB8
+FUN_001fdd10	text	msg_string	wrap	the text of an id: the port's own ids (its rows on the Video options page) have their strings from the port (rac1/host/options.c); PAL func_001FE540
+FUN_001fdd10	text	msg_string	hook	the text of a game message id: a hook point for mods (docs/port/MODS.md); PAL func_001FE540	int (int)
+_Exit	kernel	Exit	host	system call 0x04 (KExit); PAL func_00118A60
+func_001187C0	kernel	AddDmacHandler2	host	system call 0x12, the handler takes an argument (libmpeg's colour conversion); PAL func_00118AC0
+SetAlarm	kernel	SetAlarm	host	system call 0xFC; the callback runs at once; PAL func_00118B20
+ReferThreadStatus	kernel	ReferThreadStatus	host	system call 0x30; PAL func_00118BF0
+SleepThread	kernel	SleepThread	host	system call 0x32; PAL func_00118C00
+WakeupThread	kernel	WakeupThread	host	system call 0x33; PAL func_00118C10
+_iWakeupThread	kernel	WakeupThread	host	system call -0x34 (_iWakeupThread): the same in the port; PAL func_00118C20
+SuspendThread	kernel	SuspendThread	host	system call 0x37; PAL func_00118C40
+EndOfHeap	kernel	EndOfHeap	host	system call 0x3E; sbrk's limit; PAL func_00118C60
+iSignalSema	kernel	SignalSema	host	system call -0x43 (iSignalSema): the same in the port; PAL func_00118CA0
+PollSema	kernel	PollSema	host	system call 0x45; PAL func_00118CC0
+SetOsdConfigParam	kernel	SetOsdConfigParam	host	system call 0x4A; PAL func_00118CE0
+GetOsdConfigParam	kernel	GetOsdConfigParam	host	system call 0x4B; PAL func_00118CF0
+sceSifStopDma	kernel	sceSifStopDma	host	system call 0x6B; PAL func_00118DA0
+GetOsdConfigParam2	kernel	GetOsdConfigParam2	host	system call 0x6F; PAL func_00118DC0
+SetVSyncFlag	kernel	SetVSyncFlag	host	system call 0x73; PAL func_00118E00
+isceSifSetDma	kernel	sceSifSetDma	host	system call -0x77 (isceSifSetDma): the same in the port; PAL func_00118E30
+sceSifSetDChain	kernel	sceSifSetDChain	host	system call 0x78; PAL func_00118E40
+isceSifSetDChain	kernel	sceSifSetDChain	host	system call -0x78 (isceSifSetDChain): the same in the port; PAL func_00118E50
+sceSifSetReg	kernel	sceSifSetReg	host	system call 0x79; PAL func_00118E60
+sceSifGetReg	kernel	sceSifGetReg	host	system call 0x7A; PAL func_00118E70
+Deci2Call	kernel	Deci2Call	host	system call 0x7C; kputs goes to the log; PAL func_00118E90
+GetMemorySize	kernel	GetMemorySize	host	system call 0x7F; PAL func_00118EA0
+_InitTLB	kernel	_InitTLB	host	system call 0x82; PAL func_00118EB0
+InvokeKernelSyscall005A_Rfu	kernel	Copy	host	system call 0x5A; PAL func_0011D360
+Rfu091Early	kernel	GetEntryAddress	host	system call 0x5B; PAL func_0011D3A8
+Rfu116SetSyscallEarly	kernel	SetSyscall	host	system call 0x74; PAL func_0011D3B8
+func_0011D190	kernel	_SetTLBEntry	host	system call 0x56; PAL func_0011D490
+InvokeKernelSyscall0083_Rfu	kernel	FindAddress	host	system call 0x83; PAL func_0011DA80
+Rfu116SetSyscallMid	kernel	SetSyscall	host	system call 0x74; PAL func_0011DB98
+Rfu116SetSyscallLate	kernel	SetSyscall	host	system call 0x74; PAL func_0011DBE8
+InvokeKernelSyscall005A_RfuWorker	kernel	Copy	host	system call 0x5A; PAL func_0011DBF8
+Rfu091Mid	kernel	GetEntryAddress	host	system call 0x5B; PAL func_0011DC40
+Rfu116SetSyscallTail	kernel	SetSyscall	host	system call 0x74; PAL func_0011DDD0
+InvokeKernelSyscall005A_RfuTail	kernel	Copy	host	system call 0x5A; PAL func_0011DDE0
+Rfu091Tail	kernel	GetEntryAddress	host	system call 0x5B; PAL func_0011DE28
+__muldi3	libgcc	__muldi3	host	64-bit multiply; PAL func_0011EEC8
+__udivdi3	libgcc	__udivdi3	host	64-bit unsigned divide (src/sdk/soft_float/udivdi3.c, which hostgen.json skips: libgcc's GCC-only assembly); newlib's printf, strtol and malloc call it
+__umoddi3	libgcc	__umoddi3	host	64-bit unsigned remainder (src/sdk/soft_float/umoddi3.c, skipped as above)
+FUN_00217328	pad	Pad_ProcessReport	hook	the pad's report into its state, each poll: a hook point for mods (docs/port/MODS.md; the lock-strafe mod takes it); the game's C with none; PAL func_002181F0	void (unsigned int, unsigned int, int)
+FUN_L00_00211670	hero	Hero_UpdateMotionInput	hook	the stick into the hero, early in his update: a hook point for mods (docs/port/MODS.md; the lock-strafe mod takes it); the game's C with none; PAL func_L00_00211D28	void (void)
+FUN_L00_00211e30	hero	Hero_TurnToHeading	hook	eases the facing toward the move yaw: a hook point for mods (docs/port/MODS.md; the lock-strafe mod takes it); the game's C with none; PAL func_L00_002124E8	void (int, float, float, float)
+FUN_L00_002120d8	hero	Hero_SetPlanarVelocity	hook	the velocity along an angle, the facing for one above pi: a hook point for mods (docs/port/MODS.md; the lock-strafe mod takes it); the game's C with none; PAL func_L00_00212790	void (float)
+FUN_L00_002e6000	camera	FollowCamera_ApplyOverrides	hook	the follow camera's per-tick requests from the hero's state: a hook point for mods (docs/port/MODS.md; the lock-strafe mod takes it); the game's C with none; PAL func_L00_002E74B0	void (unsigned int)
+FUN_L00_002e89b0	camera	FollowCamera_ReadStickInput	wrap	the follow camera's right stick read, each tick: the game's C, then the camera it read for noted, for the picture's late camera latch to ask what the stick would turn next (rac1/host/camera_latch.c); PAL func_L00_002E9E60	void (unsigned int, unsigned int, unsigned int)
+FUN_L00_002ea9d8	camera	set_camera_position	wrap	a camera script's view: kept for the mods when the script is another player's (rac1/host/camera_script.c); PAL func_L00_002EBE88	void (unsigned int)
+FUN_L00_002eaa30	camera	set_camera_rotation	wrap	as set_camera_position; PAL func_L00_002EBEE0	void (unsigned int)
+FUN_L00_002eaaa0	camera	CameraScript	wrap	a moby's camera script started: told to the mods, and left out when a stand-in started it (rac1/host/camera_script.c); PAL func_L00_002EBF50	void (unsigned int, unsigned int, int, int, int)
+FUN_L00_002eac18	camera	CameraScript2	wrap	a camera script ended: as CameraScript; PAL func_L00_002EC0C8	void (int)
+FUN_L00_00216f90	camera	Hero_ResetToPosition	wrap	left out for a stand-in: another player's hero is not this game's (rac1/host/camera_script.c); PAL func_L00_00217718	void (unsigned int, unsigned int, int, int)
+FUN_L00_002323b8	moby	set_hero_animation	wrap	Ratchet's animation: a sequence his class lacks in this level (Quartu has no drowning one, issue #39) is swapped for swimming or skipped (rac1/host/hero_anim_guard.c); PAL func_L00_00232C10	void (int, int, float)
+FUN_L00_00232670	hero	Hero_AdvanceAnimation	hook	Ratchet's animation advance, once a tick after his state's update: a hook point for mods (docs/port/MODS.md; the lock-strafe mod takes it); the game's C with none; PAL func_L00_00232EF0	void (void)
+FUN_L00_002070d0	hero	Hero_Update	hook	the hero's whole update each tick in levels 0, 4, 7, 9, 10, 13, 17 (the level loop's coordinate_hero_frame_update: his animation, the stick, his state machine and movement, ledges and rails, his body's easing, his moby, what he holds, his drawing): a hook point for mods, rac1.player.update with its copies in the other levels (docs/port/MODS.md; the RAC-Board mod takes it); the game's C with none; PAL func_L00_002076E8	void (void)
+FUN_L01_00228870	hero	Hero_Update	hook	the hero's whole update each tick in levels 1, 2, 5, 11, 12, 15 (the level loop's update_hero_frame: his animation, the stick, his state machine and movement, ledges and rails, his body's easing, his moby, what he holds, his drawing): a hook point for mods, rac1.player.update with its copies in the other levels (docs/port/MODS.md; the RAC-Board mod takes it); the game's C with none; PAL func_L01_00228E08	void (void)
+FUN_L03_002002f8	hero	Hero_Update	hook	the hero's whole update each tick in levels 3, 6, 8, 14, 16, 18 (the level loop's HeroL03_FrameUpdate: his animation, the stick, his state machine and movement, ledges and rails, his body's easing, his moby, what he holds, his drawing): a hook point for mods, rac1.player.update with its copies in the other levels (docs/port/MODS.md; the RAC-Board mod takes it); the game's C with none; PAL func_L03_00200890	void (void)
+FUN_L00_00260860	items	Item_Give	hook	gives the player an item (GiveItem: owned and obtained flags, banner, ammo, vendor mark, quick select): a hook point for mods (docs/port/MODS.md; the item-randomizer mod takes it); the game's C with none; PAL func_L00_002618D8	void (int, int)
+FUN_L00_00203908	help	Help_Request	hook	queues a help message: a hook point for mods (docs/port/MODS.md); retail with none	int (int, int)
+FUN_L00_0028e9c8	ship	Ship_InitTransition	hook	puts the hero in the ship for a landing or take-off, Orxon's chunks by the O2 Mask: a hook point for mods (docs/port/MODS.md); retail with none	void (int)
+FUN_L00_002607d0	items	Planet_Unlock	hook	unlocks a planet's coordinates (UnlockPlanet: the flag, the galaxy list, the banner): a hook point for mods (docs/port/MODS.md; the item-randomizer mod takes it); the game's C with none; PAL func_L00_00261848	void (int)
+FUN_L00_0023d198	vendor	Vendor_InitLevelStock	hook	the vendor's stock at each level start (VendorStockLevelInit: the starting Bomb Glove, the level's new weapon): a hook point for mods (docs/port/MODS.md; the item-randomizer mod takes it); the game's C with none; PAL func_L00_0023DB30	void (void)
+FUN_L00_0029a400	vendor	Vendor_BuildItemList	hook	the vendor menu's list from the stock, each time it opens and after each purchase (VendorBuildItemList): a hook point for mods (docs/port/MODS.md; the item-randomizer mod takes it); the game's C with none; PAL func_L00_0029B770	void (int)
+FUN_00215290	items	GoldBolts_CountCollected	hook	the gold bolts collected, at most 40 (count_gold_bolts: the pause screen's count and the unspent ones): a hook point for mods (docs/port/MODS.md; the item-randomizer mod takes it); the game's C with none; PAL func_002160E0	int (void)
+FUN_L00_002050c0	hero	Hero_TakeDamage	hook	takes hit points off the hero's health (one at most a call; 0 does nothing) and updates the HUD's health bank: every hit the hero takes but the instant kills: a hook point for mods (docs/port/MODS.md; the difficulty mod takes it); the game's C with none; PAL func_L00_002056D8	void (int)
+FUN_L00_0025a420	moby	Moby_GetHitMessage	hook	the hit pending on a moby (MobyGetHitMessage: the record of the last hit posted to it, its damage a float at +0x2C) when its flags match mask, else 0 (and the hit dropped unless keep): how the hero and every enemy read the hits they take: a hook point for mods (docs/port/MODS.md; the difficulty mod takes it); the game's C with none; PAL func_L00_0025B478	unsigned int (unsigned int, int, int)
+FUN_L00_00233db8	items	Weapon_TakeAmmo	hook	takes ammo from an item for a shot (TakeAmmo: -1 for the item in hand): 1, or 0 when there is too little; an item with no ammo limit takes none: a hook point for mods (docs/port/MODS.md; the difficulty mod takes it); the game's C with none; PAL func_L00_00234638	int (int, int)
+FUN_L00_00257470	moby	Moby_RecordDeath	hook	records a placed moby's death or a crate's break (SetDeathBits: its save id's killed bits, its mission) and drops its bolts (the s16 at +0xB4, or what is left of +0xB6 for a tallied source) through the bolt drop: a hook point for mods (docs/port/MODS.md; the difficulty mod takes it); the game's C with none; PAL func_L00_002584A8	void (unsigned int, int, int)
+FUN_L00_00241940	level	Level_LoadGameplay	hook	loads a level's gameplay file into the level heap (LoadLevelGameplay: the settings, the placed mobys and their pvars, the spare moby pool, paths, ...); returns the heap cursor: a hook point for mods (docs/port/MODS.md; the difficulty mod takes it); the game's C with none; PAL func_L00_002422D8	unsigned int (int)
+FUN_L00_00212088	hero	Hero_ApproachSpeed	hook	eases the hero's ground speed (+0x194) toward his target speed (+0x190) by up below it and down above it (ApproachValue), each tick he moves on foot, in every level: a hook point for mods (docs/port/MODS.md; the difficulty mod takes it); the game's C with none; PAL func_L00_00212740	void (float, float)
+FUN_L00_0028ed58	level	Ship_TravelTo	hook	the ship's travel from the planet select (ShipTravelTo): to the planet it is on, the landing again (as backing out of the select does); to another, the save to the card and the ship's flight out of the level, which then ends and flies there: a hook point for mods (docs/port/MODS.md; the multiplayer mod takes it); the game's C with none; PAL func_L00_00290030	void (int)
+FUN_L00_002a6b70	moby	Moby_CollectBolt	hook	collects a bolt (collect_bolt, from the bolt update once it reaches the hero): its value (1, or 5 / 20 / 50 for classes 14 / 15 / 16) added to the bolt count, the level's total and its source's stats, the bolt counter shown and two sparkles at it; the bolt update deletes the bolt after it: a hook point for mods (docs/port/MODS.md; the multiplayer mod takes it); the game's C with none; PAL func_L00_002A7E10	void (unsigned int)
+FUN_0021b858	menu	Menu_ItemGrid_Update	hook	the pause menu item grid's focus and selection, each tick it is open; returns the menu's action: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021C840	int (unsigned int)
+FUN_0021d948	menu	Menu_ItemGrid_Draw	hook	draws the pause menu item grid; returns its render-pass flags: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021E950	int (unsigned int)
+FUN_0021c7a0	menu	Menu_ItemSlots_Update	hook	puts the highlighted item in a quick select slot, in the pause menu's editor: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021D7A0	int (unsigned int)
+FUN_00220b20	menu	Menu_QuickSelect_Draw	hook	draws the pause menu's quick select ring; returns its render-pass flags: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00221B58	int (unsigned int)
+FUN_0021c9c8	menu	Menu_QuickSelect_Load	hook	the eight saved quick select items into the pause menu's editor: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021D9C8	int (unsigned int)
+FUN_0021ca60	menu	Menu_QuickSelect_Store	hook	the editor's eight quick select items back to the saved quick select: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021DA60	int (unsigned int)
+FUN_0021a328	menu	Menu_ItemText_Draw	hook	draws a menu text label from its configuration, the selected item's name and description among others: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021B298	int (unsigned int)
+FUN_0021f158	menu	Menu_ItemAmmo_Draw	hook	draws the selected item's ammo panel in the pause menu: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00220160	int (int)
+FUN_0021e230	menu	Menu_Preview_Bind	hook	binds the selected item to the pause menu's preview: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021F238	int (unsigned int)
+FUN_0021df98	menu	Menu_Preview_Update	hook	makes or replaces the pause menu's item preview moby: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021EFA0	int (unsigned int)
+FUN_0021e608	menu	Menu_Preview_DrawAvailable	hook	draws the owned selected item's preview mobys; returns the render-pass flags: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021F610	int (unsigned int)
+FUN_0021e110	menu	Menu_Preview_DrawSelected	hook	draws the selected item's preview, or the message for one not owned: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021F118	int (unsigned int)
+FUN_00224368	menu	Menu_EquippedPreview_Update	hook	loads the preview of the item in hand: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_002255F8	int (unsigned int)
+FUN_0021ddf8	menu	Menu_EquippedPreview_Draw	hook	draws the pause menu's preview of the hero and what he holds: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0021EE00	int (unsigned int)
+FUN_L00_00237ae8	hud	Hud_QuickSelect_Init	hook	sets up the quick select's eight-slot selector in play: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_00238478	void (unsigned int)
+FUN_L00_00237ba0	hud	Hud_QuickSelect_Update	hook	the quick select in play, each tick: focus, visibility and the item chosen: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_00238530	void (unsigned int)
+FUN_L00_002382a0	hud	Hud_QuickSelect_Draw	hook	draws the quick select's item icons in play: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_00238C30	int (unsigned int)
+FUN_L00_0029ba78	vendor	Vendor_MenuUpdate	hook	the vendor's purchase menu, each tick it is open: buying items and ammo: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_0029CDE0	void (void)
+FUN_L00_0029b680	vendor	Vendor_InitializeSelected	hook	sets up the mobys and text of the vendor's selected row: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_0029C9E8	void (void)
+FUN_L00_00257218	items	Ammo_ChooseDrop	hook	chooses the ammo a moby or crate drops: the item to out_item, the count returned: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_00258250	int (unsigned int, unsigned int)
+FUN_L00_002c52a8	items	Ammo_SpawnDrop	hook	makes an ammo pickup moby at pos; returns it, or 0: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_L00_002C6608	unsigned int (unsigned int, int, int, int)
+FUN_002269c0	memcard	Save_Prepare	hook	the game's state into a save, and a full memory card write started: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00227C78	void (int, int)
+FUN_0020b178	memcard	Save_RequestAutosave	hook	the save's packets written and their memory card update asked for: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0020BFC8	int (int, int)
+FUN_00209298	memcard	Save_Restore	hook	restores a whole save from memory, a new game's default state too: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00209CE8	void (unsigned int)
+FUN_0020af20	memcard	Save_RestoreData	hook	restores one checked save packet; a file's load calls it directly: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0020BD70	int (unsigned int, int, unsigned int)
+FUN_00209370	memcard	Save_NewGame	hook	a new game: the disc's default state, and level 0: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00209DC0	void (void)
+FUN_00226b08	memcard	Save_NewGamePlus	hook	challenge mode's start: level 0 with the carried progress kept: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00227DB0	void (int)
+FUN_0020abb0	memcard	Save_Serialize	hook	the whole save into out, with no memory card access: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_0020BA00	void (unsigned int)
+FUN_002093d8	memcard	Save_UpdateState	hook	the memory card's state machine, each tick: saves and loads: a hook point for mods (docs/port/MODS.md; for mods that add weapons, issue 127); the game's C with none; PAL func_00209E68	void (void)
+FUN_L02_0024f748	draw	func_L02_00250720	wrap	the liquid grid's cull (seas, lava, sand): in a picture wider than the game's, against the cull matrix opened by as much as the picture is wider, put back after it (rac1/host/wide_view.c); PAL func_L02_00250720
+FUN_001fa728	draw	fast_bsphere_check	wrap	the bounding sphere view test: while a draw callback list, the nanotech cluster's update or Kerwan's air traffic's runs, in a picture wider than the game's, against clip constants opened by as much as the picture is wider, put back after it (rac1/host/wide_view.c); PAL func_L00_00200290
+FUN_L00_002d89f0	draw	nanotech_ball_update	wrap	the nanotech cluster's update (the orb on a nanotech crate), which draws it only while the bounding sphere test finds it in view: in a picture wider than the game's, that test against clip constants opened by as much as the picture is wider (rac1/host/wide_view.c); PAL func_L00_002D9EA0	void (unsigned int)
+FUN_L03_0029dba8	draw	Moby_RedShip1_Update	wrap	Kerwan's air traffic's update (classes 75, 115-120, 132, 795), which parks a group of ships for 5 ticks while the bounding sphere test finds none of them in view: in a picture wider than the game's, that test against clip constants opened by as much as the picture is wider (rac1/host/wide_view.c); PAL func_L03_0029ED60	void (unsigned int)
+FUN_L00_002d6f28	draw	particle_spawner_smoke_fire_update	wrap	the smoke and fire emitter's update (class 760: the fires and smoke of Oltanis's buildings and others), which spawns its flames and draws them only while the bounding sphere test finds it in view: in a picture wider than the game's, that test against clip constants opened by as much as the picture is wider (rac1/host/wide_view.c); PAL func_L00_002D83D8	void (unsigned int)
+FUN_00212e28	game	UpdateMobys	wrap	the moby update loop: run by the host, which notes the moby whose turn it is (one store before, one after), so a crash report names the moby being updated (rac1/host/crash_state.c); PAL func_00213C78	void (void)
+FUN_00204790	game	UpdateWorldObjectAnimation	wrap	a scene's actors: run by the host, which skips an actor CreateMoby cannot make (the moby pool full) instead of reading through the null moby as the console does; a documented divergence (rac1/host/scene_actors.c, docs/port/KNOWN_ISSUES.md); PAL func_00204FC0	void (void)
+FUN_L00_00241940	level	LoadLevelGameplay	wrap	the level loader: the gameplay header it decompresses gets at least 768 spare moby slots (256 on the disc) on every level whose heap has room (all but Rilgar, Blarg Station and Quartu), so busy effects have more room than on a PS2; a documented difference (rac1/host/moby_pool.c, docs/port/KNOWN_ISSUES.md); the mods' hook point sits under it; PAL func_L00_002422D8	unsigned int (int)
+FUN_L00_00259bc8	moby	PostHitMessage	wrap	a hit posted to a moby: the game's C, then the mods told of it, who may take it back (rac1/host/world.c, interface 1.9); its damage is its last argument here; PAL func_L00_0025AC00	void (unsigned int, int, int, unsigned int, unsigned int, float)
+FUN_L00_00211250	hero	Hero_OnKilled	wrap	a hero dead at the end of his dying state: the death counted, a fade, and the respawn at the end of the frame; left out while a mod keeps him down (rac1/host/hero_down.c, interface 1.14); PAL func_L00_00211908	void (void)
+FUN_L00_00276bd0	level	update_pause_menu	wrap	the pause menu's tick: the level's mobys go on under it while a mod asks for it, with the level's camera put up, and the level is drawn under the menu (rac1/host/world.c, interface 1.9); PAL func_L00_00277A88	void (void)
+FUN_001fce28	game	update_mode_freeze	wrap	a freeze dialog's tick: the level's mobys go on under it while a mod asks for it (rac1/host/world.c); PAL func_001FD3E8	void (void)
+FUN_L00_00259a88	moby	record_moby_hit	wrap	a hit copied from a record to a moby: the game's C, then the mods told of it (rac1/host/world.c); PAL func_L00_0025AAC0	void (unsigned int, unsigned int)
+FUN_0020c828	moby	DeleteMoby	wrap	a moby deleted: its slot's deletion noted first (whose update deleted it, or a mod), then the game's C (rac1/host/world.c, interface 1.9: moby_deletion); PAL func_0020D678	void (unsigned int)
+FUN_00204a40	game	select_world_object_resource_tables	wrap	a weapon's or gadget's class decoded into one of the two buffers they share: the figures' pieces drawn from the buffer decoded over go first (rac1/host/figure_items.c, interface 1.9); PAL func_00205270	void (int, int)
+FUN_L00_002caf70	moby	spawn_homing_shot	wrap	a Blaster shot: the hero's noted for the mods, a figure's made with it (rac1/host/figure_shots.c, interface 1.9); PAL func_L00_002CC3C0	unsigned int (unsigned int, unsigned int, unsigned int, float, float, float, float)
+FUN_L00_002acfd8	moby	launch_bomb	wrap	a bomb thrown from the Bomb Glove: the hero's noted for the mods, a figure's thrown with it (rac1/host/figure_shots.c, interface 1.9); PAL func_L00_002AE278	void (unsigned int, unsigned int, unsigned int)
+FUN_L00_0025a9f8	moby	SendRadialMessageToMobys	wrap	a blast's hits on the mobys around it: none for a figure's bomb (rac1/host/figure_shots.c, interface 1.9); PAL func_L00_0025BA50	void (unsigned int, unsigned int, unsigned int, int, unsigned int, int, int, int, float, float, float)
+FUN_0020d868	game	build_resident_visibility_list	wrap	a tick's run list: run by the host, whose target list (the scratchpad's, copied to the pointer table D_001C7900) holds at most 511 mobys where retail writes past both with more, which the bigger moby pool makes reachable (rac1/host/moby_pool.c); PAL func_0020E6B8	unsigned int (void)
+FUN_L00_0025e450	effects	SpawnExplosion	wrap	the original explosion, with a one-shot visual water impulse (rac1/host/water.c); gameplay unchanged; PAL func_L00_0025F4A8	void (unsigned int, unsigned int, unsigned int, float, float, int, int, int, float, float, float, float, int, float, int, int, int, unsigned char)
+# ---- generated by sdk/tools/gen_binding.py: the behaviour catalogue's hook points; do not edit ----
+FUN_00215420	moby	Moby_Class1750_Update	hook	The update of class 1750, each tick; it gets no moby: a hook point for mods, rac1.moby.class_1750.update (docs/port/MODS.md); retail with none
+FUN_0023ab78	moby	Moby_Class676_Update	hook	The update of class 676, each tick: a hook point for mods, rac1.moby.class_676.update (docs/port/MODS.md); retail with none
+FUN_L00_002371e0	moby	Moby_Class482_Update	hook	The update of class 482, each tick: a hook point for mods, rac1.moby.class_482.update (docs/port/MODS.md); retail with none
+FUN_L00_002a4cd8	moby	Moby_Class809_Update	hook	The update of class 809, each tick: a hook point for mods, rac1.moby.texture_scroll.update (docs/port/MODS.md); retail with none
+FUN_L00_002a4e48	moby	Moby_CameraObject_Update	hook	The update of class camera_object (1007), each tick: a hook point for mods, rac1.moby.camera_object.update (docs/port/MODS.md); retail with none
+FUN_L00_002a57a8	moby	Moby_Vendor_Update	hook	The update of class vendor (11), each tick: a hook point for mods, rac1.moby.light_beam.update (docs/port/MODS.md); retail with none
+FUN_L00_002a5dd8	moby	Moby_Bolt_Update	hook	The update of classes bolt (13), bolt_hexnut (14), bolt_starnut (15), bolt_circlenut (16), each tick: a hook point for mods, rac1.moby.bolt.update (docs/port/MODS.md); retail with none
+FUN_L00_002a84c8	moby	Moby_Wrench_Update	hook	The update of class wrench (71), each tick: a hook point for mods, rac1.moby.wrench.update (docs/port/MODS.md); retail with none
+FUN_L00_002aa670	moby	Moby_Mine_Update	hook	The update of class mine (74), each tick: a hook point for mods, rac1.moby.mine.update (docs/port/MODS.md); retail with none
+FUN_L00_002acad8	moby	Moby_Class112_Update	hook	The update of classes 112, 1192, each tick: a hook point for mods, rac1.moby.spin_fade_out.update (docs/port/MODS.md); retail with none
+FUN_L00_002adb30	moby	Moby_Class121_Update	hook	The update of class 121, each tick: a hook point for mods, rac1.moby.hero_bomb.update (docs/port/MODS.md); retail with none
+FUN_L00_002af5b8	moby	Moby_Class122_Update	hook	The update of class 122, each tick: a hook point for mods, rac1.moby.falling_spark.update (docs/port/MODS.md); retail with none
+FUN_L00_002afa48	moby	Moby_NanotechCrateFragment_Update	hook	The update of classes 149, nanotech_crate_fragment (348), nanotech_crate_fragment (349), metal_crate_fragment (354) and 7 more, each tick: a hook point for mods, rac1.moby.debris_bounce.update (docs/port/MODS.md); retail with none
+FUN_L00_002b03a0	moby	Moby_GoldDevastatorMissile_Update	hook	The update of class gold_devastator_missile (153), each tick: a hook point for mods, rac1.moby.missile.update (docs/port/MODS.md); retail with none
+FUN_L00_002b3058	moby	Moby_Visibomb_Update	hook	The update of class visibomb (163), each tick: a hook point for mods, rac1.moby.moby163.update (docs/port/MODS.md); retail with none
+FUN_L00_002b3458	moby	Moby_Class166_Update	hook	The update of class 166, each tick: a hook point for mods, rac1.moby.moby166.update (docs/port/MODS.md); retail with none
+FUN_L00_002b4198	moby	Moby_Class167_Update	hook	The update of class 167, each tick: a hook point for mods, rac1.moby.moby167.update (docs/port/MODS.md); retail with none
+FUN_L00_002b6140	moby	Moby_VisibombMissile_Update	hook	The update of class visibomb_missile (172), each tick: a hook point for mods, rac1.moby.visibomb_missile.update (docs/port/MODS.md); retail with none
+FUN_L00_002b6f10	moby	Moby_Taunter_Update	hook	The update of class taunter (175), each tick: a hook point for mods, rac1.moby.moby175.update (docs/port/MODS.md); retail with none
+FUN_L00_002b77f0	moby	Moby_Pyrocitor_Update	hook	The update of class pyrocitor (176), each tick: a hook point for mods, rac1.moby.pyrocitor.update (docs/port/MODS.md); retail with none
+FUN_L00_002bb400	moby	Moby_Class179_Update	hook	The update of class 179, each tick: a hook point for mods, rac1.moby.moby179.update (docs/port/MODS.md); retail with none
+FUN_L00_002bb558	moby	Moby_Walloper_Update	hook	The update of class walloper (180), each tick: a hook point for mods, rac1.moby.moby180.update (docs/port/MODS.md); retail with none
+FUN_L00_002bc7e8	moby	Moby_Morphoray_Update	hook	The update of class morphoray (185), each tick: a hook point for mods, rac1.moby.morphoray.update (docs/port/MODS.md); retail with none
+FUN_L00_002bffa8	moby	Moby_DoomBot_Update	hook	The update of class doom_bot (186), each tick: a hook point for mods, rac1.moby.doom_bot.update (docs/port/MODS.md); retail with none
+FUN_L00_002c1718	moby	Moby_Trespasser_Update	hook	The update of class trespasser (188), each tick: a hook point for mods, rac1.moby.moby188.update (docs/port/MODS.md); retail with none
+FUN_L00_002c1ad0	moby	Moby_MineGlove_Update	hook	The update of class mine_glove (190), each tick: a hook point for mods, rac1.moby.mine_glove.update (docs/port/MODS.md); retail with none
+FUN_L00_002c26c8	moby	Moby_BombGlove_Update	hook	The update of class bomb_glove (192), each tick: a hook point for mods, rac1.moby.moby192.update (docs/port/MODS.md); retail with none
+FUN_L00_002c4380	moby	Moby_Decoy_Update	hook	The update of classes decoy (203), gold_decoy (1900), each tick: a hook point for mods, rac1.moby.thrown_object.update (docs/port/MODS.md); retail with none
+FUN_L00_002c53c0	moby	Moby_DevestatorAmmo_Update	hook	The update of classes devestator_ammo (204), tesla_claw_ammo (213), pyrocitor_ammo (214), visibomb_ammo (222) and 7 more, each tick: a hook point for mods, rac1.moby.ammo_pickup.update (docs/port/MODS.md); retail with none
+FUN_L00_002c7070	moby	Moby_SwingshotHook_Update	hook	The update of class swingshot_hook (209), each tick: a hook point for mods, rac1.moby.moby209.update (docs/port/MODS.md); retail with none
+FUN_L00_002c7a58	moby	Moby_GloveOfDoom_Update	hook	The update of class glove_of_doom (229), each tick: a hook point for mods, rac1.moby.carrier.update (docs/port/MODS.md); retail with none
+FUN_L00_002c89e8	moby	Moby_Bomb_Update	hook	The update of class bomb (230), each tick: a hook point for mods, rac1.moby.bomb_230.update (docs/port/MODS.md); retail with none
+FUN_L00_002c97e0	moby	Moby_MorphorayChicken_Update	hook	The update of class morphoray_chicken (270), each tick: a hook point for mods, rac1.moby.morphoray_chicken.update (docs/port/MODS.md); retail with none
+FUN_L00_002cb418	moby	Moby_Class305_Update	hook	The update of class 305, each tick: a hook point for mods, rac1.moby.moby305.update (docs/port/MODS.md); retail with none
+FUN_L00_002cc210	moby	Moby_Class428_Update	hook	The update of class 428, each tick: a hook point for mods, rac1.moby.moby428.update (docs/port/MODS.md); retail with none
+FUN_L00_002cc608	moby	Moby_Ryno_Update	hook	The update of class ryno (454), each tick: a hook point for mods, rac1.moby.ryno.update (docs/port/MODS.md); retail with none
+FUN_L00_002cd1f0	moby	Moby_Rocket_Update	hook	The update of class rocket (457), each tick: a hook point for mods, rac1.moby.rocket_steer.update (docs/port/MODS.md); retail with none
+FUN_L00_002ce358	moby	Moby_Drone_Update	hook	The update of class drone (479), each tick: a hook point for mods, rac1.moby.drone.update (docs/port/MODS.md); retail with none
+FUN_L00_002cf218	moby	Moby_BoltCrate_Update	hook	The update of classes bolt_crate (500), nanotech_crate (501), metal_crate (502), oom_oom_box (505) and 1 more, each tick: a hook point for mods, rac1.moby.crate.update (docs/port/MODS.md); retail with none
+FUN_L00_002d1e80	moby	Moby_VeldinShip_Update	hook	The update of class veldin_ship (530), each tick: a hook point for mods, rac1.moby.veldin_ship.update (docs/port/MODS.md); retail with none
+FUN_L00_002d2670	moby	Moby_DecoyGlove_Update	hook	The update of class decoy_glove (562), each tick: a hook point for mods, rac1.moby.decoy_glove.update (docs/port/MODS.md); retail with none
+FUN_L00_002d2ee8	moby	Moby_MetalDetector_Update	hook	The update of class metal_detector (585), each tick: a hook point for mods, rac1.moby.target_tracker.update (docs/port/MODS.md); retail with none
+FUN_L00_002d37d0	moby	Moby_Helipack_Update	hook	The update of class helipack (607), each tick: a hook point for mods, rac1.moby.clank_pack.update (docs/port/MODS.md); retail with none
+FUN_L00_002d3a10	moby	Moby_Class639_Update	hook	The update of class 639, each tick: a hook point for mods, rac1.moby.moby639.update (docs/port/MODS.md); retail with none
+FUN_L00_002d4610	moby	Moby_HornyToad_Update	hook	The update of class horny_toad (749), each tick: a hook point for mods, rac1.moby.horny_toad.update (docs/port/MODS.md); retail with none
+FUN_L00_002d5de8	moby	Moby_Infobot_Update	hook	The update of class infobot (750), each tick: a hook point for mods, rac1.moby.infobot.update (docs/port/MODS.md); retail with none
+FUN_L00_002d6f28	moby	Moby_ParticleSpawnerSmokeFire_Update	hook	The update of class particle_spawner_smoke__fire (760), each tick: a hook point for mods, rac1.moby.particle_field.update (docs/port/MODS.md); retail with none
+FUN_L00_002d7f38	moby	Moby_Class775_Update	hook	The update of class 775, each tick: a hook point for mods, rac1.moby.grow_and_fade_out.update (docs/port/MODS.md); retail with none
+FUN_L00_002d7f88	moby	Moby_Class804_Update	hook	The update of class 804, each tick: a hook point for mods, rac1.moby.trail_moby.update (docs/port/MODS.md); retail with none
+FUN_L00_002d89f0	moby	Moby_NanotechBall_Update	hook	The update of class nanotech_ball (806), each tick: a hook point for mods, rac1.moby.nanotech_ball.update (docs/port/MODS.md); retail with none
+FUN_L00_002d9dc8	moby	Moby_ClankCutsceneTrigger_Update	hook	The update of class clank_cutscene_trigger (834), each tick: a hook point for mods, rac1.moby.moby834.update (docs/port/MODS.md); retail with none
+FUN_L00_002da790	moby	Moby_Suckcannon_Update	hook	The update of class suckcannon (849), each tick: a hook point for mods, rac1.moby.suck_cannon.update (docs/port/MODS.md); retail with none
+FUN_L00_002df4f8	moby	Moby_RedOrb_Update	hook	The update of class red_orb (1060), each tick: a hook point for mods, rac1.moby.pulsing_color_moby.update (docs/port/MODS.md); retail with none
+FUN_0023a2c0	moby	Moby_Class1138_Update	hook	The update of class 1138, each tick: a hook point for mods, rac1.moby.quad_moby.update (docs/port/MODS.md); retail with none
+FUN_L00_002df730	moby	Moby_VendorOrb_Update	hook	The update of class vendor_orb (1143), each tick: a hook point for mods, rac1.moby.moby1143.update (docs/port/MODS.md); retail with none
+FUN_L00_002df9a0	moby	Moby_Hydrodisplacer_Update	hook	The update of class hydrodisplacer (1251), each tick: a hook point for mods, rac1.moby.hydrodisplacer_pad.update (docs/port/MODS.md); retail with none
+FUN_L00_002e03a0	moby	Moby_PilotsHelmet_Update	hook	The update of class pilots_helmet (1290), each tick: a hook point for mods, rac1.moby.moby1290.update (docs/port/MODS.md); retail with none
+FUN_L00_002e0988	moby	Moby_Class1413_Update	hook	The update of class 1413, each tick: a hook point for mods, rac1.moby.moby1413.update (docs/port/MODS.md); retail with none
+FUN_L00_002e0b88	moby	Moby_VeldinRobotEnemy_Update	hook	The update of class veldin_robot_enemy (1440), each tick: a hook point for mods, rac1.moby.vendor.update (docs/port/MODS.md); retail with none
+FUN_L00_002e1df0	moby	Moby_Class1471_Update	hook	The update of class 1471, each tick: a hook point for mods, rac1.moby.beam_slot_manager.update (docs/port/MODS.md); retail with none
+FUN_L00_002e3800	moby	Moby_Class1545_Update	hook	The update of class 1545, each tick: a hook point for mods, rac1.moby.moby1545.update (docs/port/MODS.md); retail with none
+FUN_L00_002e3a88	moby	Moby_Pterodactyl_Update	hook	The update of class pterodactyl (1564), each tick: a hook point for mods, rac1.moby.path_follow_moby.update (docs/port/MODS.md); retail with none
+FUN_L00_002e3ca8	moby	Moby_BombthrowerGrass_Update	hook	The update of classes bombthrower_grass (492), green_leaves (724), blue_leaves (725), plant (766) and 3 more, each tick: a hook point for mods, rac1.moby.grass.update (docs/port/MODS.md); retail with none
+FUN_L00_002e3d88	moby	Moby_Hoverboard_Update	hook	The update of classes 1505, 1506, 1517, 1518 and 199 more, each tick: a hook point for mods, rac1.moby.fx_group.update (docs/port/MODS.md); retail with none
+FUN_L01_002b9eb0	moby	Moby_NovalisElevator_Update	hook	The update of classes novalis_elevator (726), elevator (1141), each tick: a hook point for mods, rac1.moby.path_platform.update (docs/port/MODS.md); retail with none
+FUN_L01_002bd100	moby	Moby_Class27_Update	hook	The update of class 27, each tick: a hook point for mods, rac1.moby.particle_emitter.update (docs/port/MODS.md); retail with none
+FUN_L01_002c7530	moby	Moby_Class156_Update	hook	The update of class 156, each tick: a hook point for mods, rac1.moby.moby156.update (docs/port/MODS.md); retail with none
+FUN_L01_002e0c68	moby	Moby_BoltCrank_Update	hook	The update of class bolt_crank (280), each tick: a hook point for mods, rac1.moby.bolt_crank.update (docs/port/MODS.md); retail with none
+FUN_L01_002e1ac0	moby	Moby_GoldWeaponCase_Update	hook	The update of classes gold_weapon_case (304), gold_bomb_glove (1456), gold_pyrocitor (1457), gold_blaster (1458) and 7 more, each tick: a hook point for mods, rac1.moby.item_offer.update (docs/port/MODS.md); retail with none
+FUN_L01_002e3f20	moby	Moby_SandMouse_Update	hook	The update of class sand_mouse (437), each tick: a hook point for mods, rac1.moby.sand_mouse.update (docs/port/MODS.md); retail with none
+FUN_L01_002e6bf0	moby	Moby_Birdbot_Update	hook	The update of class birdbot (459), each tick: a hook point for mods, rac1.moby.birdbot.update (docs/port/MODS.md); retail with none
+FUN_L01_002eda00	moby	Moby_Class567_Update	hook	The update of class 567, each tick: a hook point for mods, rac1.moby.burning_debris.update (docs/port/MODS.md); retail with none
+FUN_L01_002edca0	moby	Moby_LargeAmoeboid_Update	hook	The update of classes large_amoeboid (572), medium_amoeboid (865), small_amoeboid (866), each tick: a hook point for mods, rac1.moby.amoeboid.update (docs/port/MODS.md); retail with none
+FUN_L01_002efc60	moby	Moby_Peckbot_Update	hook	The update of class peckbot (577), each tick: a hook point for mods, rac1.moby.peckbot.update (docs/port/MODS.md); retail with none
+FUN_L01_002f2b68	moby	Moby_SandmouseHouse_Update	hook	The update of class sandmouse_house (604), each tick: a hook point for mods, rac1.moby.moby604.update (docs/port/MODS.md); retail with none
+FUN_L01_002f2eb8	moby	Moby_Class605_Update	hook	The update of class 605, each tick: a hook point for mods, rac1.moby.moby605.update (docs/port/MODS.md); retail with none
+FUN_L01_002f3120	moby	Moby_WaterCurrent_Update	hook	The update of class water_current (613), each tick: a hook point for mods, rac1.moby.path_carrier.update (docs/port/MODS.md); retail with none
+FUN_L01_002f4348	moby	Moby_CaveDoor_Update	hook	The update of class cave_door (641), each tick: a hook point for mods, rac1.moby.crank_rotator.update (docs/port/MODS.md); retail with none
+FUN_L01_002f4428	moby	Moby_FighterJet_Update	hook	The update of class fighter_jet (660), each tick: a hook point for mods, rac1.moby.tethered_mine.update (docs/port/MODS.md); retail with none
+FUN_L01_002f4710	moby	Moby_DoorHalf_Update	hook	The update of class door_half (665), each tick: a hook point for mods, rac1.moby.crank_slider.update (docs/port/MODS.md); retail with none
+FUN_L01_002f4960	moby	Moby_StationaryShip_Update	hook	The update of class stationary_ship (666), each tick: a hook point for mods, rac1.moby.rider_carrier.update (docs/port/MODS.md); retail with none
+FUN_L01_002f5168	moby	Moby_Class845_Update	hook	The update of class 845, each tick: a hook point for mods, rac1.moby.class_845.update (docs/port/MODS.md); retail with none
+FUN_L01_002f6180	moby	Moby_Class678_Update	hook	The update of class 678, each tick: a hook point for mods, rac1.moby.scrolling_layers2.update (docs/port/MODS.md); retail with none
+FUN_L01_002f6328	moby	Moby_Class679_Update	hook	The update of class 679, each tick: a hook point for mods, rac1.moby.grind_rail.update (docs/port/MODS.md); retail with none
+FUN_L01_002f6a30	moby	Moby_Class686_Update	hook	The update of class 686, each tick: a hook point for mods, rac1.moby.flying_burst.update (docs/port/MODS.md); retail with none
+FUN_L01_002f7728	moby	Moby_BomberJet_Update	hook	The update of class bomber_jet (688), each tick: a hook point for mods, rac1.moby.gunship.update (docs/port/MODS.md); retail with none
+FUN_L01_002f8268	moby	Moby_WaterLily_Update	hook	The update of class water_lily (695), each tick: a hook point for mods, rac1.moby.hover_enemy.update (docs/port/MODS.md); retail with none
+FUN_L01_002f8718	moby	Moby_Rock_Update	hook	The update of classes 200, 201, 205, 206 and 7 more, each tick: a hook point for mods, rac1.moby.debris_moby.update (docs/port/MODS.md); retail with none
+FUN_L01_002f8c58	moby	Moby_Class700_Update	hook	The update of class 700, each tick: a hook point for mods, rac1.moby.steam_vent.update (docs/port/MODS.md); retail with none
+FUN_L01_002f9080	moby	Moby_FallingRock_Update	hook	The update of class falling_rock (701), each tick: a hook point for mods, rac1.moby.collapsing_platform.update (docs/port/MODS.md); retail with none
+FUN_L01_002f95c0	moby	Moby_PistonPlatform_Update	hook	The update of classes piston_platform (703), piston_platform_2 (715), each tick: a hook point for mods, rac1.moby.lift_move.update (docs/port/MODS.md); retail with none
+FUN_L01_002f9810	moby	Moby_RockFormation_Update	hook	The update of class rock_formation (704), each tick: a hook point for mods, rac1.moby.breakable_rock.update (docs/port/MODS.md); retail with none
+FUN_L01_002f9bf0	moby	Moby_Fan_Update	hook	The update of class fan (705), each tick: a hook point for mods, rac1.moby.oscillating_spinner.update (docs/port/MODS.md); retail with none
+FUN_L01_002f9d80	moby	Moby_BridgePiece1_Update	hook	The update of classes bridge_piece_1 (709), bridge_piece_2 (710), bridge_piece_3 (711), each tick: a hook point for mods, rac1.moby.projectile_breakable.update (docs/port/MODS.md); retail with none
+FUN_L01_002fa4c0	moby	Moby_Class722_Update	hook	The update of class 722, each tick: a hook point for mods, rac1.moby.falling_drop.update (docs/port/MODS.md); retail with none
+FUN_L01_002fa800	moby	Moby_DestroyableCaveWall_Update	hook	The update of class destroyable_cave_wall (729), each tick: a hook point for mods, rac1.moby.breakable_wall.update (docs/port/MODS.md); retail with none
+FUN_L01_002fad68	moby	Moby_AgnoggShipFront_Update	hook	The update of classes agnogg_ship_front (730), agnogg_ship_back (731), ship_rear (790), each tick: a hook point for mods, rac1.moby.agnogg_ship.update (docs/port/MODS.md); retail with none
+FUN_L01_002fb5b0	moby	Moby_Class737_Update	hook	The update of class 737, each tick: a hook point for mods, rac1.moby.cutscene_trigger.update (docs/port/MODS.md); retail with none
+FUN_L01_002fb8a8	moby	Moby_BridgeHalf_Update	hook	The update of class bridge_half (746), each tick: a hook point for mods, rac1.moby.hinged_bridge.update (docs/port/MODS.md); retail with none
+FUN_L01_002fd0e8	moby	Moby_Class751_Update	hook	The update of class 751, each tick: a hook point for mods, rac1.moby.water_surface_fx.update (docs/port/MODS.md); retail with none
+FUN_L01_002fd9a0	moby	Moby_GreenMushroom_Update	hook	The update of class green_mushroom (754), each tick: a hook point for mods, rac1.moby.breakable_pot.update (docs/port/MODS.md); retail with none
+FUN_L01_002feb58	moby	Moby_Class761_Update	hook	The update of class 761, each tick: a hook point for mods, rac1.moby.pulsing_mesh.update (docs/port/MODS.md); retail with none
+FUN_L01_002fed68	moby	Moby_DoorLeft_Update	hook	The update of classes door_left (768), door_right (769), each tick: a hook point for mods, rac1.moby.sliding_door.update (docs/port/MODS.md); retail with none
+FUN_L01_002ff118	moby	Moby_ThePlumber_Update	hook	The update of class the_plumber (774), each tick: a hook point for mods, rac1.moby.talking_npc.update (docs/port/MODS.md); retail with none
+FUN_L01_002ff860	moby	Moby_Pipe_Update	hook	The update of class pipe (778), each tick: a hook point for mods, rac1.moby.moby778.update (docs/port/MODS.md); retail with none
+FUN_L01_002ffb28	moby	Moby_Class779_Update	hook	The update of class 779, each tick: a hook point for mods, rac1.moby.smoke_emitter.update (docs/port/MODS.md); retail with none
+FUN_L01_002ffdc0	moby	Moby_Class787_Update	hook	The update of class 787, each tick: a hook point for mods, rac1.moby.falling_chunk.update (docs/port/MODS.md); retail with none
+FUN_L01_00300220	moby	Moby_SpawnPoint_Update	hook	The update of class spawn_point (805), each tick: a hook point for mods, rac1.moby.checkpoint_trigger.update (docs/port/MODS.md); retail with none
+FUN_L01_003021b8	moby	Moby_Beehive_Update	hook	The update of class beehive (815), each tick: a hook point for mods, rac1.moby.enemy_spawner.update (docs/port/MODS.md); retail with none
+FUN_L01_00302648	moby	Moby_Class832_Update	hook	The update of class 832, each tick: a hook point for mods, rac1.moby.rc_range_limiter.update (docs/port/MODS.md); retail with none
+FUN_L01_00307c48	moby	Moby_MushroomUnderside_Update	hook	The update of class mushroom_underside (1042), each tick: a hook point for mods, rac1.moby.moby1042.update (docs/port/MODS.md); retail with none
+FUN_L01_00307ca0	moby	Moby_GoldBolt_Update	hook	The update of class gold_bolt (1134), each tick: a hook point for mods, rac1.moby.gold_bolt.update (docs/port/MODS.md); retail with none
+FUN_L01_00308bd8	moby	Moby_Teleporter_Update	hook	The update of class teleporter (1135), each tick: a hook point for mods, rac1.moby.teleporter_pad.update (docs/port/MODS.md); retail with none
+FUN_L01_00309c98	moby	Moby_Class1225_Update	hook	The update of class 1225, each tick: a hook point for mods, rac1.moby.moby1225.update (docs/port/MODS.md); retail with none
+FUN_L01_0030acb8	moby	Moby_Class1341_Update	hook	The update of class 1341, each tick: a hook point for mods, rac1.moby.help_hint_director.update (docs/port/MODS.md); retail with none
+FUN_L01_0030b618	moby	Moby_Class1504_Update	hook	The update of class 1504, each tick: a hook point for mods, rac1.moby.wandering_light.update (docs/port/MODS.md); retail with none
+FUN_L01_0030ba18	moby	Moby_Class1510_Update	hook	The update of class 1510, each tick: a hook point for mods, rac1.moby.moby1510.update (docs/port/MODS.md); retail with none
+FUN_L01_0030c190	moby	Moby_Class1546_Update	hook	The update of class 1546, each tick: a hook point for mods, rac1.moby.moby1546.update (docs/port/MODS.md); retail with none
+FUN_L01_0030c9a8	moby	Moby_Class1633_Update	hook	The update of class 1633, each tick: a hook point for mods, rac1.moby.class_1633.update (docs/port/MODS.md); retail with none
+FUN_L01_0030d0f0	moby	Moby_TallShroom_Update	hook	The update of class tall_shroom (1813), each tick: a hook point for mods, rac1.moby.moby1813.update (docs/port/MODS.md); retail with none
+FUN_L01_0030df40	moby	Moby_Sandmouse_Update	hook	The update of class sandmouse (1818), each tick: a hook point for mods, rac1.moby.mouse_critter.update (docs/port/MODS.md); retail with none
+FUN_L01_0030f208	moby	Moby_Class1848_Update	hook	The update of class 1848, each tick: a hook point for mods, rac1.moby.moby1848.update (docs/port/MODS.md); retail with none
+FUN_L02_002cb978	moby	Moby_TrackdriveLeft_Update	hook	The update of class trackdrive_left (331), each tick: a hook point for mods, rac1.moby.trackdrive_left.update (docs/port/MODS.md); retail with none
+FUN_L02_002d3e50	moby	Moby_SandShark_Update	hook	The update of class sand_shark (580), each tick: a hook point for mods, rac1.moby.sand_shark.update (docs/port/MODS.md); retail with none
+FUN_L02_002d7748	moby	Moby_Constructorbot_Update	hook	The update of class constructorbot (612), each tick: a hook point for mods, rac1.moby.moby612.update (docs/port/MODS.md); retail with none
+FUN_L02_002d8ad0	moby	Moby_TresspasserPad_Update	hook	The update of class tresspasser_pad (615), each tick: a hook point for mods, rac1.moby.trespasser_puzzle.update (docs/port/MODS.md); retail with none
+FUN_L02_002dbd38	moby	Moby_Elevator_Update	hook	The update of class elevator (651), each tick: a hook point for mods, rac1.moby.elevator_651.update (docs/port/MODS.md); retail with none
+FUN_L02_002dc6b0	moby	Moby_ConveyorBelt_Update	hook	The update of classes conveyor_belt (296), escalator (652), escalator_end (653), each tick: a hook point for mods, rac1.moby.pusher.update (docs/port/MODS.md); retail with none
+FUN_L02_002dca10	moby	Moby_Bulldozer_Update	hook	The update of class bulldozer (656), each tick: a hook point for mods, rac1.moby.moby656.update (docs/port/MODS.md); retail with none
+FUN_L02_002dcb38	moby	Moby_SandSharkNest_Update	hook	The update of class sand_shark_nest (668), each tick: a hook point for mods, rac1.moby.sand_shark_nest.update (docs/port/MODS.md); retail with none
+FUN_L02_002dd370	moby	Moby_GrabCrane_Update	hook	The update of class grab_crane (675), each tick: a hook point for mods, rac1.moby.moby675.update (docs/port/MODS.md); retail with none
+FUN_L02_002ddc00	moby	Moby_Platform_Update	hook	The update of classes platform (707), platform (734), each tick: a hook point for mods, rac1.moby.rotate_platform.update (docs/port/MODS.md); retail with none
+FUN_L02_002ddc88	moby	Moby_TransportPod_Update	hook	The update of class transport_pod (713), each tick: a hook point for mods, rac1.moby.moby713.update (docs/port/MODS.md); retail with none
+FUN_L02_002df1a8	moby	Moby_Crane_Update	hook	The update of class crane (732), each tick: a hook point for mods, rac1.moby.moby732.update (docs/port/MODS.md); retail with none
+FUN_L02_002df3d8	moby	Moby_RocketLauncher_Update	hook	The update of class rocket_launcher (733), each tick: a hook point for mods, rac1.moby.rocket_launcher.update (docs/port/MODS.md); retail with none
+FUN_L02_002df948	moby	Moby_RocketDoor1_Update	hook	The update of classes rocket_door1 (735), rocket_door2 (736), each tick: a hook point for mods, rac1.moby.rocket_door1.update (docs/port/MODS.md); retail with none
+FUN_L02_002dffc8	moby	Moby_TresspasserDoor1_Update	hook	The update of class tresspasser_door1 (743), each tick: a hook point for mods, rac1.moby.moby743.update (docs/port/MODS.md); retail with none
+FUN_L02_002e0138	moby	Moby_TresspasserDoor2_Update	hook	The update of class tresspasser_door2 (744), each tick: a hook point for mods, rac1.moby.moby744.update (docs/port/MODS.md); retail with none
+FUN_L02_002e0280	moby	Moby_SandsharkEgg_Update	hook	The update of class sandshark_egg (755), each tick: a hook point for mods, rac1.moby.moby755.update (docs/port/MODS.md); retail with none
+FUN_L02_002e0450	moby	Moby_SwingshotVersatarget_Update	hook	The update of classes swingshot_versatarget (758), swingshot_swinging_versatarget (803), each tick: a hook point for mods, rac1.moby.hideable_flower.update (docs/port/MODS.md); retail with none
+FUN_L02_002e0720	moby	Moby_Rocks_Update	hook	The update of class rocks (762), each tick: a hook point for mods, rac1.moby.moby762.update (docs/port/MODS.md); retail with none
+FUN_L02_002e0dc0	moby	Moby_SkidsAgent_Update	hook	The update of class skids_agent (786), each tick: a hook point for mods, rac1.moby.skids_agent.update (docs/port/MODS.md); retail with none
+FUN_L02_002e1950	moby	Moby_SkidMcmarx_Update	hook	The update of class skid_mcmarx (788), each tick: a hook point for mods, rac1.moby.skid_mc_marx_aridia.update (docs/port/MODS.md); retail with none
+FUN_L02_002e2228	moby	Moby_LiftcarPlatform_Update	hook	The update of class liftcar_platform (792), each tick: a hook point for mods, rac1.moby.driver_lift.update (docs/port/MODS.md); retail with none
+FUN_L02_002ea198	moby	Moby_OceanAridia_Update	hook	The update of class ocean_aridia (854), each tick: a hook point for mods, rac1.moby.moby854.update (docs/port/MODS.md); retail with none
+FUN_L02_002ea210	moby	Moby_Tresspasser_Update	hook	The update of classes tresspasser (1005), hydrodisplacer (1016), each tick: a hook point for mods, rac1.moby.moby1005.update (docs/port/MODS.md); retail with none
+FUN_L02_002ebf20	moby	Moby_Constructorbot1208_Update	hook	The update of class constructorbot (1208), each tick: a hook point for mods, rac1.moby.shard_debris.update (docs/port/MODS.md); retail with none
+FUN_L02_002ec4b8	moby	Moby_BackgroundShip1_Update	hook	The update of class background_ship_1 (1212), each tick: a hook point for mods, rac1.moby.background_ship.update (docs/port/MODS.md); retail with none
+FUN_L02_002ece18	moby	Moby_BackgroundShip2_Update	hook	The update of classes background_ship_2 (1213), ship (1973), each tick: a hook point for mods, rac1.moby.ship_path.update (docs/port/MODS.md); retail with none
+FUN_L02_002ee890	moby	Moby_Class1324_Update	hook	The update of class 1324, each tick: a hook point for mods, rac1.moby.tutorial_hint.update (docs/port/MODS.md); retail with none
+FUN_L02_002ef020	moby	Moby_Class1479_Update	hook	The update of class 1479, each tick: a hook point for mods, rac1.moby.moby1479.update (docs/port/MODS.md); retail with none
+FUN_L02_002f1f60	moby	Moby_WhiteFlower_Update	hook	The update of classes white_flower (1819), lightpost (1827), pipe (1834), 1844 and 3 more, each tick: a hook point for mods, rac1.moby.break_on_hit_l02.update (docs/port/MODS.md); retail with none
+FUN_L03_00292e98	moby	Moby_MetropolisTrainLocomotive_Update	hook	The update of class metropolis_train_locomotive (822), each tick: a hook point for mods, rac1.moby.metropolis_train.update (docs/port/MODS.md); retail with none
+FUN_L03_00294c08	moby	Moby_MovingPlatformSmall_Update	hook	The update of classes moving_platform_small (868), moving_platform_medium (905), moving_platform_large (928), each tick: a hook point for mods, rac1.moby.moving_platform.update (docs/port/MODS.md); retail with none
+FUN_L03_002953f8	moby	Moby_MetropolisTrainCarriage_Update	hook	The update of class metropolis_train_carriage (1210), each tick: a hook point for mods, rac1.moby.metropolis_train_carriage.update (docs/port/MODS.md); retail with none
+FUN_L03_0029dba8	moby	Moby_RedShip1_Update	hook	The update of classes red_ship_1 (75), white_ship (115), red_ship_2 (116), yellow_ship (117) and 5 more, each tick: a hook point for mods, rac1.moby.train_car.update (docs/port/MODS.md); retail with none
+FUN_L03_002bae48	moby	Moby_Class235_Update	hook	The update of class 235, each tick: a hook point for mods, rac1.moby.parent_follow_fade.update (docs/port/MODS.md); retail with none
+FUN_L03_002bef68	moby	Moby_Spawner_Update	hook	The update of class spawner (455), each tick: a hook point for mods, rac1.moby.child_spawner.update (docs/port/MODS.md); retail with none
+FUN_L03_002c4718	moby	Moby_Bomb545_Update	hook	The update of class bomb (545), each tick: a hook point for mods, rac1.moby.moby545.update (docs/port/MODS.md); retail with none
+FUN_L03_002c5bb8	moby	Moby_RobotDog_Update	hook	The update of class robot_dog (573), each tick: a hook point for mods, rac1.moby.moby573.update (docs/port/MODS.md); retail with none
+FUN_L03_002c6fd0	moby	Moby_Class574_Update	hook	The update of class 574, each tick: a hook point for mods, rac1.moby.moby574.update (docs/port/MODS.md); retail with none
+FUN_L03_002c9eb8	moby	Moby_MineLayer_Update	hook	The update of class mine_layer (578), each tick: a hook point for mods, rac1.moby.trooper.update (docs/port/MODS.md); retail with none
+FUN_L03_002cbea8	moby	Moby_Mine627_Update	hook	The update of class mine (627), each tick: a hook point for mods, rac1.moby.kerwan_mine.update (docs/port/MODS.md); retail with none
+FUN_L03_002cca00	moby	Moby_BlargHelicopter_Update	hook	The update of class blarg_helicopter (631), each tick: a hook point for mods, rac1.moby.helicopter_gunship.update (docs/port/MODS.md); retail with none
+FUN_L03_002d3198	moby	Moby_Taxi_Update	hook	The update of class taxi (816), each tick: a hook point for mods, rac1.moby.rail_taxi.update (docs/port/MODS.md); retail with none
+FUN_L03_002d3cd8	moby	Moby_Statue_Update	hook	The update of classes statue (817), seashell (1686), each tick: a hook point for mods, rac1.moby.moby817.update (docs/port/MODS.md); retail with none
+FUN_L03_002d3e58	moby	Moby_RoboShackSign_Update	hook	The update of class robo_shack_sign (825), each tick: a hook point for mods, rac1.moby.spinner.update (docs/port/MODS.md); retail with none
+FUN_L03_002d43c8	moby	Moby_Class833_Update	hook	The update of class 833, each tick: a hook point for mods, rac1.moby.kerwan_homing_rocket.update (docs/port/MODS.md); retail with none
+FUN_L03_002d47c0	moby	Moby_Class848_Update	hook	The update of class 848, each tick: a hook point for mods, rac1.moby.moby848.update (docs/port/MODS.md); retail with none
+FUN_L03_002da870	moby	Moby_Helga_Update	hook	The update of class helga (890), each tick: a hook point for mods, rac1.moby.quest_giver.update (docs/port/MODS.md); retail with none
+FUN_L03_002db020	moby	Moby_Class898_Update	hook	The update of class 898, each tick: a hook point for mods, rac1.moby.rail_moby.update (docs/port/MODS.md); retail with none
+FUN_L03_002db280	moby	Moby_Class899_Update	hook	The update of class 899, each tick: a hook point for mods, rac1.moby.rail_spawner.update (docs/port/MODS.md); retail with none
+FUN_L03_002db558	moby	Moby_BigAl_Update	hook	The update of class big_al (909), each tick: a hook point for mods, rac1.moby.guide.update (docs/port/MODS.md); retail with none
+FUN_L03_002dbd90	moby	Moby_RobotQwark_Update	hook	The update of class robot_qwark (914), each tick: a hook point for mods, rac1.moby.moby914.update (docs/port/MODS.md); retail with none
+FUN_L03_002dc310	moby	Moby_Fred1_Update	hook	The update of classes fred_1 (915), fred_2 (916), fred_3 (917), each tick: a hook point for mods, rac1.moby.fred_1.update (docs/port/MODS.md); retail with none
+FUN_L03_002dc478	moby	Moby_QwarkUmbris_Update	hook	The update of classes qwark_umbris (447), qwark_rilgar (920), each tick: a hook point for mods, rac1.moby.qwark_watch.update (docs/port/MODS.md); retail with none
+FUN_L03_002dc9b0	moby	Moby_Class994_Update	hook	The update of classes 994, 1260, each tick: a hook point for mods, rac1.moby.ambient_stream_l03.update (docs/port/MODS.md); retail with none
+FUN_L03_002dca30	moby	Moby_Gate_Update	hook	The update of classes gate (353), garage_door (997), each tick: a hook point for mods, rac1.moby.rise_when_collected.update (docs/port/MODS.md); retail with none
+FUN_L03_002dccc0	moby	Moby_Taxi1012_Update	hook	The update of class taxi (1012), each tick: a hook point for mods, rac1.moby.rail_lift.update (docs/port/MODS.md); retail with none
+FUN_L03_002de370	moby	Moby_Class1221_Update	hook	The update of classes 1221, 1222, each tick: a hook point for mods, rac1.moby.falling_moby.update (docs/port/MODS.md); retail with none
+FUN_L03_002df520	moby	Moby_Class1342_Update	hook	The update of class 1342, each tick: a hook point for mods, rac1.moby.tutorial_hint_trigger.update (docs/port/MODS.md); retail with none
+FUN_L03_002e01d0	moby	Moby_Class1548_Update	hook	The update of class 1548, each tick: a hook point for mods, rac1.moby.cutscene_beams.update (docs/port/MODS.md); retail with none
+FUN_L04_0029ecf8	moby	Moby_Class86_Update	hook	The update of class 86, each tick: a hook point for mods, rac1.moby.swarm.update (docs/port/MODS.md); retail with none
+FUN_L04_002a5a08	moby	Moby_Class161_Update	hook	The update of class 161, each tick: a hook point for mods, rac1.moby.class_161.update (docs/port/MODS.md); retail with none
+FUN_L04_002af058	moby	Moby_Class184_Update	hook	The update of class 184, each tick: a hook point for mods, rac1.moby.moby184_shot.update (docs/port/MODS.md); retail with none
+FUN_L04_002ba520	moby	Moby_BigAxebot_Update	hook	The update of class big_axebot (217), each tick: a hook point for mods, rac1.moby.big_axebot.update (docs/port/MODS.md); retail with none
+FUN_L04_002c2270	moby	Moby_CircularSawEnemy_Update	hook	The update of class circular_saw_enemy (340), each tick: a hook point for mods, rac1.moby.circular_saw.update (docs/port/MODS.md); retail with none
+FUN_L04_002c4850	moby	Moby_BlargTrooper_Update	hook	The update of class blarg_trooper (427), each tick: a hook point for mods, rac1.moby.blarg_trooper.update (docs/port/MODS.md); retail with none
+FUN_L04_002c6858	moby	Moby_EudoraBridge_Update	hook	The update of classes eudora_bridge (432), bridge (1052), each tick: a hook point for mods, rac1.moby.switch_follower.update (docs/port/MODS.md); retail with none
+FUN_L04_002c6bb8	moby	Moby_PlatformBooster_Update	hook	The update of class platform_booster (434), each tick: a hook point for mods, rac1.moby.lever_door.update (docs/port/MODS.md); retail with none
+FUN_L04_002ca420	moby	Moby_SnowPlow_Update	hook	The update of classes snow_plow (466), grab_helicopter (480), ball_ship_1 (485), ball_ship_2 (486) and 7 more, each tick: a hook point for mods, rac1.moby.path_vehicle.update (docs/port/MODS.md); retail with none
+FUN_L04_002cdda0	moby	Moby_FloatingPlatform_Update	hook	The update of class floating_platform (481), each tick: a hook point for mods, rac1.moby.floating_platform_481.update (docs/port/MODS.md); retail with none
+FUN_L04_002ce060	moby	Moby_TransportShip_Update	hook	The update of class transport_ship (484), each tick: a hook point for mods, rac1.moby.delete_moby.update (docs/port/MODS.md); retail with none
+FUN_L04_002d16b8	moby	Moby_WoodcutBot_Update	hook	The update of class woodcut_bot (563), each tick: a hook point for mods, rac1.moby.wb_moby.update (docs/port/MODS.md); retail with none
+FUN_L04_002d3580	moby	Moby_Class584_Update	hook	The update of class 584, each tick: a hook point for mods, rac1.moby.moby584.update (docs/port/MODS.md); retail with none
+FUN_L04_002d6f68	moby	Moby_Class617_Update	hook	The update of class 617, each tick: a hook point for mods, rac1.moby.path_keyframe_blend.update (docs/port/MODS.md); retail with none
+FUN_L04_002d7e90	moby	Moby_Leaf_Update	hook	The update of class leaf (642), each tick: a hook point for mods, rac1.moby.drift_spark_moby.update (docs/port/MODS.md); retail with none
+FUN_L04_002e17d8	moby	Moby_UpperDoor_Update	hook	The update of classes upper_door (1101), lower_door (1102), lower_door (1531), upper_door (1532), each tick: a hook point for mods, rac1.moby.collectable.update (docs/port/MODS.md); retail with none
+FUN_L04_002e1a10	moby	Moby_SuckCannon_Update	hook	The update of class suck_cannon (1120), each tick: a hook point for mods, rac1.moby.warp_portal.update (docs/port/MODS.md); retail with none
+FUN_L04_002e3078	moby	Moby_Lieutenant_Update	hook	The update of class lieutenant (1190), each tick: a hook point for mods, rac1.moby.unlock_planet_pad.update (docs/port/MODS.md); retail with none
+FUN_L04_002e4418	moby	Moby_Class1343_Update	hook	The update of class 1343, each tick: a hook point for mods, rac1.moby.moby1343.update (docs/port/MODS.md); retail with none
+FUN_L04_002e5178	moby	Moby_Class1516_Update	hook	The update of class 1516, each tick: a hook point for mods, rac1.moby.bouncing_debris.update (docs/port/MODS.md); retail with none
+FUN_L04_002e53a0	moby	Moby_Class1549_Update	hook	The update of class 1549, each tick: a hook point for mods, rac1.moby.sparks_trigger_l04.update (docs/port/MODS.md); retail with none
+FUN_L05_002d1688	moby	Moby_Sharkigator_Update	hook	The update of class sharkigator (35), each tick: a hook point for mods, rac1.moby.sharkigator_35.update (docs/port/MODS.md); retail with none
+FUN_L05_002d7140	moby	Moby_SceneryShip_Update	hook	The update of class scenery_ship (79), each tick: a hook point for mods, rac1.moby.scenery_ship.update (docs/port/MODS.md); retail with none
+FUN_L05_002dac80	moby	Moby_Amoeboid_Update	hook	The update of class amoeboid (133), each tick: a hook point for mods, rac1.moby.grazing_critter.update (docs/port/MODS.md); retail with none
+FUN_L05_002f5200	moby	Moby_Class258_Update	hook	The update of class 258, each tick: a hook point for mods, rac1.moby.moby258.update (docs/port/MODS.md); retail with none
+FUN_L05_002f8080	moby	Moby_HydrodisplacerFaucet_Update	hook	The update of class hydrodisplacer_faucet (341), each tick: a hook point for mods, rac1.moby.moby341.update (docs/port/MODS.md); retail with none
+FUN_L05_002f87a8	moby	Moby_Hoverboard439_Update	hook	The update of class hoverboard (439), each tick: a hook point for mods, rac1.moby.hoverboard.update (docs/port/MODS.md); retail with none
+FUN_L05_00301f48	moby	Moby_Extermibot_Update	hook	The update of class extermibot (623), each tick: a hook point for mods, rac1.moby.extermibot.update (docs/port/MODS.md); retail with none
+FUN_L05_00304320	moby	Moby_Extermitank_Update	hook	The update of class extermitank (625), each tick: a hook point for mods, rac1.moby.extermitank.update (docs/port/MODS.md); retail with none
+FUN_L05_00307910	moby	Moby_SkidMcmarx717_Update	hook	The update of class skid_mcmarx (717), each tick: a hook point for mods, rac1.moby.skid_mc_marx.update (docs/port/MODS.md); retail with none
+FUN_L05_0030bdd8	moby	Moby_FloatingPlatform810_Update	hook	The update of class floating_platform (810), each tick: a hook point for mods, rac1.moby.floating_platform_810.update (docs/port/MODS.md); retail with none
+FUN_L05_0030bf98	moby	Moby_Box_Update	hook	The update of class box (812), each tick: a hook point for mods, rac1.moby.moby812.update (docs/port/MODS.md); retail with none
+FUN_L05_0030c0a8	moby	Moby_Lamp_Update	hook	The update of class lamp (823), each tick: a hook point for mods, rac1.moby.moby823.update (docs/port/MODS.md); retail with none
+FUN_L05_0030c5b0	moby	Moby_FloorButton_Update	hook	The update of class floor_button (830), each tick: a hook point for mods, rac1.moby.floor_button.update (docs/port/MODS.md); retail with none
+FUN_L05_0030ca80	moby	Moby_Water_Update	hook	The update of class water (831), each tick: a hook point for mods, rac1.moby.water_surface.update (docs/port/MODS.md); retail with none
+FUN_L05_0030dc68	moby	Moby_ElectricGate_Update	hook	The update of class electric_gate (838), each tick: a hook point for mods, rac1.moby.electric_gate.update (docs/port/MODS.md); retail with none
+FUN_L05_0030e1f8	moby	Moby_Class841_Update	hook	The update of class 841, each tick: a hook point for mods, rac1.moby.fog_zone.update (docs/port/MODS.md); retail with none
+FUN_L05_0030e508	moby	Moby_Class843_Update	hook	The update of class 843, each tick: a hook point for mods, rac1.moby.pose_slide_out.update (docs/port/MODS.md); retail with none
+FUN_L05_0030e7f8	moby	Moby_DrainCover_Update	hook	The update of class drain_cover (844), each tick: a hook point for mods, rac1.moby.drain_cover.update (docs/port/MODS.md); retail with none
+FUN_L05_0030f5c8	moby	Moby_PipeMountedGrating_Update	hook	The update of class pipe_mounted_grating (846), each tick: a hook point for mods, rac1.moby.pipe_mounted_grating.update (docs/port/MODS.md); retail with none
+FUN_L05_00314eb0	moby	Moby_Class852_Update	hook	The update of classes 852, 853, each tick: a hook point for mods, rac1.moby.gate_rise.update (docs/port/MODS.md); retail with none
+FUN_L05_003150f0	moby	Moby_Class855_Update	hook	The update of class 855, each tick: a hook point for mods, rac1.moby.emitter_l05.update (docs/port/MODS.md); retail with none
+FUN_L05_003156d0	moby	Moby_ElevatorWithButton_Update	hook	The update of class elevator_with_button (877), each tick: a hook point for mods, rac1.moby.lift_l05.update (docs/port/MODS.md); retail with none
+FUN_L05_00316110	moby	Moby_OceanRilgar_Update	hook	The update of class ocean_rilgar (879), each tick: a hook point for mods, rac1.moby.pulsing_marker.update (docs/port/MODS.md); retail with none
+FUN_L05_00316258	moby	Moby_Class893_Update	hook	The update of class 893, each tick: a hook point for mods, rac1.moby.class_893.update (docs/port/MODS.md); retail with none
+FUN_L05_003166a0	moby	Moby_Class895_Update	hook	The update of class 895, each tick: a hook point for mods, rac1.moby.triggered_rotor.update (docs/port/MODS.md); retail with none
+FUN_L05_00316ab8	moby	Moby_HoverboardGirl_Update	hook	The update of class hoverboard_girl (918), each tick: a hook point for mods, rac1.moby.hoverboard_girl.update (docs/port/MODS.md); retail with none
+FUN_L05_00317470	moby	Moby_QwarksBouncer_Update	hook	The update of class qwarks_bouncer (919), each tick: a hook point for mods, rac1.moby.bouncer.update (docs/port/MODS.md); retail with none
+FUN_L05_003180a0	moby	Moby_ShadySalesman_Update	hook	The update of class shady_salesman (925), each tick: a hook point for mods, rac1.moby.shady_salesman.update (docs/port/MODS.md); retail with none
+FUN_L05_003186f8	moby	Moby_BlargGun_Update	hook	The update of classes blarg_gun (344), 547, 548, 549 and 19 more, each tick: a hook point for mods, rac1.moby.blarg_gun.update (docs/port/MODS.md); retail with none
+FUN_L05_00318a68	moby	Moby_Class982_Update	hook	The update of class 982, each tick: a hook point for mods, rac1.moby.water_plane_marker.update (docs/port/MODS.md); retail with none
+FUN_L05_00318b98	moby	Moby_Television_Update	hook	The update of class television (984), each tick: a hook point for mods, rac1.moby.bobbing_moby_l05.update (docs/port/MODS.md); retail with none
+FUN_L05_00318c78	moby	Moby_Taxi998_Update	hook	The update of class taxi (998), each tick: a hook point for mods, rac1.moby.pickup_l05.update (docs/port/MODS.md); retail with none
+FUN_L05_00319c28	moby	Moby_QwarksTrailer_Update	hook	The update of class qwarks_trailer (1099), each tick: a hook point for mods, rac1.moby.qwarks_trailer.update (docs/port/MODS.md); retail with none
+FUN_L05_0031abe0	moby	Moby_HoverboardRing_Update	hook	The update of class hoverboard_ring (1139), each tick: a hook point for mods, rac1.moby.moby1139.update (docs/port/MODS.md); retail with none
+FUN_L05_0031bf40	moby	Moby_Class1347_Update	hook	The update of class 1347, each tick: a hook point for mods, rac1.moby.challenge.update (docs/port/MODS.md); retail with none
+FUN_L05_0031c8e0	moby	Moby_Lamp1511_Update	hook	The update of class lamp (1511), each tick: a hook point for mods, rac1.moby.mine_moby.update (docs/port/MODS.md); retail with none
+FUN_L05_0031d5c8	moby	Moby_Class1550_Update	hook	The update of class 1550, each tick: a hook point for mods, rac1.moby.moby1550.update (docs/port/MODS.md); retail with none
+FUN_L06_002b4770	moby	Moby_HangarDoor_Update	hook	The update of class hangar_door (55), each tick: a hook point for mods, rac1.moby.orbiting_platform.update (docs/port/MODS.md); retail with none
+FUN_L06_002d85a0	moby	Moby_GadgebotSpawnContainer_Update	hook	The update of class gadgebot_spawn_container (302), each tick: a hook point for mods, rac1.moby.moby302.update (docs/port/MODS.md); retail with none
+FUN_L06_002d8c20	moby	Moby_GadgebotSpawnPad_Update	hook	The update of class gadgebot_spawn_pad (303), each tick: a hook point for mods, rac1.moby.moby303.update (docs/port/MODS.md); retail with none
+FUN_L06_002d9d10	moby	Moby_Class367_Update	hook	The update of class 367, each tick: a hook point for mods, rac1.moby.moby367.update (docs/port/MODS.md); retail with none
+FUN_L06_002e8678	moby	Moby_Frog_Update	hook	The update of class frog (827), each tick: a hook point for mods, rac1.moby.frog.update (docs/port/MODS.md); retail with none
+FUN_L06_002f0040	moby	Moby_Gadgebot_Update	hook	The update of class gadgebot (857), each tick: a hook point for mods, rac1.moby.gadgebot.update (docs/port/MODS.md); retail with none
+FUN_L06_002f3ad8	moby	Moby_ToxicGasVent_Update	hook	The update of class toxic_gas_vent (911), each tick: a hook point for mods, rac1.moby.swinging_hazard.update (docs/port/MODS.md); retail with none
+FUN_L06_002f4f00	moby	Moby_Class1021_Update	hook	The update of class 1021, each tick: a hook point for mods, rac1.moby.door_ring.update (docs/port/MODS.md); retail with none
+FUN_L06_002f55a0	moby	Moby_Class1028_Update	hook	The update of class 1028, each tick: a hook point for mods, rac1.moby.drawbridge.update (docs/port/MODS.md); retail with none
+FUN_L06_002f6470	moby	Moby_Class1035_Update	hook	The update of class 1035, each tick: a hook point for mods, rac1.moby.class_1035.update (docs/port/MODS.md); retail with none
+FUN_L06_002f7288	moby	Moby_EnergySphereHolder_Update	hook	The update of class energy_sphere_holder (1038), each tick: a hook point for mods, rac1.moby.collectible_spawner.update (docs/port/MODS.md); retail with none
+FUN_L06_002f7930	moby	Moby_Class1039_Update	hook	The update of class 1039, each tick: a hook point for mods, rac1.moby.trigger_lists.update (docs/port/MODS.md); retail with none
+FUN_L06_002f7ab8	moby	Moby_EnergySphere_Update	hook	The update of class energy_sphere (1040), each tick: a hook point for mods, rac1.moby.moby1040.update (docs/port/MODS.md); retail with none
+FUN_L06_002f7d78	moby	Moby_AlienSnapper_Update	hook	The update of class alien_snapper (1048), each tick: a hook point for mods, rac1.moby.moby1048.update (docs/port/MODS.md); retail with none
+FUN_L06_002f9a28	moby	Moby_AlienQueen_Update	hook	The update of class alien_queen (1051), each tick: a hook point for mods, rac1.moby.alien_queen.update (docs/port/MODS.md); retail with none
+FUN_L06_002fbfb0	moby	Moby_Class1054_Update	hook	The update of class 1054, each tick: a hook point for mods, rac1.moby.moby1054.update (docs/port/MODS.md); retail with none
+FUN_L06_002fc640	moby	Moby_Class1061_Update	hook	The update of class 1061, each tick: a hook point for mods, rac1.moby.callable_lift.update (docs/port/MODS.md); retail with none
+FUN_L06_002fd088	moby	Moby_Class1062_Update	hook	The update of class 1062, each tick: a hook point for mods, rac1.moby.class_1062.update (docs/port/MODS.md); retail with none
+FUN_L06_002fda30	moby	Moby_Class1066_Update	hook	The update of class 1066, each tick: a hook point for mods, rac1.moby.launch_trigger.update (docs/port/MODS.md); retail with none
+FUN_L06_002fdbd0	moby	Moby_BlargSpaceCommando_Update	hook	The update of class blarg_space_commando (1068), each tick: a hook point for mods, rac1.moby.moby1068.update (docs/port/MODS.md); retail with none
+FUN_L06_002ffcb0	moby	Moby_Class1083_Update	hook	The update of class 1083, each tick: a hook point for mods, rac1.moby.camera_takeover_trigger.update (docs/port/MODS.md); retail with none
+FUN_L06_00300b90	moby	Moby_Class1085_Update	hook	The update of classes 1085, 1086, 1087, 1088 and 1 more, each tick: a hook point for mods, rac1.moby.spinning_debris.update (docs/port/MODS.md); retail with none
+FUN_L06_00300df0	moby	Moby_Class1091_Update	hook	The update of classes 1091, 1092, 1093, 1094 and 5 more, each tick: a hook point for mods, rac1.moby.bobbing_moby.update (docs/port/MODS.md); retail with none
+FUN_L06_00301070	moby	Moby_Fred_Update	hook	The update of class fred (1105), each tick: a hook point for mods, rac1.moby.moby1105.update (docs/port/MODS.md); retail with none
+FUN_L06_00301b90	moby	Moby_Class1108_Update	hook	The update of class 1108, each tick: a hook point for mods, rac1.moby.moby1108.update (docs/port/MODS.md); retail with none
+FUN_L06_00302578	moby	Moby_Shuttle_Update	hook	The update of class shuttle (1109), each tick: a hook point for mods, rac1.moby.shuttle.update (docs/port/MODS.md); retail with none
+FUN_L06_00304098	moby	Moby_RedButton_Update	hook	The update of class red_button (1118), each tick: a hook point for mods, rac1.moby.red_button.update (docs/port/MODS.md); retail with none
+FUN_L06_003049f8	moby	Moby_Class1123_Update	hook	The update of class 1123, each tick: a hook point for mods, rac1.moby.moby1123.update (docs/port/MODS.md); retail with none
+FUN_L06_00307d30	moby	Moby_BotDoorLock_Update	hook	The update of class bot_door_lock (1302), each tick: a hook point for mods, rac1.moby.moby1302.update (docs/port/MODS.md); retail with none
+FUN_L06_003083b0	moby	Moby_Class1348_Update	hook	The update of class 1348, each tick: a hook point for mods, rac1.moby.class_1348.update (docs/port/MODS.md); retail with none
+FUN_L06_00308c68	moby	Moby_Class1512_Update	hook	The update of class 1512, each tick: a hook point for mods, rac1.moby.spark_emitter.update (docs/port/MODS.md); retail with none
+FUN_L06_00309348	moby	Moby_Class1551_Update	hook	The update of class 1551, each tick: a hook point for mods, rac1.moby.sparks_trigger_l06.update (docs/port/MODS.md); retail with none
+FUN_L06_00309860	moby	Moby_Mushroom_Update	hook	The update of classes mushroom (1650), 1655, robot_head (1663), 1677, each tick: a hook point for mods, rac1.moby.spawn_child_and_delete.update (docs/port/MODS.md); retail with none
+FUN_L06_00309e08	moby	Moby_Class1660_Update	hook	The update of classes 1660, 1664, each tick: a hook point for mods, rac1.moby.break_on_hit_blarg.update (docs/port/MODS.md); retail with none
+FUN_L06_0030be60	moby	Moby_Class1898_Update	hook	The update of class 1898, each tick: a hook point for mods, rac1.moby.moby1898.update (docs/port/MODS.md); retail with none
+FUN_L07_002cd2b0	moby	Moby_TaxiPlatform_Update	hook	The update of class taxi_platform (38), each tick: a hook point for mods, rac1.moby.taxi_platform_38.update (docs/port/MODS.md); retail with none
+FUN_L07_002cdb28	moby	Moby_TaxiPlatform1474_Update	hook	The update of class taxi_platform (1474), each tick: a hook point for mods, rac1.moby.taxi_platform_1474.update (docs/port/MODS.md); retail with none
+FUN_L07_002f5ba0	moby	Moby_Class436_Update	hook	The update of class 436, each tick: a hook point for mods, rac1.moby.moby436.update (docs/port/MODS.md); retail with none
+FUN_L07_002f8058	moby	Moby_Class317_Update	hook	The update of classes 317, 460, each tick: a hook point for mods, rac1.moby.ambient_stream_l07.update (docs/port/MODS.md); retail with none
+FUN_L07_002fbdb8	moby	Moby_PurpleShip_Update	hook	The update of class purple_ship (529), each tick: a hook point for mods, rac1.moby.purple_ship_529.update (docs/port/MODS.md); retail with none
+FUN_L07_0030b000	moby	Moby_BoltcratePossiblyForMetalDetector_Update	hook	The update of class boltcrate_possibly_for_metal_detector (871), each tick: a hook point for mods, rac1.moby.path_train.update (docs/port/MODS.md); retail with none
+FUN_L07_0030b6a8	moby	Moby_Class880_Update	hook	The update of class 880, each tick: a hook point for mods, rac1.moby.bolt_projectile.update (docs/port/MODS.md); retail with none
+FUN_L07_0030bbc8	moby	Moby_Bomb882_Update	hook	The update of class bomb (882), each tick: a hook point for mods, rac1.moby.gravity_debris.update (docs/port/MODS.md); retail with none
+FUN_L07_0030bf90	moby	Moby_TimedActivationPads_Update	hook	The update of class timed_activation_pads (886), each tick: a hook point for mods, rac1.moby.timed_pad.update (docs/port/MODS.md); retail with none
+FUN_L07_0030c508	moby	Moby_Water902_Update	hook	The update of classes water (902), water (941), water (943), water (944) and 16 more, each tick: a hook point for mods, rac1.moby.water_plate.update (docs/port/MODS.md); retail with none
+FUN_L07_0030cf90	moby	Moby_Class1013_Update	hook	The update of classes 1013, 1014, 1064, 1065, each tick: a hook point for mods, rac1.moby.target_driven_slider.update (docs/port/MODS.md); retail with none
+FUN_L07_0030d440	moby	Moby_OceanUmbris_Update	hook	The update of class ocean_umbris (1018), each tick: a hook point for mods, rac1.moby.audio_stream_trigger.update (docs/port/MODS.md); retail with none
+FUN_L07_0030d4d8	moby	Moby_Bombomatic_Update	hook	The update of class bombomatic (1041), each tick: a hook point for mods, rac1.moby.lobber_enemy.update (docs/port/MODS.md); retail with none
+FUN_L07_0030e1f8	moby	Moby_Class1046_Update	hook	The update of class 1046, each tick: a hook point for mods, rac1.moby.shockwave.update (docs/port/MODS.md); retail with none
+FUN_L07_0030e458	moby	Moby_Class1049_Update	hook	The update of class 1049, each tick: a hook point for mods, rac1.moby.lobbed_bomb.update (docs/port/MODS.md); retail with none
+FUN_L07_0030f5f0	moby	Moby_Sharkigator1059_Update	hook	The update of class sharkigator (1059), each tick: a hook point for mods, rac1.moby.sharkigator_1059.update (docs/port/MODS.md); retail with none
+FUN_L07_00310df0	moby	Moby_Door_Update	hook	The update of classes 129, 130, door (182), door (183) and 5 more, each tick: a hook point for mods, rac1.moby.door.update (docs/port/MODS.md); retail with none
+FUN_L07_003112c8	moby	Moby_Class1069_Update	hook	The update of class 1069, each tick: a hook point for mods, rac1.moby.moby1069.update (docs/port/MODS.md); retail with none
+FUN_L07_00311bc8	moby	Moby_Class1080_Update	hook	The update of class 1080, each tick: a hook point for mods, rac1.moby.falling_leaf.update (docs/port/MODS.md); retail with none
+FUN_L07_00314150	moby	Moby_Snagglebeast_Update	hook	The update of class snagglebeast (1106), each tick: a hook point for mods, rac1.moby.snagglebeast.update (docs/port/MODS.md); retail with none
+FUN_L07_003196e0	moby	Moby_Mine1112_Update	hook	The update of class mine (1112), each tick: a hook point for mods, rac1.moby.swooper.update (docs/port/MODS.md); retail with none
+FUN_L07_00319f48	moby	Moby_Class1113_Update	hook	The update of classes 1113, 1114, 1115, 1116, each tick: a hook point for mods, rac1.moby.breakable_prop.update (docs/port/MODS.md); retail with none
+FUN_L07_0031a250	moby	Moby_MachinegunTurret_Update	hook	The update of class machinegun_turret (1126), each tick: a hook point for mods, rac1.moby.machinegun_turret_1126.update (docs/port/MODS.md); retail with none
+FUN_L07_0031a9e8	moby	Moby_Class1128_Update	hook	The update of class 1128, each tick: a hook point for mods, rac1.moby.moving_moby_l07.update (docs/port/MODS.md); retail with none
+FUN_L07_0031aee0	moby	Moby_Bridge_Update	hook	The update of classes bridge (104), bridge (106), 1129, each tick: a hook point for mods, rac1.moby.bridge.update (docs/port/MODS.md); retail with none
+FUN_L07_0031b3f0	moby	Moby_Class1133_Update	hook	The update of class 1133, each tick: a hook point for mods, rac1.moby.moby1133.update (docs/port/MODS.md); retail with none
+FUN_L07_0031d2e0	moby	Moby_Class1142_Update	hook	The update of class 1142, each tick: a hook point for mods, rac1.moby.moby1142.update (docs/port/MODS.md); retail with none
+FUN_L07_0031eba8	moby	Moby_Class1552_Update	hook	The update of class 1552, each tick: a hook point for mods, rac1.moby.spark_burst_spawner.update (docs/port/MODS.md); retail with none
+FUN_L07_0031f900	moby	Moby_Class1789_Update	hook	The update of class 1789, each tick: a hook point for mods, rac1.moby.moby1789.update (docs/port/MODS.md); retail with none
+FUN_L08_002b82a0	moby	Moby_Class152_Update	hook	The update of class 152, each tick: a hook point for mods, rac1.moby.moby152.update (docs/port/MODS.md); retail with none
+FUN_L08_002d23f0	moby	Moby_Bomb248_Update	hook	The update of class bomb (248), each tick: a hook point for mods, rac1.moby.bomb_248.update (docs/port/MODS.md); retail with none
+FUN_L08_002d2af0	moby	Moby_Scoutbot_Update	hook	The update of class scoutbot (252), each tick: a hook point for mods, rac1.moby.scoutbot.update (docs/port/MODS.md); retail with none
+FUN_L08_002d42d8	moby	Moby_BomberTank_Update	hook	The update of class bomber_tank (253), each tick: a hook point for mods, rac1.moby.bomber_tank.update (docs/port/MODS.md); retail with none
+FUN_L08_002da0f0	moby	Moby_Class327_Update	hook	The update of class 327, each tick: a hook point for mods, rac1.moby.moby327.update (docs/port/MODS.md); retail with none
+FUN_L08_002dabf0	moby	Moby_BlargBombthrower_Update	hook	The update of class blarg_bombthrower (333), each tick: a hook point for mods, rac1.moby.blarg_bomb_thrower.update (docs/port/MODS.md); retail with none
+FUN_L08_002dbdb0	moby	Moby_Shuttle424_Update	hook	The update of class shuttle (424), each tick: a hook point for mods, rac1.moby.route_platform.update (docs/port/MODS.md); retail with none
+FUN_L08_002dc9a8	moby	Moby_Bomb425_Update	hook	The update of class bomb (425), each tick: a hook point for mods, rac1.moby.moby425.update (docs/port/MODS.md); retail with none
+FUN_L08_002dd3c0	moby	Moby_Rocket435_Update	hook	The update of class rocket (435), each tick: a hook point for mods, rac1.moby.guided_rocket.update (docs/port/MODS.md); retail with none
+FUN_L08_002de848	moby	Moby_Class438_Update	hook	The update of class 438, each tick: a hook point for mods, rac1.moby.moby438.update (docs/port/MODS.md); retail with none
+FUN_L08_002e0328	moby	Moby_Class440_Update	hook	The update of class 440, each tick: a hook point for mods, rac1.moby.cannon.update (docs/port/MODS.md); retail with none
+FUN_L08_002e16c0	moby	Moby_Class441_Update	hook	The update of classes 441, 442, 443, 445 and 6 more, each tick: a hook point for mods, rac1.moby.falling_debris.update (docs/port/MODS.md); retail with none
+FUN_L08_002e24e8	moby	Moby_Class444_Update	hook	The update of class 444, each tick: a hook point for mods, rac1.moby.moby444.update (docs/port/MODS.md); retail with none
+FUN_L08_002e2df0	moby	Moby_BoltThief_Update	hook	The update of class bolt_thief (452), each tick: a hook point for mods, rac1.moby.batalia_bolt_thief.update (docs/port/MODS.md); retail with none
+FUN_L08_002e8210	moby	Moby_Rocket458_Update	hook	The update of class rocket (458), each tick: a hook point for mods, rac1.moby.moby458.update (docs/port/MODS.md); retail with none
+FUN_L08_002e8cd0	moby	Moby_Shrub_Update	hook	The update of class shrub (462), each tick: a hook point for mods, rac1.moby.moby462.update (docs/port/MODS.md); retail with none
+FUN_L08_002e9b70	moby	Moby_Class463_Update	hook	The update of class 463, each tick: a hook point for mods, rac1.moby.swarm_leader.update (docs/port/MODS.md); retail with none
+FUN_L08_002ea398	moby	Moby_Class467_Update	hook	The update of classes 467, 472, each tick: a hook point for mods, rac1.moby.group_clear.update (docs/port/MODS.md); retail with none
+FUN_L08_002ea4c0	moby	Moby_Class468_Update	hook	The update of classes 468, 469, each tick: a hook point for mods, rac1.moby.gate_swing.update (docs/port/MODS.md); retail with none
+FUN_L08_002f1548	moby	Moby_Class600_Update	hook	The update of class 600, each tick: a hook point for mods, rac1.moby.moby600.update (docs/port/MODS.md); retail with none
+FUN_L08_002f44c0	moby	Moby_Class621_Update	hook	The update of class 621, each tick: a hook point for mods, rac1.moby.moby621.update (docs/port/MODS.md); retail with none
+FUN_L08_002f5830	moby	Moby_Class648_Update	hook	The update of class 648, each tick: a hook point for mods, rac1.moby.moby648.update (docs/port/MODS.md); retail with none
+FUN_L08_002f70a0	moby	Moby_Class671_Update	hook	The update of class 671, each tick: a hook point for mods, rac1.moby.flicker_light.update (docs/port/MODS.md); retail with none
+FUN_L08_00301158	moby	Moby_BlargParatrooper_Update	hook	The update of class blarg_paratrooper (1023), each tick: a hook point for mods, rac1.moby.paratrooper.update (docs/port/MODS.md); retail with none
+FUN_L08_00302ce8	moby	Moby_Commando_Update	hook	The update of class commando (1130), each tick: a hook point for mods, rac1.moby.commando.update (docs/port/MODS.md); retail with none
+FUN_L08_00305270	moby	Moby_BataliaDeserter_Update	hook	The update of class batalia_deserter (1144), each tick: a hook point for mods, rac1.moby.deserter.update (docs/port/MODS.md); retail with none
+FUN_L08_003065d8	moby	Moby_ThePlumberBatalia_Update	hook	The update of class the_plumber_batalia (1283), each tick: a hook point for mods, rac1.moby.moby1283.update (docs/port/MODS.md); retail with none
+FUN_L08_00307298	moby	Moby_Class1292_Update	hook	The update of class 1292, each tick: a hook point for mods, rac1.moby.fire_bolt.update (docs/port/MODS.md); retail with none
+FUN_L08_00307540	moby	Moby_Class1349_Update	hook	The update of class 1349, each tick: a hook point for mods, rac1.moby.moby1349.update (docs/port/MODS.md); retail with none
+FUN_L08_00307cf0	moby	Moby_Class1400_Update	hook	The update of class 1400, each tick: a hook point for mods, rac1.moby.moby1400.update (docs/port/MODS.md); retail with none
+FUN_L08_003084d8	moby	Moby_Class1553_Update	hook	The update of class 1553, each tick: a hook point for mods, rac1.moby.moby1553.update (docs/port/MODS.md); retail with none
+FUN_L08_003085f0	moby	Moby_Class1629_Update	hook	The update of class 1629, each tick: a hook point for mods, rac1.moby.moby1629.update (docs/port/MODS.md); retail with none
+FUN_L08_00308c90	moby	Moby_Class1641_Update	hook	The update of class 1641, each tick: a hook point for mods, rac1.moby.moby1641.update (docs/port/MODS.md); retail with none
+FUN_L08_003097b0	moby	Moby_Class1649_Update	hook	The update of class 1649, each tick: a hook point for mods, rac1.moby.moby1649.update (docs/port/MODS.md); retail with none
+FUN_L09_002c26c8	moby	Moby_AirshipPart_Update	hook	The update of classes airship_part (1182), airship_part (1183), airship_part (1184), airship_part (1185) and 4 more, each tick: a hook point for mods, rac1.moby.airship_part.update (docs/port/MODS.md); retail with none
+FUN_L09_002c5990	moby	Moby_Seeker_Update	hook	The update of class seeker (52), each tick: a hook point for mods, rac1.moby.moby52.update (docs/port/MODS.md); retail with none
+FUN_L09_002e27d8	moby	Moby_Class193_Update	hook	The update of class 193, each tick: a hook point for mods, rac1.moby.ground_enemy.update (docs/port/MODS.md); retail with none
+FUN_L09_002eb970	moby	Moby_Asteroid_Update	hook	The update of classes asteroid (263), asteroid (264), asteroid (265), asteroid (266) and 1 more, each tick: a hook point for mods, rac1.moby.asteroid_belt.update (docs/port/MODS.md); retail with none
+FUN_L09_002edc30	moby	Moby_Display_Update	hook	The update of classes display (276), display_damaged (1298), display_damaged (1299), each tick: a hook point for mods, rac1.moby.breakable_stack.update (docs/port/MODS.md); retail with none
+FUN_L09_002ee110	moby	Moby_Class279_Update	hook	The update of class 279, each tick: a hook point for mods, rac1.moby.moby279.update (docs/port/MODS.md); retail with none
+FUN_L09_002ef430	moby	Moby_Class313_Update	hook	The update of class 313, each tick: a hook point for mods, rac1.moby.tumbling_debris.update (docs/port/MODS.md); retail with none
+FUN_L09_002ef9b0	moby	Moby_Class320_Update	hook	The update of classes 320, 321, each tick: a hook point for mods, rac1.moby.heavy_tumbling_debris.update (docs/port/MODS.md); retail with none
+FUN_L09_002f0040	moby	Moby_Class417_Update	hook	The update of class 417, each tick: a hook point for mods, rac1.moby.moby417.update (docs/port/MODS.md); retail with none
+FUN_L09_002f86a0	moby	Moby_Platform664_Update	hook	The update of class platform (664), each tick: a hook point for mods, rac1.moby.moby664.update (docs/port/MODS.md); retail with none
+FUN_L09_00300888	moby	Moby_Class1000_Update	hook	The update of class 1000, each tick: a hook point for mods, rac1.moby.moby1000.update (docs/port/MODS.md); retail with none
+FUN_L09_003033a0	moby	Moby_Elevator1150_Update	hook	The update of classes elevator (1150), elevator (1151), each tick: a hook point for mods, rac1.moby.path_platform_l09.update (docs/port/MODS.md); retail with none
+FUN_L09_00303d10	moby	Moby_RefuelingStation_Update	hook	The update of class refueling_station (1172), each tick: a hook point for mods, rac1.moby.pressure_plate.update (docs/port/MODS.md); retail with none
+FUN_L09_00304360	moby	Moby_AirshipPart1181_Update	hook	The update of class airship_part (1181), each tick: a hook point for mods, rac1.moby.airship_chain_link.update (docs/port/MODS.md); retail with none
+FUN_L09_00304c80	moby	Moby_Turret_Update	hook	The update of class turret (1201), each tick: a hook point for mods, rac1.moby.mountable_turret.update (docs/port/MODS.md); retail with none
+FUN_L09_00305a28	moby	Moby_Class1206_Update	hook	The update of class 1206, each tick: a hook point for mods, rac1.moby.moby1206.update (docs/port/MODS.md); retail with none
+FUN_L09_00307d68	moby	Moby_Class1258_Update	hook	The update of class 1258, each tick: a hook point for mods, rac1.moby.enemy_shot.update (docs/port/MODS.md); retail with none
+FUN_L09_003082d8	moby	Moby_Barrier_Update	hook	The update of classes barrier (1285), barrier (1286), barrier (1287), barrier (1288), each tick: a hook point for mods, rac1.moby.barrier.update (docs/port/MODS.md); retail with none
+FUN_L09_003091b0	moby	Moby_Class1293_Update	hook	The update of classes 1293, 1320, each tick: a hook point for mods, rac1.moby.linked_riser.update (docs/port/MODS.md); retail with none
+FUN_L09_00309c08	moby	Moby_Shuttle1766_Update	hook	The update of class shuttle (1766), each tick: a hook point for mods, rac1.moby.moby1766.update (docs/port/MODS.md); retail with none
+FUN_L09_0030ab80	moby	Moby_Spawner1885_Update	hook	The update of class spawner (1885), each tick: a hook point for mods, rac1.moby.moby1885.update (docs/port/MODS.md); retail with none
+FUN_L09_0030b3b0	moby	Moby_SpawnerEgg_Update	hook	The update of class spawner_egg (1886), each tick: a hook point for mods, rac1.moby.moby1886.update (docs/port/MODS.md); retail with none
+FUN_L10_00295a38	moby	Moby_Platform1033_Update	hook	The update of class platform (1033), each tick: a hook point for mods, rac1.moby.moby1033.update (docs/port/MODS.md); retail with none
+FUN_L10_00295c20	moby	Moby_Platform1117_Update	hook	The update of class platform (1117), each tick: a hook point for mods, rac1.moby.bobbing_platform.update (docs/port/MODS.md); retail with none
+FUN_L10_00298668	moby	Moby_Magnetboots_Update	hook	The update of class magnetboots (18), each tick: a hook point for mods, rac1.moby.spinning_pickup.update (docs/port/MODS.md); retail with none
+FUN_L10_00298b68	moby	Moby_Class22_Update	hook	The update of class 22, each tick: a hook point for mods, rac1.moby.moby22.update (docs/port/MODS.md); retail with none
+FUN_L10_002be858	moby	Moby_GadgebotTelepotPad_Update	hook	The update of classes gadgebot_telepot_pad (351), bot_elevator (1301), each tick: a hook point for mods, rac1.moby.near_hero_sparkle.update (docs/port/MODS.md); retail with none
+FUN_L10_002c7a20	moby	Moby_Class702_Update	hook	The update of class 702, each tick: a hook point for mods, rac1.moby.moby702.update (docs/port/MODS.md); retail with none
+FUN_L10_002c9c70	moby	Moby_Class794_Update	hook	The update of class 794, each tick: a hook point for mods, rac1.moby.moby794.update (docs/port/MODS.md); retail with none
+FUN_L10_002cc2e8	moby	Moby_Rocket819_Update	hook	The update of class rocket (819), each tick: a hook point for mods, rac1.moby.moby819.update (docs/port/MODS.md); retail with none
+FUN_L10_002d7b80	moby	Moby_Class859_Update	hook	The update of class 859, each tick: a hook point for mods, rac1.moby.moby859.update (docs/port/MODS.md); retail with none
+FUN_L10_002d85c8	moby	Moby_Bomb938_Update	hook	The update of class bomb (938), each tick: a hook point for mods, rac1.moby.moby938.update (docs/port/MODS.md); retail with none
+FUN_L10_002d8c00	moby	Moby_BombthrowerGrass939_Update	hook	The update of class bombthrower_grass (939), each tick: a hook point for mods, rac1.moby.timed_shooter.update (docs/port/MODS.md); retail with none
+FUN_L10_002d8d30	moby	Moby_Class947_Update	hook	The update of class 947, each tick: a hook point for mods, rac1.moby.electric_spark.update (docs/port/MODS.md); retail with none
+FUN_L10_002d90a8	moby	Moby_LabDoor_Update	hook	The update of classes lab_door (1015), flame_door (1282), each tick: a hook point for mods, rac1.moby.height_glide.update (docs/port/MODS.md); retail with none
+FUN_L10_002d92b8	moby	Moby_Button_Update	hook	The update of class button (1031), each tick: a hook point for mods, rac1.moby.moby1031.update (docs/port/MODS.md); retail with none
+FUN_L10_002d9eb8	moby	Moby_Class1047_Update	hook	The update of class 1047, each tick: a hook point for mods, rac1.moby.moby1047.update (docs/port/MODS.md); retail with none
+FUN_L10_002da2c8	moby	Moby_Class1067_Update	hook	The update of class 1067, each tick: a hook point for mods, rac1.moby.sound_prop.update (docs/port/MODS.md); retail with none
+FUN_L10_002dd3d8	moby	Moby_Class1090_Update	hook	The update of class 1090, each tick: a hook point for mods, rac1.moby.moby1090.update (docs/port/MODS.md); retail with none
+FUN_L10_002dd650	moby	Moby_BlockCave_Update	hook	The update of class block_cave (1100), each tick: a hook point for mods, rac1.moby.collectible_trigger.update (docs/port/MODS.md); retail with none
+FUN_L10_002df270	moby	Moby_Screamer_Update	hook	The update of class screamer (1196), each tick: a hook point for mods, rac1.moby.moby1196.update (docs/port/MODS.md); retail with none
+FUN_L10_002e01a8	moby	Moby_Class1199_Update	hook	The update of class 1199, each tick: a hook point for mods, rac1.moby.moby1199.update (docs/port/MODS.md); retail with none
+FUN_L10_002e1d38	moby	Moby_ToxicCrab_Update	hook	The update of class toxic_crab (1202), each tick: a hook point for mods, rac1.moby.toxic_crab.update (docs/port/MODS.md); retail with none
+FUN_L10_002e4a88	moby	Moby_BlargShip_Update	hook	The update of class blarg_ship (1229), each tick: a hook point for mods, rac1.moby.blarg_ship.update (docs/port/MODS.md); retail with none
+FUN_L10_002e5be0	moby	Moby_Class1240_Update	hook	The update of class 1240, each tick: a hook point for mods, rac1.moby.exhaust_vent.update (docs/port/MODS.md); retail with none
+FUN_L10_002e8358	moby	Moby_NanotechUpgradeVendor_Update	hook	The update of class nanotech_upgrade_vendor (1326), each tick: a hook point for mods, rac1.moby.nanotech_vendor.update (docs/port/MODS.md); retail with none
+FUN_L10_002e85b8	moby	Moby_Class1344_Update	hook	The update of class 1344, each tick: a hook point for mods, rac1.moby.moby1344.update (docs/port/MODS.md); retail with none
+FUN_L10_002e8ab0	moby	Moby_Gun_Update	hook	The update of class gun (1346), each tick: a hook point for mods, rac1.moby.linked_turret.update (docs/port/MODS.md); retail with none
+FUN_L10_002e9028	moby	Moby_Class1378_Update	hook	The update of class 1378, each tick: a hook point for mods, rac1.moby.moby1378.update (docs/port/MODS.md); retail with none
+FUN_L10_002e9648	moby	Moby_Gate1_Update	hook	The update of class gate_1 (1421), each tick: a hook point for mods, rac1.moby.swing_door.update (docs/port/MODS.md); retail with none
+FUN_L10_002e9990	moby	Moby_Gate2_Update	hook	The update of class gate_2 (1424), each tick: a hook point for mods, rac1.moby.moby1424.update (docs/port/MODS.md); retail with none
+FUN_L10_002ea1f0	moby	Moby_Class1544_Update	hook	The update of class 1544, each tick: a hook point for mods, rac1.moby.effect_emitter.update (docs/port/MODS.md); retail with none
+FUN_L10_002eacd8	moby	Moby_Class1555_Update	hook	The update of class 1555, each tick: a hook point for mods, rac1.moby.moby1555.update (docs/port/MODS.md); retail with none
+FUN_L10_002eb6f0	moby	Moby_Class1855_Update	hook	The update of class 1855, each tick: a hook point for mods, rac1.moby.moby1855.update (docs/port/MODS.md); retail with none
+FUN_L10_002eb7e0	moby	Moby_Class1856_Update	hook	The update of class 1856, each tick: a hook point for mods, rac1.moby.moby1856.update (docs/port/MODS.md); retail with none
+FUN_L11_002cb668	moby	Moby_Class23_Update	hook	The update of class 23, each tick: a hook point for mods, rac1.moby.pickup.update (docs/port/MODS.md); retail with none
+FUN_L11_002cb790	moby	Moby_Class37_Update	hook	The update of class 37, each tick: a hook point for mods, rac1.moby.moby37.update (docs/port/MODS.md); retail with none
+FUN_L11_002cb810	moby	Moby_Class65_Update	hook	The update of class 65, each tick: a hook point for mods, rac1.moby.moby65.update (docs/port/MODS.md); retail with none
+FUN_L11_002d0710	moby	Moby_Bob_Update	hook	The update of class bob (90), each tick: a hook point for mods, rac1.moby.moby90.update (docs/port/MODS.md); retail with none
+FUN_L11_002d0fa8	moby	Moby_ResortOwner_Update	hook	The update of class resort_owner (114), each tick: a hook point for mods, rac1.moby.moby114.update (docs/port/MODS.md); retail with none
+FUN_L11_002f0e40	moby	Moby_FredPokitaru_Update	hook	The update of class fred_pokitaru (298), each tick: a hook point for mods, rac1.moby.pokitaru_vendor.update (docs/port/MODS.md); retail with none
+FUN_L11_002f2518	moby	Moby_Teleporter318_Update	hook	The update of class teleporter (318), each tick: a hook point for mods, rac1.moby.moby318.update (docs/port/MODS.md); retail with none
+FUN_L11_002f3350	moby	Moby_Class361_Update	hook	The update of class 361, each tick: a hook point for mods, rac1.moby.moby361.update (docs/port/MODS.md); retail with none
+FUN_L11_003089d0	moby	Moby_Class1009_Update	hook	The update of class 1009, each tick: a hook point for mods, rac1.moby.class_1009.update (docs/port/MODS.md); retail with none
+FUN_L11_00309098	moby	Moby_Class1017_Update	hook	The update of class 1017, each tick: a hook point for mods, rac1.moby.fireball.update (docs/port/MODS.md); retail with none
+FUN_L11_003094f8	moby	Moby_Rocket1034_Update	hook	The update of class rocket (1034), each tick: a hook point for mods, rac1.moby.moby1034.update (docs/port/MODS.md); retail with none
+FUN_L11_00309ac0	moby	Moby_PokitaruBoat_Update	hook	The update of class pokitaru_boat (1075), each tick: a hook point for mods, rac1.moby.pokitaru_boat.update (docs/port/MODS.md); retail with none
+FUN_L11_0030b358	moby	Moby_OceanPokitaru_Update	hook	The update of class ocean_pokitaru (1111), each tick: a hook point for mods, rac1.moby.ocean.update (docs/port/MODS.md); retail with none
+FUN_L11_0030c788	moby	Moby_Class1156_Update	hook	The update of class 1156, each tick: a hook point for mods, rac1.moby.cutscene_controller.update (docs/port/MODS.md); retail with none
+FUN_L11_0030d800	moby	Moby_Class1157_Update	hook	The update of class 1157, each tick: a hook point for mods, rac1.moby.moby1157.update (docs/port/MODS.md); retail with none
+FUN_L11_0030e088	moby	Moby_Class1158_Update	hook	The update of class 1158, each tick: a hook point for mods, rac1.moby.moby1158.update (docs/port/MODS.md); retail with none
+FUN_L11_0030e978	moby	Moby_Class1159_Update	hook	The update of class 1159, each tick: a hook point for mods, rac1.moby.moby1159.update (docs/port/MODS.md); retail with none
+FUN_L11_0030eb90	moby	Moby_SeesawPlatform_Update	hook	The update of class seesaw_platform (1178), each tick: a hook point for mods, rac1.moby.moby1178.update (docs/port/MODS.md); retail with none
+FUN_L11_0030ee00	moby	Moby_ThrusterPackLock_Update	hook	The update of class thruster_pack_lock (1179), each tick: a hook point for mods, rac1.moby.moby1179.update (docs/port/MODS.md); retail with none
+FUN_L11_0030f2a8	moby	Moby_Class1180_Update	hook	The update of class 1180, each tick: a hook point for mods, rac1.moby.moby1180.update (docs/port/MODS.md); retail with none
+FUN_L11_0030f728	moby	Moby_Ammocrate_Update	hook	The update of classes ammocrate (1218), jet_fighter_health_crate (1220), each tick: a hook point for mods, rac1.moby.ship_collider.update (docs/port/MODS.md); retail with none
+FUN_L11_00310028	moby	Moby_Class1219_Update	hook	The update of class 1219, each tick: a hook point for mods, rac1.moby.moby1219.update (docs/port/MODS.md); retail with none
+FUN_L11_00310180	moby	Moby_Psytcopus_Update	hook	The update of class psytcopus (1231), each tick: a hook point for mods, rac1.moby.psytcopus.update (docs/port/MODS.md); retail with none
+FUN_L11_00313290	moby	Moby_JetFighter_Update	hook	The update of class jet_fighter (1242), each tick: a hook point for mods, rac1.moby.jet_fighter.update (docs/port/MODS.md); retail with none
+FUN_L11_00314318	moby	Moby_Puffoid_Update	hook	The update of class puffoid (1246), each tick: a hook point for mods, rac1.moby.moby1246.update (docs/port/MODS.md); retail with none
+FUN_L11_00316320	moby	Moby_Class1248_Update	hook	The update of class 1248, each tick: a hook point for mods, rac1.moby.gate.update (docs/port/MODS.md); retail with none
+FUN_L11_003172c0	moby	Moby_OilTankerFront_Update	hook	The update of class oil_tanker_front (1264), each tick: a hook point for mods, rac1.moby.moby1264.update (docs/port/MODS.md); retail with none
+FUN_L11_003181f0	moby	Moby_Class1265_Update	hook	The update of class 1265, each tick: a hook point for mods, rac1.moby.bubbling_vent.update (docs/port/MODS.md); retail with none
+FUN_L11_00318b30	moby	Moby_EnergySphere1297_Update	hook	The update of class energy_sphere (1297), each tick: a hook point for mods, rac1.moby.moby1297.update (docs/port/MODS.md); retail with none
+FUN_L11_00319838	moby	Moby_BlargShip1319_Update	hook	The update of class blarg_ship (1319), each tick: a hook point for mods, rac1.moby.flying_craft.update (docs/port/MODS.md); retail with none
+FUN_L11_0031aa80	moby	Moby_Class1350_Update	hook	The update of class 1350, each tick: a hook point for mods, rac1.moby.moby1350.update (docs/port/MODS.md); retail with none
+FUN_L11_0031ab08	moby	Moby_Class1524_Update	hook	The update of class 1524, each tick: a hook point for mods, rac1.moby.bubble.update (docs/port/MODS.md); retail with none
+FUN_L11_0031e2f0	moby	Moby_Class1903_Update	hook	The update of class 1903, each tick: a hook point for mods, rac1.moby.pokitaru_surface_near.update (docs/port/MODS.md); retail with none
+FUN_L11_0031f150	moby	Moby_Class1919_Update	hook	The update of class 1919, each tick: a hook point for mods, rac1.moby.pokitaru_surface_far.update (docs/port/MODS.md); retail with none
+FUN_L12_002bf140	moby	Moby_Class19_Update	hook	The update of class 19, each tick: a hook point for mods, rac1.moby.moby19.update (docs/port/MODS.md); retail with none
+FUN_L12_002e1be0	moby	Moby_Class238_Update	hook	The update of class 238, each tick: a hook point for mods, rac1.moby.hoven_troll.update (docs/port/MODS.md); retail with none
+FUN_L12_002e3ed8	moby	Moby_Platform240_Update	hook	The update of class platform (240), each tick: a hook point for mods, rac1.moby.hoven_platform.update (docs/port/MODS.md); retail with none
+FUN_L12_002e6c48	moby	Moby_Miner_Update	hook	The update of class miner (282), each tick: a hook point for mods, rac1.moby.miner.update (docs/port/MODS.md); retail with none
+FUN_L12_002e7208	moby	Moby_Class293_Update	hook	The update of class 293, each tick: a hook point for mods, rac1.moby.moby293.update (docs/port/MODS.md); retail with none
+FUN_L12_002e72c0	moby	Moby_BlargTrooper294_Update	hook	The update of class blarg_trooper (294), each tick: a hook point for mods, rac1.moby.moby294.update (docs/port/MODS.md); retail with none
+FUN_L12_002e9f68	moby	Moby_BlargHelicopter326_Update	hook	The update of class blarg_helicopter (326), each tick: a hook point for mods, rac1.moby.moby326.update (docs/port/MODS.md); retail with none
+FUN_L12_002eb570	moby	Moby_Edwina_Update	hook	The update of class edwina (328), each tick: a hook point for mods, rac1.moby.edwina.update (docs/port/MODS.md); retail with none
+FUN_L12_002ebea8	moby	Moby_Helicopter_Update	hook	The update of class helicopter (336), each tick: a hook point for mods, rac1.moby.moby336.update (docs/port/MODS.md); retail with none
+FUN_L12_002ec1d0	moby	Moby_CraneArm_Update	hook	The update of class crane_arm (339), each tick: a hook point for mods, rac1.moby.moby339.update (docs/port/MODS.md); retail with none
+FUN_L12_002ec720	moby	Moby_WaterReservoir_Update	hook	The update of class water_reservoir (384), each tick: a hook point for mods, rac1.moby.water_reservoir.update (docs/port/MODS.md); retail with none
+FUN_L12_002ece00	moby	Moby_Rocket409_Update	hook	The update of class rocket (409), each tick: a hook point for mods, rac1.moby.hoven_shot.update (docs/port/MODS.md); retail with none
+FUN_L12_002ed280	moby	Moby_Class422_Update	hook	The update of class 422, each tick: a hook point for mods, rac1.moby.hoven_challenge.update (docs/port/MODS.md); retail with none
+FUN_L12_00302f30	moby	Moby_Class1259_Update	hook	The update of class 1259, each tick: a hook point for mods, rac1.moby.moby1259.update (docs/port/MODS.md); retail with none
+FUN_L12_00303540	moby	Moby_HovenTurret_Update	hook	The update of class hoven_turret (1267), each tick: a hook point for mods, rac1.moby.moby1267.update (docs/port/MODS.md); retail with none
+FUN_L12_00304e00	moby	Moby_Mine1269_Update	hook	The update of class mine (1269), each tick: a hook point for mods, rac1.moby.hoven_homing_mine.update (docs/port/MODS.md); retail with none
+FUN_L12_003069d0	moby	Moby_PlanetbusterMaximusPart_Update	hook	The update of class planetbuster_maximus_part (1274), each tick: a hook point for mods, rac1.moby.planetbuster_part.update (docs/port/MODS.md); retail with none
+FUN_L12_00307840	moby	Moby_HomingMineSpawner_Update	hook	The update of class homing_mine_spawner (1281), each tick: a hook point for mods, rac1.moby.door_switch.update (docs/port/MODS.md); retail with none
+FUN_L12_003081b0	moby	Moby_Class1345_Update	hook	The update of class 1345, each tick: a hook point for mods, rac1.moby.moby1345.update (docs/port/MODS.md); retail with none
+FUN_L12_00308918	moby	Moby_BlargCommander_Update	hook	The update of class blarg_commander (1371), each tick: a hook point for mods, rac1.moby.blarg_commander.update (docs/port/MODS.md); retail with none
+FUN_L12_003093c8	moby	Moby_Class1404_Update	hook	The update of class 1404, each tick: a hook point for mods, rac1.moby.cutscene_volume_trigger.update (docs/port/MODS.md); retail with none
+FUN_L12_003094a0	moby	Moby_Class1557_Update	hook	The update of class 1557, each tick: a hook point for mods, rac1.moby.class_1557.update (docs/port/MODS.md); retail with none
+FUN_L12_0030bff0	moby	Moby_Class1901_Update	hook	The update of class 1901, each tick: a hook point for mods, rac1.moby.moby1901.update (docs/port/MODS.md); retail with none
+FUN_L13_002b0e80	moby	Moby_Class6_Update	hook	The update of class 6, each tick: a hook point for mods, rac1.moby.clip_volume_trigger.update (docs/port/MODS.md); retail with none
+FUN_L13_002b39e0	moby	Moby_Elevator21_Update	hook	The update of classes elevator (21), elevator (244), each tick: a hook point for mods, rac1.moby.elevator_21.update (docs/port/MODS.md); retail with none
+FUN_L13_002b41b8	moby	Moby_BlargTurret_Update	hook	The update of class blarg_turret (29), each tick: a hook point for mods, rac1.moby.blarg_turret.update (docs/port/MODS.md); retail with none
+FUN_L13_002b4c80	moby	Moby_BlargGunner_Update	hook	The update of class blarg_gunner (36), each tick: a hook point for mods, rac1.moby.gem_lock_turret.update (docs/port/MODS.md); retail with none
+FUN_L13_002b50d8	moby	Moby_Robosquawker_Update	hook	The update of class robosquawker (63), each tick: a hook point for mods, rac1.moby.robosquawker.update (docs/port/MODS.md); retail with none
+FUN_L13_002bb068	moby	Moby_FighterJet69_Update	hook	The update of class fighter_jet (69), each tick: a hook point for mods, rac1.moby.fighter_jet_69.update (docs/port/MODS.md); retail with none
+FUN_L13_002c1528	moby	Moby_Rocket82_Update	hook	The update of class rocket (82), each tick: a hook point for mods, rac1.moby.homing_rocket82.update (docs/port/MODS.md); retail with none
+FUN_L13_002c2048	moby	Moby_Mine83_Update	hook	The update of class mine (83), each tick: a hook point for mods, rac1.moby.moby83.update (docs/port/MODS.md); retail with none
+FUN_L13_002c25b8	moby	Moby_BlargSpaceFighter_Update	hook	The update of class blarg_space_fighter (101), each tick: a hook point for mods, rac1.moby.blarg_space_fighter.update (docs/port/MODS.md); retail with none
+FUN_L13_002c4428	moby	Moby_BlargSpaceFighter111_Update	hook	The update of class blarg_space_fighter (111), each tick: a hook point for mods, rac1.moby.blarg_fighter111.update (docs/port/MODS.md); retail with none
+FUN_L13_002c7f38	moby	Moby_Class127_Update	hook	The update of classes 127, 128, 159, 169, each tick: a hook point for mods, rac1.moby.rotating_door.update (docs/port/MODS.md); retail with none
+FUN_L13_002cefc0	moby	Moby_ForcefieldTower_Update	hook	The update of class forcefield_tower (170), each tick: a hook point for mods, rac1.moby.forcefield_tower.update (docs/port/MODS.md); retail with none
+FUN_L13_002e1638	moby	Moby_Asteroid212_Update	hook	The update of classes asteroid (212), asteroid (1412), each tick: a hook point for mods, rac1.moby.drifting_blob.update (docs/port/MODS.md); retail with none
+FUN_L13_002e1cc8	moby	Moby_Ammocrate224_Update	hook	The update of classes ammocrate (224), jet_fighter_health_crate (228), each tick: a hook point for mods, rac1.moby.ship_pickup.update (docs/port/MODS.md); retail with none
+FUN_L13_002e4448	moby	Moby_Class231_Update	hook	The update of class 231, each tick: a hook point for mods, rac1.moby.switch.update (docs/port/MODS.md); retail with none
+FUN_L13_002e6c08	moby	Moby_Rocket295_Update	hook	The update of class rocket (295), each tick: a hook point for mods, rac1.moby.rocket295.update (docs/port/MODS.md); retail with none
+FUN_L13_002e84d8	moby	Moby_Class352_Update	hook	The update of class 352, each tick: a hook point for mods, rac1.moby.fade_in_hold_out.update (docs/port/MODS.md); retail with none
+FUN_L13_002eb098	moby	Moby_QwarksStarfighterPart_Update	hook	The update of class qwarks_starfighter_part (388), each tick: a hook point for mods, rac1.moby.qwark_starfighter_part.update (docs/port/MODS.md); retail with none
+FUN_L13_002ece00	moby	Moby_QwarksStarfighterPart389_Update	hook	The update of classes qwarks_starfighter_part (389), qwarks_starfighter_part (390), qwarks_starfighter_part (391), qwarks_starfighter_part (392) and 7 more, each tick: a hook point for mods, rac1.moby.starfighter_part.update (docs/port/MODS.md); retail with none
+FUN_L13_002ed4a8	moby	Moby_Forcefield_Update	hook	The update of classes forcefield (404), forcefield (405), each tick: a hook point for mods, rac1.moby.gem_lock_pickup.update (docs/port/MODS.md); retail with none
+FUN_L13_002f3750	moby	Moby_PurpleShip533_Update	hook	The update of class purple_ship (533), each tick: a hook point for mods, rac1.moby.purple_ship_533.update (docs/port/MODS.md); retail with none
+FUN_L13_002f3778	moby	Moby_Class558_Update	hook	The update of class 558, each tick: a hook point for mods, rac1.moby.help_volume.update (docs/port/MODS.md); retail with none
+FUN_L13_002f8880	moby	Moby_Class667_Update	hook	The update of class 667, each tick: a hook point for mods, rac1.moby.moby_state_relay.update (docs/port/MODS.md); retail with none
+FUN_L13_002f8a78	moby	Moby_Class674_Update	hook	The update of classes 674, 677, 680, each tick: a hook point for mods, rac1.moby.controlled_gate.update (docs/port/MODS.md); retail with none
+FUN_L13_00306300	moby	Moby_Class1238_Update	hook	The update of class 1238, each tick: a hook point for mods, rac1.moby.projectile_l13.update (docs/port/MODS.md); retail with none
+FUN_L13_00307b10	moby	Moby_PoisonVessel_Update	hook	The update of class poison_vessel (1261), each tick: a hook point for mods, rac1.moby.moby1261.update (docs/port/MODS.md); retail with none
+FUN_L13_00307e98	moby	Moby_BlargSpaceCommando1262_Update	hook	The update of class blarg_space_commando (1262), each tick: a hook point for mods, rac1.moby.blarg_space_commando.update (docs/port/MODS.md); retail with none
+FUN_L13_00309e88	moby	Moby_Class1263_Update	hook	The update of classes 1263, 1393, each tick: a hook point for mods, rac1.moby.bobbing_lights.update (docs/port/MODS.md); retail with none
+FUN_L13_0030a6d8	moby	Moby_Class1270_Update	hook	The update of class 1270, each tick: a hook point for mods, rac1.moby.lift1270.update (docs/port/MODS.md); retail with none
+FUN_L13_0030af50	moby	Moby_Class1271_Update	hook	The update of class 1271, each tick: a hook point for mods, rac1.moby.class_1271.update (docs/port/MODS.md); retail with none
+FUN_L13_0030b628	moby	Moby_Class1353_Update	hook	The update of class 1353, each tick: a hook point for mods, rac1.moby.moby1353.update (docs/port/MODS.md); retail with none
+FUN_L13_0030bb70	moby	Moby_Class1403_Update	hook	The update of class 1403, each tick: a hook point for mods, rac1.moby.class_1403.update (docs/port/MODS.md); retail with none
+FUN_L13_0030bdf0	moby	Moby_Class1558_Update	hook	The update of class 1558, each tick: a hook point for mods, rac1.moby.sparks_trigger_l13.update (docs/port/MODS.md); retail with none
+FUN_L13_0030be60	moby	Moby_Class1577_Update	hook	The update of class 1577, each tick: a hook point for mods, rac1.moby.watch_mobys.update (docs/port/MODS.md); retail with none
+FUN_L13_0030c060	moby	Moby_Class1632_Update	hook	The update of class 1632, each tick: a hook point for mods, rac1.moby.moby1632.update (docs/port/MODS.md); retail with none
+FUN_L13_0030c3b8	moby	Moby_Class1634_Update	hook	The update of class 1634, each tick: a hook point for mods, rac1.moby.moby1634.update (docs/port/MODS.md); retail with none
+FUN_L13_0030cdb8	moby	Moby_BlargShip1805_Update	hook	The update of class blarg_ship (1805), each tick: a hook point for mods, rac1.moby.moby1805.update (docs/port/MODS.md); retail with none
+FUN_L14_002aba80	moby	Moby_Platform903_Update	hook	The update of class platform (903), each tick: a hook point for mods, rac1.moby.keyframe_platform.update (docs/port/MODS.md); retail with none
+FUN_L14_002ac618	moby	Moby_BlargHeavyInterceptor_Update	hook	The update of class blarg_heavy_interceptor (8), each tick: a hook point for mods, rac1.moby.moby8.update (docs/port/MODS.md); retail with none
+FUN_L14_002b17d8	moby	Moby_Plasmabot_Update	hook	The update of class plasmabot (28), each tick: a hook point for mods, rac1.moby.plasmabot.update (docs/port/MODS.md); retail with none
+FUN_L14_002b3bf0	moby	Moby_MachinegunTurret30_Update	hook	The update of class machinegun_turret (30), each tick: a hook point for mods, rac1.moby.machinegun_turret_30.update (docs/port/MODS.md); retail with none
+FUN_L14_002b46e8	moby	Moby_Minibomber_Update	hook	The update of class minibomber (31), each tick: a hook point for mods, rac1.moby.minibomber.update (docs/port/MODS.md); retail with none
+FUN_L14_002bac78	moby	Moby_Class81_Update	hook	The update of class 81, each tick: a hook point for mods, rac1.moby.moby81.update (docs/port/MODS.md); retail with none
+FUN_L14_002d5f40	moby	Moby_Plasmabot211_Update	hook	The update of class plasmabot (211), each tick: a hook point for mods, rac1.moby.moby211.update (docs/port/MODS.md); retail with none
+FUN_L14_002d96e0	moby	Moby_PlasmabotHatch_Update	hook	The update of class plasmabot_hatch (250), each tick: a hook point for mods, rac1.moby.moby250.update (docs/port/MODS.md); retail with none
+FUN_L14_002de1f8	moby	Moby_Platform309_Update	hook	The update of class platform (309), each tick: a hook point for mods, rac1.moby.moby309.update (docs/port/MODS.md); retail with none
+FUN_L14_002de670	moby	Moby_Class325_Update	hook	The update of class 325, each tick: a hook point for mods, rac1.moby.debris_particle.update (docs/port/MODS.md); retail with none
+FUN_L14_002dee28	moby	Moby_Class386_Update	hook	The update of class 386, each tick: a hook point for mods, rac1.moby.gem_lock_sentry.update (docs/port/MODS.md); retail with none
+FUN_L14_002dfd10	moby	Moby_Class403_Update	hook	The update of class 403, each tick: a hook point for mods, rac1.moby.race_debris.update (docs/port/MODS.md); retail with none
+FUN_L14_002e7bd8	moby	Moby_Shuttle557_Update	hook	The update of class shuttle (557), each tick: a hook point for mods, rac1.moby.path_lift.update (docs/port/MODS.md); retail with none
+FUN_L14_002eaf88	moby	Moby_Class610_Update	hook	The update of class 610, each tick: a hook point for mods, rac1.moby.moby610.update (docs/port/MODS.md); retail with none
+FUN_L14_002ec810	moby	Moby_Mine643_Update	hook	The update of class mine (643), each tick: a hook point for mods, rac1.moby.mine_l14.update (docs/port/MODS.md); retail with none
+FUN_L14_002ece00	moby	Moby_Class681_Update	hook	The update of class 681, each tick: a hook point for mods, rac1.moby.sweeping_bolt.update (docs/port/MODS.md); retail with none
+FUN_L14_002ed280	moby	Moby_Class684_Update	hook	The update of class 684, each tick: a hook point for mods, rac1.moby.class_684.update (docs/port/MODS.md); retail with none
+FUN_L14_002ee8d8	moby	Moby_Elevator685_Update	hook	The update of class elevator (685), each tick: a hook point for mods, rac1.moby.moby685.update (docs/port/MODS.md); retail with none
+FUN_L14_002f0538	moby	Moby_Taxi712_Update	hook	The update of class taxi (712), each tick: a hook point for mods, rac1.moby.taxi.update (docs/port/MODS.md); retail with none
+FUN_L14_002fba20	moby	Moby_QwarkOltanis_Update	hook	The update of class qwark_oltanis (851), each tick: a hook point for mods, rac1.moby.moby851.update (docs/port/MODS.md); retail with none
+FUN_L14_002fc0f0	moby	Moby_Jet_Update	hook	The update of class jet (908), each tick: a hook point for mods, rac1.moby.moby908.update (docs/port/MODS.md); retail with none
+FUN_L14_002fcbb0	moby	Moby_Jet921_Update	hook	The update of class jet (921), each tick: a hook point for mods, rac1.moby.oltanis_jet.update (docs/port/MODS.md); retail with none
+FUN_L14_002fdbb8	moby	Moby_Rocket922_Update	hook	The update of class rocket (922), each tick: a hook point for mods, rac1.moby.flyer.update (docs/port/MODS.md); retail with none
+FUN_L14_002fe2a0	moby	Moby_BoltThief923_Update	hook	The update of class bolt_thief (923), each tick: a hook point for mods, rac1.moby.bolt_thief.update (docs/port/MODS.md); retail with none
+FUN_L14_002fefe0	moby	Moby_Sam_Update	hook	The update of class sam (924), each tick: a hook point for mods, rac1.moby.moby924.update (docs/port/MODS.md); retail with none
+FUN_L14_002ff640	moby	Moby_Mine933_Update	hook	The update of class mine (933), each tick: a hook point for mods, rac1.moby.floating_mine.update (docs/port/MODS.md); retail with none
+FUN_L14_00300e00	moby	Moby_Class1193_Update	hook	The update of class 1193, each tick: a hook point for mods, rac1.moby.bouncing_spark.update (docs/port/MODS.md); retail with none
+FUN_L14_003015d0	moby	Moby_Class1224_Update	hook	The update of class 1224, each tick: a hook point for mods, rac1.moby.moby1224.update (docs/port/MODS.md); retail with none
+FUN_L14_003039e0	moby	Moby_Class1331_Update	hook	The update of class 1331, each tick: a hook point for mods, rac1.moby.moby1331.update (docs/port/MODS.md); retail with none
+FUN_L14_00305408	moby	Moby_Class1352_Update	hook	The update of class 1352, each tick: a hook point for mods, rac1.moby.triggered_unlock.update (docs/port/MODS.md); retail with none
+FUN_L14_00305758	moby	Moby_Morphoray1354_Update	hook	The update of class morphoray (1354), each tick: a hook point for mods, rac1.moby.collectible_pickup.update (docs/port/MODS.md); retail with none
+FUN_L14_00305d28	moby	Moby_Class1395_Update	hook	The update of class 1395, each tick: a hook point for mods, rac1.moby.moby1395.update (docs/port/MODS.md); retail with none
+FUN_L14_003061d8	moby	Moby_Class1397_Update	hook	The update of class 1397, each tick: a hook point for mods, rac1.moby.moby1397.update (docs/port/MODS.md); retail with none
+FUN_L14_00306b78	moby	Moby_Button1416_Update	hook	The update of class button (1416), each tick: a hook point for mods, rac1.moby.step_on_switch.update (docs/port/MODS.md); retail with none
+FUN_L14_00306ee0	moby	Moby_BlargHeavyInterceptor1417_Update	hook	The update of class blarg_heavy_interceptor (1417), each tick: a hook point for mods, rac1.moby.blarg_interceptor.update (docs/port/MODS.md); retail with none
+FUN_L14_00307a80	moby	Moby_Class1418_Update	hook	The update of class 1418, each tick: a hook point for mods, rac1.moby.queue_effect_draw.update (docs/port/MODS.md); retail with none
+FUN_L14_003087c0	moby	Moby_Class1559_Update	hook	The update of class 1559, each tick: a hook point for mods, rac1.moby.skill_point.update (docs/port/MODS.md); retail with none
+FUN_L15_002979d8	moby	Moby_Sentrybot_Update	hook	The update of class sentrybot (44), each tick: a hook point for mods, rac1.moby.sentrybot.update (docs/port/MODS.md); retail with none
+FUN_L15_0029ac30	moby	Moby_Rocket49_Update	hook	The update of class rocket (49), each tick: a hook point for mods, rac1.moby.projectile.update (docs/port/MODS.md); retail with none
+FUN_L15_0029aff0	moby	Moby_Class67_Update	hook	The update of class 67, each tick: a hook point for mods, rac1.moby.moby67.update (docs/port/MODS.md); retail with none
+FUN_L15_0029d6c0	moby	Moby_Class256_Update	hook	The update of class 256, each tick: a hook point for mods, rac1.moby.class_256.update (docs/port/MODS.md); retail with none
+FUN_L15_0029ead0	moby	Moby_Class1427_Update	hook	The update of class 1427, each tick: a hook point for mods, rac1.moby.scale_fade_and_delete.update (docs/port/MODS.md); retail with none
+FUN_L15_0029edb0	moby	Moby_Class1523_Update	hook	The update of class 1523, each tick: a hook point for mods, rac1.moby.moby1523.update (docs/port/MODS.md); retail with none
+FUN_L15_002a2488	moby	Moby_Mine77_Update	hook	The update of class mine (77), each tick: a hook point for mods, rac1.moby.moby77.update (docs/port/MODS.md); retail with none
+FUN_L15_002a2bf0	moby	Moby_Class78_Update	hook	The update of class 78, each tick: a hook point for mods, rac1.moby.moby78.update (docs/port/MODS.md); retail with none
+FUN_L15_002a36d0	moby	Moby_Gate92_Update	hook	The update of class gate (92), each tick: a hook point for mods, rac1.moby.sliding_gate.update (docs/port/MODS.md); retail with none
+FUN_L15_002a3ba8	moby	Moby_Gate93_Update	hook	The update of class gate (93), each tick: a hook point for mods, rac1.moby.clip_volume_door.update (docs/port/MODS.md); retail with none
+FUN_L15_002a6e68	moby	Moby_Spiderbot_Update	hook	The update of class spiderbot (123), each tick: a hook point for mods, rac1.moby.spiderbot.update (docs/port/MODS.md); retail with none
+FUN_L15_002a7880	moby	Moby_Class148_Update	hook	The update of classes 148, 255, each tick: a hook point for mods, rac1.moby.class_148.update (docs/port/MODS.md); retail with none
+FUN_L15_002aa280	moby	Moby_Class154_Update	hook	The update of class 154, each tick: a hook point for mods, rac1.moby.hit_reaction_effect_alt.update (docs/port/MODS.md); retail with none
+FUN_L15_002bddb0	moby	Moby_Door196_Update	hook	The update of classes door (196), door (197), underwater_door (1958), each tick: a hook point for mods, rac1.moby.moving_moby.update (docs/port/MODS.md); retail with none
+FUN_L15_002c2938	moby	Moby_ConstructionArm_Update	hook	The update of class construction_arm (221), each tick: a hook point for mods, rac1.moby.construction_arm.update (docs/port/MODS.md); retail with none
+FUN_L15_002c5630	moby	Moby_Helicopter233_Update	hook	The update of class helicopter (233), each tick: a hook point for mods, rac1.moby.helicopter.update (docs/port/MODS.md); retail with none
+FUN_L15_002cb4c8	moby	Moby_SentrybotAlarm_Update	hook	The update of class sentrybot_alarm (408), each tick: a hook point for mods, rac1.moby.sentrybot_alarm.update (docs/port/MODS.md); retail with none
+FUN_L15_002cf3a8	moby	Moby_UltramechUnlimited_Update	hook	The update of class ultramech_unlimited (491), each tick: a hook point for mods, rac1.moby.ultramech.update (docs/port/MODS.md); retail with none
+FUN_L15_002d6810	moby	Moby_Class655_Update	hook	The update of class 655, each tick: a hook point for mods, rac1.moby.class_655.update (docs/port/MODS.md); retail with none
+FUN_L15_002e4380	moby	Moby_Class934_Update	hook	The update of class 934, each tick: a hook point for mods, rac1.moby.moby934.update (docs/port/MODS.md); retail with none
+FUN_L15_002e46b0	moby	Moby_Class937_Update	hook	The update of class 937, each tick: a hook point for mods, rac1.moby.class_937.update (docs/port/MODS.md); retail with none
+FUN_L15_002e5958	moby	Moby_UnderwaterRing_Update	hook	The update of class underwater_ring (1209), each tick: a hook point for mods, rac1.moby.underwater_ring.update (docs/port/MODS.md); retail with none
+FUN_L15_002e73c0	moby	Moby_ConveyorBelt1250_Update	hook	The update of class conveyor_belt (1250), each tick: a hook point for mods, rac1.moby.side_drift.update (docs/port/MODS.md); retail with none
+FUN_L15_002e7f68	moby	Moby_PoisonVessel1257_Update	hook	The update of class poison_vessel (1257), each tick: a hook point for mods, rac1.moby.poison_vessel.update (docs/port/MODS.md); retail with none
+FUN_L15_002ea748	moby	Moby_BoltGrabber_Update	hook	The update of class bolt_grabber (1388), each tick: a hook point for mods, rac1.moby.moby1388.update (docs/port/MODS.md); retail with none
+FUN_L15_002eabd8	moby	Moby_Class1394_Update	hook	The update of class 1394, each tick: a hook point for mods, rac1.moby.moby1257_spawner.update (docs/port/MODS.md); retail with none
+FUN_L15_002eb0a0	moby	Moby_Class1405_Update	hook	The update of classes 1405, 1406, 1407, 1408 and 4 more, each tick: a hook point for mods, rac1.moby.ripple_strips_moby.update (docs/port/MODS.md); retail with none
+FUN_L15_002eb4c0	moby	Moby_Class1419_Update	hook	The update of class 1419, each tick: a hook point for mods, rac1.moby.moby1419.update (docs/port/MODS.md); retail with none
+FUN_L15_002eb928	moby	Moby_Class1425_Update	hook	The update of class 1425, each tick: a hook point for mods, rac1.moby.class_1425.update (docs/port/MODS.md); retail with none
+FUN_L15_002ebd78	moby	Moby_Codebot_Update	hook	The update of class codebot (1428), each tick: a hook point for mods, rac1.moby.moby1428.update (docs/port/MODS.md); retail with none
+FUN_L15_002ec030	moby	Moby_CodebotSlot_Update	hook	The update of class codebot_slot (1430), each tick: a hook point for mods, rac1.moby.codebot_slot.update (docs/port/MODS.md); retail with none
+FUN_L15_002ec760	moby	Moby_UltramechScientist_Update	hook	The update of class ultramech_scientist (1446), each tick: a hook point for mods, rac1.moby.ultramech_scientist.update (docs/port/MODS.md); retail with none
+FUN_L15_002ed068	moby	Moby_GiantClankPad_Update	hook	The update of classes giant_clank_pad (1451), giant_clank_pad (1899), each tick: a hook point for mods, rac1.moby.giant_clank_pad.update (docs/port/MODS.md); retail with none
+FUN_L15_002ed398	moby	Moby_Class1469_Update	hook	The update of class 1469, each tick: a hook point for mods, rac1.moby.moby1469.update (docs/port/MODS.md); retail with none
+FUN_L15_002edb20	moby	Moby_Class1560_Update	hook	The update of class 1560, each tick: a hook point for mods, rac1.moby.boss_slot_effect.update (docs/port/MODS.md); retail with none
+FUN_L16_002a0a98	moby	Moby_Rocket50_Update	hook	The update of class rocket (50), each tick: a hook point for mods, rac1.moby.homing_projectile.update (docs/port/MODS.md); retail with none
+FUN_L16_002a3f38	moby	Moby_Rocket1475_Update	hook	The update of class rocket (1475), each tick: a hook point for mods, rac1.moby.homing_spark_1475.update (docs/port/MODS.md); retail with none
+FUN_L16_002c3d38	moby	Moby_Class257_Update	hook	The update of class 257, each tick: a hook point for mods, rac1.moby.moby257.update (docs/port/MODS.md); retail with none
+FUN_L16_002c5eb0	moby	Moby_Bomb281_Update	hook	The update of class bomb (281), each tick: a hook point for mods, rac1.moby.thrown_bomb.update (docs/port/MODS.md); retail with none
+FUN_L16_002c9480	moby	Moby_Rocket470_Update	hook	The update of class rocket (470), each tick: a hook point for mods, rac1.moby.moby470.update (docs/port/MODS.md); retail with none
+FUN_L16_002c9878	moby	Moby_ConveyorBelt471_Update	hook	The update of class conveyor_belt (471), each tick: a hook point for mods, rac1.moby.moby471.update (docs/port/MODS.md); retail with none
+FUN_L16_002cddb8	moby	Moby_TestDummy_Update	hook	The update of class test_dummy (541), each tick: a hook point for mods, rac1.moby.test_dummy.update (docs/port/MODS.md); retail with none
+FUN_L16_002cf198	moby	Moby_WallButton_Update	hook	The update of class wall_button (546), each tick: a hook point for mods, rac1.moby.moby546.update (docs/port/MODS.md); retail with none
+FUN_L16_002cf4a8	moby	Moby_Class552_Update	hook	The update of class 552, each tick: a hook point for mods, rac1.moby.moby552.update (docs/port/MODS.md); retail with none
+FUN_L16_002d04a0	moby	Moby_TestDummyOnHoverboard_Update	hook	The update of class test_dummy_on_hoverboard (556), each tick: a hook point for mods, rac1.moby.hoverboard_racer.update (docs/port/MODS.md); retail with none
+FUN_L16_002d2cf0	moby	Moby_BlargEliteCommando_Update	hook	The update of class blarg_elite_commando (638), each tick: a hook point for mods, rac1.moby.floating_enemy.update (docs/port/MODS.md); retail with none
+FUN_L16_002d59e0	moby	Moby_Door647_Update	hook	The update of class door (647), each tick: a hook point for mods, rac1.moby.moby647.update (docs/port/MODS.md); retail with none
+FUN_L16_002d5cb8	moby	Moby_TestDummyDoor_Update	hook	The update of class test_dummy_door (650), each tick: a hook point for mods, rac1.moby.moby650.update (docs/port/MODS.md); retail with none
+FUN_L16_002d5ef8	moby	Moby_Class654_Update	hook	The update of class 654, each tick: a hook point for mods, rac1.moby.moby654.update (docs/port/MODS.md); retail with none
+FUN_L16_002d6740	moby	Moby_Class800_Update	hook	The update of class 800, each tick: a hook point for mods, rac1.moby.moby800.update (docs/port/MODS.md); retail with none
+FUN_L16_002e22d8	moby	Moby_ArmedTransport_Update	hook	The update of class armed_transport (1356), each tick: a hook point for mods, rac1.moby.armed_transport.update (docs/port/MODS.md); retail with none
+FUN_L16_002e3190	moby	Moby_HelpDeskLady_Update	hook	The update of class help_desk_lady (1377), each tick: a hook point for mods, rac1.moby.watcher.update (docs/port/MODS.md); retail with none
+FUN_L16_002e36e8	moby	Moby_Class1387_Update	hook	The update of class 1387, each tick: a hook point for mods, rac1.moby.moby1387.update (docs/port/MODS.md); retail with none
+FUN_L16_002e37a0	moby	Moby_BoltThief1401_Update	hook	The update of class bolt_thief (1401), each tick: a hook point for mods, rac1.moby.crate_platform.update (docs/port/MODS.md); retail with none
+FUN_L16_002e43e0	moby	Moby_Taxi1410_Update	hook	The update of class taxi (1410), each tick: a hook point for mods, rac1.moby.path_pickup.update (docs/port/MODS.md); retail with none
+FUN_L16_002e5010	moby	Moby_GrindrailGate_Update	hook	The update of class grindrail_gate (1439), each tick: a hook point for mods, rac1.moby.moby1439.update (docs/port/MODS.md); retail with none
+FUN_L16_002e5258	moby	Moby_GrindrailGate1441_Update	hook	The update of class grindrail_gate (1441), each tick: a hook point for mods, rac1.moby.moby1441.update (docs/port/MODS.md); retail with none
+FUN_L16_002e54a0	moby	Moby_GrindrailButton_Update	hook	The update of class grindrail_button (1442), each tick: a hook point for mods, rac1.moby.moby1442.update (docs/port/MODS.md); retail with none
+FUN_L16_002e5708	moby	Moby_GrindrailBarrier_Update	hook	The update of classes grindrail_barrier (1443), 1890, each tick: a hook point for mods, rac1.moby.ring_effect.update (docs/port/MODS.md); retail with none
+FUN_L16_002e5e08	moby	Moby_Chomper_Update	hook	The update of class chomper (1445), each tick: a hook point for mods, rac1.moby.wandering_helper.update (docs/port/MODS.md); retail with none
+FUN_L16_002e6808	moby	Moby_GadgetronCeo_Update	hook	The update of class gadgetron_ceo (1455), each tick: a hook point for mods, rac1.moby.challenge_npc.update (docs/port/MODS.md); retail with none
+FUN_L16_002e7208	moby	Moby_Class1561_Update	hook	The update of class 1561, each tick: a hook point for mods, rac1.moby.banner_trigger.update (docs/port/MODS.md); retail with none
+FUN_L16_002e76b8	moby	Moby_Class1667_Update	hook	The update of classes 1667, 1668, 1669, 1670 and 1 more, each tick: a hook point for mods, rac1.moby.path_walker.update (docs/port/MODS.md); retail with none
+FUN_L16_002e7e00	moby	Moby_Class1812_Update	hook	The update of class 1812, each tick: a hook point for mods, rac1.moby.spark_ring_emitter.update (docs/port/MODS.md); retail with none
+FUN_L16_002e7f80	moby	Moby_Elevator1826_Update	hook	The update of class elevator (1826), each tick: a hook point for mods, rac1.moby.elevator_platform.update (docs/port/MODS.md); retail with none
+FUN_L16_002e88d0	moby	Moby_GadgetronSign_Update	hook	The update of class gadgetron_sign (1891), each tick: a hook point for mods, rac1.moby.spinning_object.update (docs/port/MODS.md); retail with none
+FUN_L16_002e8970	moby	Moby_Class1923_Update	hook	The update of class 1923, each tick: a hook point for mods, rac1.moby.target_activator.update (docs/port/MODS.md); retail with none
+FUN_L16_002e8e80	moby	Moby_Class1943_Update	hook	The update of class 1943, each tick: a hook point for mods, rac1.moby.env_map_a.update (docs/port/MODS.md); retail with none
+FUN_L16_002e93b0	moby	Moby_Class1947_Update	hook	The update of class 1947, each tick: a hook point for mods, rac1.moby.class_1947.update (docs/port/MODS.md); retail with none
+FUN_L16_002e98e0	moby	Moby_Class1948_Update	hook	The update of class 1948, each tick: a hook point for mods, rac1.moby.env_map_b.update (docs/port/MODS.md); retail with none
+FUN_L16_002e9df0	moby	Moby_Class1907_Update	hook	The update of classes 1907, 1908, 1910, 1911 and 3 more, each tick: a hook point for mods, rac1.moby.class_1907.update (docs/port/MODS.md); retail with none
+FUN_L16_002ea128	moby	Moby_Class1953_Update	hook	The update of class 1953, each tick: a hook point for mods, rac1.moby.env_map_c.update (docs/port/MODS.md); retail with none
+FUN_L17_002a8da0	moby	Moby_Class99_Update	hook	The update of class 99, each tick: a hook point for mods, rac1.moby.moby99.update (docs/port/MODS.md); retail with none
+FUN_L17_002cb310	moby	Moby_DreksFleetTurret_Update	hook	The update of class dreks_fleet_turret (347), each tick: a hook point for mods, rac1.moby.fleet_turret.update (docs/port/MODS.md); retail with none
+FUN_L17_002d77f0	moby	Moby_Class669_Update	hook	The update of class 669, each tick: a hook point for mods, rac1.moby.moby669.update (docs/port/MODS.md); retail with none
+FUN_L17_002dc3f8	moby	Moby_Class835_Update	hook	The update of class 835, each tick: a hook point for mods, rac1.moby.moby835.update (docs/port/MODS.md); retail with none
+FUN_L17_002e87d8	moby	Moby_Door1359_Update	hook	The update of classes door (1359), door (1360), door (1361), door (1362) and 6 more, each tick: a hook point for mods, rac1.moby.stops_platform.update (docs/port/MODS.md); retail with none
+FUN_L17_002e8e08	moby	Moby_Class1368_Update	hook	The update of class 1368, each tick: a hook point for mods, rac1.moby.moby1368.update (docs/port/MODS.md); retail with none
+FUN_L17_002ed018	moby	Moby_FighterJet1379_Update	hook	The update of class fighter_jet (1379), each tick: a hook point for mods, rac1.moby.fighter_jet_1379.update (docs/port/MODS.md); retail with none
+FUN_L17_002ee2b0	moby	Moby_MagnetElevator_Update	hook	The update of class magnet_elevator (1380), each tick: a hook point for mods, rac1.moby.moby1380.update (docs/port/MODS.md); retail with none
+FUN_L17_002eeb68	moby	Moby_RobotDog1382_Update	hook	The update of class robot_dog (1382), each tick: a hook point for mods, rac1.moby.moby1382.update (docs/port/MODS.md); retail with none
+FUN_L17_002f1940	moby	Moby_Shuttle1448_Update	hook	The update of class shuttle (1448), each tick: a hook point for mods, rac1.moby.moby1448.update (docs/port/MODS.md); retail with none
+FUN_L17_002f26d0	moby	Moby_Class1470_Update	hook	The update of class 1470, each tick: a hook point for mods, rac1.moby.moby1470.update (docs/port/MODS.md); retail with none
+FUN_L17_002f2e78	moby	Moby_Class1562_Update	hook	The update of class 1562, each tick: a hook point for mods, rac1.moby.moby750_spark_trigger.update (docs/port/MODS.md); retail with none
+FUN_L17_002f3848	moby	Moby_Class1772_Update	hook	The update of class 1772, each tick: a hook point for mods, rac1.moby.fleet_reflection.update (docs/port/MODS.md); retail with none
+FUN_L17_002f40d8	moby	Moby_BlargShip1843_Update	hook	The update of class blarg_ship (1843), each tick: a hook point for mods, rac1.moby.moby1843.update (docs/port/MODS.md); retail with none
+FUN_L17_002f5260	moby	Moby_Class1873_Update	hook	The update of class 1873, each tick: a hook point for mods, rac1.moby.moby1873.update (docs/port/MODS.md); retail with none
+FUN_L17_002f5390	moby	Moby_Class1876_Update	hook	The update of class 1876, each tick: a hook point for mods, rac1.moby.moby1876.update (docs/port/MODS.md); retail with none
+FUN_L18_002a7220	moby	Moby_Rocket41_Update	hook	The update of class rocket (41), each tick: a hook point for mods, rac1.moby.moby41.update (docs/port/MODS.md); retail with none
+FUN_L18_002d5050	moby	Moby_Rocket564_Update	hook	The update of class rocket (564), each tick: a hook point for mods, rac1.moby.moby564.update (docs/port/MODS.md); retail with none
+FUN_L18_002d5918	moby	Moby_Mine568_Update	hook	The update of class mine (568), each tick: a hook point for mods, rac1.moby.moby568.update (docs/port/MODS.md); retail with none
+FUN_L18_002d62e8	moby	Moby_Class582_Update	hook	The update of class 582, each tick: a hook point for mods, rac1.moby.path_junction.update (docs/port/MODS.md); retail with none
+FUN_L18_002d6600	moby	Moby_ThrusterPackLockGreen_Update	hook	The update of class thruster_pack_lock_green (583), each tick: a hook point for mods, rac1.moby.energy_field_emitter.update (docs/port/MODS.md); retail with none
+FUN_L18_002d7b20	moby	Moby_ThrusterPackLockRed_Update	hook	The update of class thruster_pack_lock_red (586), each tick: a hook point for mods, rac1.moby.timed_lift.update (docs/port/MODS.md); retail with none
+FUN_L18_002d82c0	moby	Moby_FloatingPlatform587_Update	hook	The update of class floating_platform (587), each tick: a hook point for mods, rac1.moby.sinking_platform.update (docs/port/MODS.md); retail with none
+FUN_L18_002db460	moby	Moby_Class624_Update	hook	The update of class 624, each tick: a hook point for mods, rac1.moby.falling_fireball.update (docs/port/MODS.md); retail with none
+FUN_L18_002dc260	moby	Moby_Class628_Update	hook	The update of class 628, each tick: a hook point for mods, rac1.moby.moby628.update (docs/port/MODS.md); retail with none
+FUN_L18_002df608	moby	Moby_Class644_Update	hook	The update of class 644, each tick: a hook point for mods, rac1.moby.vendor_moby.update (docs/port/MODS.md); retail with none
+FUN_L18_002e9768	moby	Moby_Class885_Update	hook	The update of classes 885, 888, 891, 892 and 4 more, each tick: a hook point for mods, rac1.moby.hit_trigger.update (docs/port/MODS.md); retail with none
+FUN_L18_002e9e70	moby	Moby_Class983_Update	hook	The update of class 983, each tick: a hook point for mods, rac1.moby.homing_spark_983.update (docs/port/MODS.md); retail with none
+FUN_L18_002efb88	moby	Moby_DrekFightMissile_Update	hook	The update of class drek_fight_missile (1355), each tick: a hook point for mods, rac1.moby.moby1355.update (docs/port/MODS.md); retail with none
+FUN_L18_002f16f0	moby	Moby_Class1381_Update	hook	The update of class 1381, each tick: a hook point for mods, rac1.moby.moby1381.update (docs/port/MODS.md); retail with none
+FUN_L18_002f1e68	moby	Moby_Class1392_Update	hook	The update of class 1392, each tick: a hook point for mods, rac1.moby.moby1392.update (docs/port/MODS.md); retail with none
+FUN_L18_002f2310	moby	Moby_Class1402_Update	hook	The update of class 1402, each tick: a hook point for mods, rac1.moby.moby1402.update (docs/port/MODS.md); retail with none
+FUN_L18_002f2bf0	moby	Moby_DrekFinalBossRobot_Update	hook	The update of class drek_final_boss_robot (1422), each tick: a hook point for mods, rac1.moby.final_boss.update (docs/port/MODS.md); retail with none
+FUN_L18_002f7ab0	moby	Moby_Class1432_Update	hook	The update of class 1432, each tick: a hook point for mods, rac1.moby.class_1432.update (docs/port/MODS.md); retail with none
+FUN_L18_002f7ad8	moby	Moby_DeplanetizerGun_Update	hook	The update of classes deplanetizer_gun (1434), 1435, each tick: a hook point for mods, rac1.moby.moby1434.update (docs/port/MODS.md); retail with none
+FUN_L18_002f7c40	moby	Moby_RocketTank_Update	hook	The update of class rocket_tank (1454), each tick: a hook point for mods, rac1.moby.moby1454.update (docs/port/MODS.md); retail with none
+FUN_L18_002f88e8	moby	Moby_Class1563_Update	hook	The update of class 1563, each tick: a hook point for mods, rac1.moby.moby1563.update (docs/port/MODS.md); retail with none
+FUN_L18_002fa640	moby	Moby_DeplanetizerGun1568_Update	hook	The update of class deplanetizer_gun (1568), each tick: a hook point for mods, rac1.moby.moby1568.update (docs/port/MODS.md); retail with none
+FUN_L18_002fa728	moby	Moby_Class1584_Update	hook	The update of class 1584, each tick: a hook point for mods, rac1.moby.moby1584.update (docs/port/MODS.md); retail with none
+FUN_L18_002fad28	moby	Moby_Class1799_Update	hook	The update of class 1799, each tick: a hook point for mods, rac1.moby.moby1799.update (docs/port/MODS.md); retail with none
+FUN_L18_002fbb98	moby	Moby_Gadgebot1906_Update	hook	The update of class gadgebot (1906), each tick: a hook point for mods, rac1.moby.moby1906.update (docs/port/MODS.md); retail with none
+# ---- end of the generated hook points ----
+FUN_L00_002995d0	mpeg	prepare_movie_playback	wrap	a movie in a level: the RAM the console's decoder needs is parked in the GS's memory, which the port's player has no use for; run with the image transfers off (rac1/host/movie.c); PAL func_L00_0029A940	void (int, int, int)
+FUN_L00_002997c8	mpeg	unpark_movie_memory	wrap	after a movie in a level: the parked RAM read back; run with the image transfers off (rac1/host/movie.c); PAL func_L00_0029AB38	void (void)
+FUN_L01_002fd0c0	render	NovalisWater_002fd0c0	wrap	Tag authored Novalis water for optional enhanced materials	void(void)
+FUN_L01_002f60f8	render	NovalisWater_002f60f8	wrap	Tag authored Novalis water for optional enhanced materials	void(void)
+FUN_L01_002f6150	render	NovalisWater_002f6150	wrap	Tag authored Novalis water for optional enhanced materials	void(void)
+FUN_L11_0030a908	render	PokitaruOceanDraw	wrap	Tag authored Pokitaru ocean strips for the optional ocean material	void(gaddr moby)
+FUN_L17_002f04d0	render	FleetLandingWaterDraw	wrap	Tag the two landing pool strips for enhanced water	void(gaddr moby)
+FUN_L17_002f0948	render	FleetRingWaterDraw	wrap	Tag both Fleet ring water callbacks for enhanced water	void(gaddr moby)
+FUN_L17_002f10c8	render	FleetSquareWaterDraw	wrap	Tag the square Fleet pools for enhanced water	void(gaddr moby)
+FUN_L00_001fde98	render	DrawEnvOverlayMesh	wrap	Keep only the first scroll pass of enhanced Fleet water strips	void(int count,gaddr vertices,gaddr colours,gaddr uv,int mode)
+FUN_L01_002feb28	render	NovalisWater_002feb28	wrap	Tag authored Novalis water for optional enhanced materials	void(void)
+FUN_L01_002b7fe0	render	NovalisPoolStep	wrap	Bypass original pool displacement when enhanced water is active	void(gaddr,int)
+FUN_L00_002a3ec8	render	NovalisPoolImpulse	wrap	Bypass original Novalis pool impulses when enhanced water is active	void(gaddr,int,int,float,float,float,float)
+FUN_L01_00262618	render	NovalisWaterVertices	wrap	Use static rest heights instead of original scrolling-water displacement	void(gaddr)
+FUN_L01_00309bf8	render	NovalisCaveWater_00309bf8	wrap	Tag the three cave water surfaces for enhanced materials	void(void)
+FUN_L00_002afc70	moby	spawn_devastator_missile	wrap	a Devastator missile: the hero's noted for the mods (hero_shots2), a figure's made with it (rac1/host/figure_shots.c, interface 1.14); PAL func_L00_002B0F58	unsigned int (unsigned int, unsigned int, unsigned int, float, float, float, float, float)
+FUN_L00_002ccee0	moby	spawn_ryno_rocket	wrap	an R.Y.N.O. rocket: the hero's noted for the mods (hero_shots2), a figure's made with it (rac1/host/figure_shots.c, interface 1.14); PAL func_L00_002CE390	unsigned int (int, unsigned int, unsigned int, float, float, float)
+FUN_L00_002c82f0	moby	release_glove_of_doom_held_moby	wrap	the Glove of Doom's throw: the hero's noted for the mods (hero_shots2) (rac1/host/figure_shots.c, interface 1.14); PAL func_L00_002C96D0	void (unsigned int, unsigned int, unsigned int)
+FUN_L00_002aa008	moby	initialize_moby_motion_at_position	wrap	the Mine Glove's throw: the hero's noted for the mods (hero_shots2) (rac1/host/figure_shots.c, interface 1.14); PAL func_L00_002AB2A8	void (unsigned int, unsigned int, unsigned int)
+FUN_L00_002c3888	moby	release_moby_with_collision_check	wrap	the Decoy Glove's throw: the hero's noted for the mods (hero_shots2) (rac1/host/figure_shots.c, interface 1.14); PAL func_L00_002C4B90	void (unsigned int, unsigned int, unsigned int)
+FUN_L00_002223f8	hero	HeroEnterMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L00_00222B80	int (int, int)
+FUN_L01_0023cf98	hero	Hero_SetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L01_0023D688	int (int, int)
+FUN_L02_0022b728	hero	HeroL02_SetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L02_0022BE40	int (int, int)
+FUN_L03_00216648	hero	HeroL03_SetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L03_00216D38	int (int, int)
+FUN_L05_0024cee8	hero	Hero_TryMoveStateL05	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L05_0024D680	int (int, int)
+FUN_L06_002356a0	hero	HeroL06_TrySetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L06_00235E08	int (int, int)
+FUN_L08_00230b38	hero	Hero_TryMoveStateL08	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L08_00231228	int (int, int)
+FUN_L11_0024db50	hero	Hero_TrySetMoveStateL11	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L11_0024E240	int (int, int)
+FUN_L12_002400d0	hero	HeroL12_SetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L12_002407C0	int (int, int)
+FUN_L14_0022ff58	hero	Hero_TryMoveStateL14	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L14_002306C8	int (int, int)
+FUN_L15_00216c38	hero	HeroQuartu_TrySetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L15_00217348	int (int, int)
+FUN_L16_0021e398	hero	Hero_TryMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L16_0021EA88	int (int, int)
+FUN_L17_0021e530	hero	HeroL17_SetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L17_0021ED38	int (int, int)
+FUN_L18_00227dd0	hero	HeroL18_SetMoveState	wrap	the hero put in a move state; under a stand-in only the state the update sees changes, for the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L18_002284E0	int (int, int)
+FUN_L00_00210a08	hero	enter_hero_vehicle_mode	wrap	the hero on a ride or as Clank; under a stand-in it is left out: the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L00_002110C0	void (int, int, unsigned int)
+FUN_L01_00231348	hero	enter_hero_vehicle_mode_and_set_moby	wrap	the hero on a ride or as Clank; under a stand-in it is left out: the player standing in is not this game's hero (rac1/host/hero_grab.c); PAL func_L01_00231960	void (int, int, int)
+FUN_L00_00254b58	draw	MobyAnimDecodeLocalPose	wrap	the local pose decoder: a mod's joint offsets on the hero go into its joint records, which the items he wears (O2 mask, helmets) copy (rac1/host/render_native.c); PAL func_L00_00255B90	void(gaddr)
+FUN_L00_0029a6b0	vendor	Vendor_OpenMenu	hook	opens the vendor purchase menu, including the Gadgetron PDA remote vendor; a hook point for mods to prevent opening an empty vendor; PAL func_L00_0029BA20	void (unsigned int)

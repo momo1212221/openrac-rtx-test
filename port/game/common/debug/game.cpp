@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// The debug overlay's game section: the level, the camera, the pad, the functions without C that
+// were called, and the probes (debug/overlay.h).
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <format>
+#include <imgui.h>
+#include <string>
+
+#include "common/stats.h"
+#include "debug/overlay.h"
+#include "openrac/game_host.h"
+#include "openrac/guest.h"
+
+namespace openrac::frontend::debug_overlay {
+
+void game_section(const Shown& shown) {
+    const std::string level = openrac_game_has_level(s.level)
+                                  ? std::format("{} {}", s.level, openrac_game_level_name(s.level))
+                                  : std::string("none (the boot program: title, menus)");
+    text("{}   level {}", s.game, level);
+    std::uint32_t mode = 0;
+
+    if (openrac_game_mode != nullptr && openrac_game_mode(&mode) != 0) {
+        text("tick {}   game mode {}", s.tick, mode);
+    } else if (const openrac_front_end* fe = openrac_game_front_end;
+               fe != nullptr && fe->game_mode != 0) {
+        text("tick {}   game mode {}", s.tick, read<std::int32_t>(fe->game_mode));
+    } else {
+        text("tick {}", s.tick);
+    }
+
+    if (openrac_game_bolts != nullptr && openrac_game_has_level(s.level)) {
+        text("bolts {}", openrac_game_bolts());
+    }
+
+    if (const host::LiveMoby* h = hero()) {
+        text(
+            "hero {:.2f} {:.2f} {:.2f}   state {}",
+            h->matrix[12],
+            h->matrix[13],
+            h->matrix[14],
+            read<std::uint8_t>(h->address + 0x20)
+        );
+    } else {
+        ImGui::TextDisabled("no hero moby");
+    }
+
+    const host::GameState& g = s.state;
+    const auto* freecam = shown.freecam ? shown.camera : nullptr;
+    const auto position = freecam ? freecam->position : g.camera_position;
+    const auto forward = freecam ? camera_forward(*freecam) : g.forward;
+    const float fov_x = freecam ? 1.0f / std::abs(freecam->projection[0]) : g.tan_half_fov_x;
+    const float fov_y = freecam ? 1.0f / std::abs(freecam->projection[5]) : g.tan_half_fov_y;
+    text(
+        "{} {:.2f} {:.2f} {:.2f}",
+        freecam ? "freecam" : "camera",
+        position[0],
+        position[1],
+        position[2]
+    );
+    text(
+        "  forward {:.3f} {:.3f} {:.3f}   tan fov {:.3f} x {:.3f}",
+        forward[0],
+        forward[1],
+        forward[2],
+        fov_x,
+        fov_y
+    );
+    if (freecam && ImGui::Button("Copy freecam JSON")) {
+        const auto json = std::format(
+            "{{\"position\":[{},{},{}],\"forward\":[{},{},{}]}}",
+            position[0],
+            position[1],
+            position[2],
+            forward[0],
+            forward[1],
+            forward[2]
+        );
+        ImGui::SetClipboardText(json.c_str());
+    }
+    text(
+        "  fog {:.0f} {:.0f} {:.0f} from {:.0f} to {:.0f}",
+        g.fog_colour[0] * 255.0f,
+        g.fog_colour[1] * 255.0f,
+        g.fog_colour[2] * 255.0f,
+        g.fog_near,
+        g.fog_far
+    );
+    std::string held;
+
+    for (std::size_t bit = 0; bit < kButtonNames.size(); ++bit) {
+        if ((s.buttons & (1u << bit)) == 0) {
+            held += (held.empty() ? "" : " ") + std::string(kButtonNames[bit]);
+        }
+    }
+
+    text("pad {:#06x} {}", s.buttons, held.empty() ? "(nothing held)" : held);
+    text(
+        "  left stick {} {}   right stick {} {}", s.analog[2], s.analog[3], s.analog[0], s.analog[1]
+    );
+    unsigned functions = 0;
+    const unsigned long calls = openrac_guest_missing_calls(&functions);
+
+    if (functions == 0) {
+        text_coloured(kGreen, "no function without C was called");
+    } else {
+        text_coloured(kRed, "{} calls to {} functions without C", calls, functions);
+
+        if (ImGui::TreeNode("the functions")) {
+            unsigned long count = 0;
+
+            for (unsigned i = 0; i < 64; ++i) {
+                const char* name = openrac_guest_missing_at(i, &count);
+
+                if (name == nullptr) {
+                    break;
+                }
+
+                text("{:8} {}", count, name);
+            }
+
+            ImGui::TreePop();
+        }
+    }
+
+    text_coloured(kDim, "a fault in the game's code ends the program: its report is in the log");
+
+    if (const openrac_game_tools* tools = openrac_game_tools_host; tools != nullptr) {
+        if (tools->give != nullptr && ImGui::Button("give everything")) {
+            tools->give("all");
+        }
+
+        if (tools->heal != nullptr) {
+            ImGui::SameLine();
+
+            if (ImGui::Button("full health")) {
+                tools->heal();
+            }
+        }
+
+        static float place[3]{};
+
+        if (tools->teleport != nullptr) {
+            ImGui::InputFloat3("place", place);
+            ImGui::SameLine();
+
+            if (ImGui::Button("go there")) {
+                tools->teleport(place);
+            }
+        }
+    }
+
+    if (ImGui::TreeNode("probes (the OPENRAC_* switches)")) {
+        for (stats::Probe* p : stats::probes()) {
+            ImGui::Checkbox(p->variable, &p->on);
+
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", p->what);
+            }
+        }
+
+        if (stats::probes().empty()) {
+            ImGui::TextDisabled("none read yet");
+        }
+
+        ImGui::TreePop();
+    }
+}
+
+}  // namespace openrac::frontend::debug_overlay

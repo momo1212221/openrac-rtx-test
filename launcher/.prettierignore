@@ -1,0 +1,11 @@
+dist/
+target/
+.svelte-check/
+src-tauri/
+core/
+node_modules/
+package-lock.json
+actions.json
+.pnp.*
+.yarn/
+src/lib/generated/

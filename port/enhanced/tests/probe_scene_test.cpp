@@ -1,0 +1,670 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include <cfenv>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <limits>
+#include <numbers>
+
+#include "common/json.h"
+#include "enhanced/tools/baker/output/report.h"
+#include "enhanced/tools/baker/sources/activation.h"
+#include "enhanced/tools/baker/sources/level_scene.h"
+#include "enhanced/tools/baker/sources/probe_fingerprint.h"
+#include "enhanced/tools/baker/sources/probe_grid.h"
+#include "tests/check.h"
+
+using namespace openrac;
+using namespace openrac::lighting;
+
+namespace {
+// Printed settings retain both default transport and per-room gains for reproducible bake records.
+void test_profile_report_includes_local_emission() {
+    LevelBakeProfile profile;
+    profile.activation.bake.surface_emission_regions.push_back({{1, 2, 3}, {4, 5, 6}, 8});
+    json::Value report;
+    std::string error;
+    CHECK(json::parse(describe_level_bake_profile(profile), report, error));
+    CHECK(report["surface_emission_scale"].number() == 1);
+    const auto& regions = report["surface_emission_regions"];
+    CHECK(regions.items().size() == 1);
+    CHECK(regions[0]["minimum"][1].number() == 2);
+    CHECK(regions[0]["maximum"][2].number() == 6);
+    CHECK(regions[0]["scale"].number() == 8);
+    CHECK(report["bake_version"].number() == kProbeBakeVersion);
+    CHECK(report["playable_space"]["jump_distance"].number() == 12);
+    CHECK(report["playable_space"]["jump_rise"].number() == 4);
+    CHECK(report["playable_space"]["player_height"].number() == 2.5);
+}
+
+// Inspection reports the same padded payload size as all three GPU-ready texture planes.
+void test_bake_report_counts_gpu_payload() {
+    ProbeGrid grid;
+    grid.map_resolution = 2;
+    const auto packed = decode_gpu_probes(encode_probes(ProbeVolume::allocate(grid)));
+    const auto bytes =
+        packed.gpu_plane(0).size() + packed.gpu_plane(1).size() + packed.gpu_plane(2).size();
+    const auto report =
+        describe_probe_bake(scene::LevelData{}, BakeSceneExport{}, grid, BakeSettings{}, 0);
+    CHECK(
+        report.find("\nmap_and_metadata_bytes " + std::to_string(bytes) + "\n") != std::string::npos
+    );
+    const ProbeBakeReport cached(scene::LevelData{}, BakeSceneExport{}, BakeSettings{}, 0);
+    CHECK(cached.describe(grid) == report);
+    grid.origin = {2, 3, 4};
+    CHECK(cached.describe(grid).find("\nprobe_origin 2 3 4\n") != std::string::npos);
+    CHECK(
+        cached.describe(grid)
+        == describe_probe_bake(scene::LevelData{}, BakeSceneExport{}, grid, BakeSettings{}, 0)
+    );
+}
+
+// Fractional spacing and large scenes must not add cells to an exact repartitioned grid.
+void test_lattice_grid_bounds() {
+    BakeSceneExport scene;
+    scene.bounds_min = {-1000, -1000, -1000};
+    scene.bounds_max = {1000, 1000, 1000};
+    const Float3 spacing{8.0f / 3.0f, 4, 2};
+    const auto grid = lattice_probe_grid(scene, {-5, 10, 20, 5, 14, 23}, spacing, 6);
+    CHECK(grid.origin == (Float3{-5 * spacing[0], 40, 40}));
+    CHECK(grid.dimensions == (std::array<std::uint32_t, 3>{11, 5, 4}));
+
+    // Fractional, reversed, excessive and nonfinite indices are rejected before allocation.
+    for (const std::array<float, 6> cells :
+         {std::array<float, 6>{.5f, 0, 0, 4, 4, 4},
+          std::array<float, 6>{4, 0, 0, 0, 4, 4},
+          std::array<float, 6>{0, 0, 0, 100'000, 4, 4},
+          std::array<float, 6>{0, 0, 0, std::numeric_limits<float>::infinity(), 4, 4}}) {
+        bool rejected = false;
+
+        try {
+            [[maybe_unused]] const auto rejected_grid =
+                lattice_probe_grid(scene, cells, spacing, 6);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+
+        CHECK(rejected);
+    }
+}
+}  // namespace
+
+int main() {
+    test_profile_report_includes_local_emission();
+    test_bake_report_counts_gpu_payload();
+    test_lattice_grid_bounds();
+    scene::LevelData level;
+    level.level = 3;
+    level.light_sets.resize(256);
+    level.light_sets[0] = 1;
+    level.light_sets[1] = 0.5f;
+    level.light_sets[2] = 0.25f;
+    level.light_sets[6] = -1;
+    level.materials.push_back({});
+    scene::Vertex a{}, b{}, c{};
+    b.position[0] = 1;
+    c.position[1] = 1;
+    a.colour[0] = 100;
+    b.colour[1] = 99;
+    c.colour[2] = 98;  // prelit data must not become albedo
+    level.vertices = {a, b, c};
+    level.indices = {0, 1, 2};
+    scene::Model model;
+    model.primitives.push_back({0, 3, 0, -1});
+    level.models.push_back(model);
+    scene::Instance instance;
+    instance.matrix = renderer::translation({10, 20, 30});
+    level.instances[static_cast<std::size_t>(scene::Layer::Terrain)].push_back(instance);
+    instance.matrix = renderer::translation({40, 50, 60});
+    level.instances[static_cast<std::size_t>(scene::Layer::Ties)].push_back(instance);
+    instance.matrix = renderer::translation({100, 200, 300});
+    level.instances[static_cast<std::size_t>(scene::Layer::Mobys)].push_back(instance);
+    auto exported = export_probe_scene(level, 0, {0.1f, 0.1f, 0.1f});
+    CHECK(exported.scene.triangles.size() == 2);
+    CHECK((exported.scene.triangles[0].vertices[0] == Float3{10, 20, 30}));
+    CHECK((exported.scene.triangles[1].vertices[0] == Float3{40, 50, 60}));
+    CHECK((exported.scene.triangles[0].diffuse == Float3{1, 1, 1}));
+    CHECK(exported.scene.suns.size() == 1);
+    {
+        auto liquid = level;
+        liquid.bake_surfaces.push_back(
+            liquid.instances[static_cast<std::size_t>(scene::Layer::Terrain)][0]
+        );
+        const auto lava = export_probe_scene(liquid, 0, {.1f, .1f, .1f});
+        CHECK(lava.surface_instances == 1);
+        CHECK(lava.scene.triangles.size() == exported.scene.triangles.size() + 1);
+        CHECK(lava.scene_hash != exported.scene_hash);
+
+        for (unsigned layer = 0; layer < scene::kLayerCount; ++layer) {
+            CHECK(liquid.instances[layer].size() == level.instances[layer].size());
+        }
+    }
+    {
+        auto emitting = level;
+        emitting.materials[0].emission = {1, 2, 3};
+        auto shared = export_probe_scene(emitting, 0, {.1f, .1f, .1f});
+        CHECK(shared.scene.triangles[0].emission == emitting.materials[0].emission);
+        emitting.materials[0].emission[0] = 2;
+        CHECK(shared.scene_hash != export_probe_scene(emitting, 0, {.1f, .1f, .1f}).scene_hash);
+        emitting.materials[0].emission[0] = 1;
+        emitting.materials[0].emission_vertex_colour = true;
+        emitting.materials[0].emission_contrast = 1.5f;
+        emitting.materials[0].diffuse_scale = 0;
+        emitting.vertices[0].colour[0] = .25f;
+        emitting.vertices[0].colour[1] = 1;
+        const auto tinted = export_probe_scene(emitting, 0, {.1f, .1f, .1f});
+        CHECK(tinted.scene.triangles[0].emission_vertex_colour);
+        CHECK(tinted.scene.triangles[0].emission_contrast == 1.5f);
+        emitting.materials[0].emission_contrast = 2;
+        CHECK(tinted.scene_hash != export_probe_scene(emitting, 0, {.1f, .1f, .1f}).scene_hash);
+        emitting.materials[0].emission_contrast = 1.5f;
+        CHECK(tinted.scene.triangles[0].emission_colours[0][0] == .25f);
+        CHECK(tinted.scene.triangles[0].diffuse_scale == 0);
+        emitting.light_colours = {32u | (64u << 8) | (128u << 16)};
+        emitting.instances[static_cast<std::size_t>(scene::Layer::Terrain)][0].lights = 0;
+        const auto slot_colours = export_probe_scene(emitting, 0, {.1f, .1f, .1f});
+        CHECK((slot_colours.scene.triangles[0].emission_colours[0] == Float3{.25f, .5f, 1}));
+        emitting.instances[static_cast<std::size_t>(scene::Layer::Terrain)][0].lights = -1;
+        emitting.materials[0].bake_intensity = 4;
+        const auto overridden = export_probe_scene(emitting, 0, {.1f, .1f, .1f});
+        CHECK((overridden.scene.triangles[0].emission == Float3{4, 4, 4}));
+        CHECK(overridden.scene.triangles[0].fixed_emission);
+        CHECK(overridden.scene_hash != tinted.scene_hash);
+        CHECK((emitting.materials[0].emission == Float3{1, 2, 3}));
+        emitting.materials[0].bake_intensity = 0;
+        const auto disabled = export_probe_scene(emitting, 0, {.1f, .1f, .1f});
+        CHECK(disabled.scene.triangles[0].emission == Float3{});
+    }
+    {
+        auto holders = level;
+        holders.moby_classes[1038] = {0, false};
+        const auto e = export_probe_scene(holders, 0, {.1f, .1f, .1f});
+        CHECK(e.scene.point_emitters.size() == 1);
+        CHECK((e.scene.point_emitters[0].position == Float3{100, 200, 300.85f}));
+        CHECK(e.scene.triangles.size() == exported.scene.triangles.size());
+        CHECK(e.scene_hash != exported.scene_hash);
+    }
+    CHECK(exported.scene.primary_directional_colour[0] == 1.0f);
+    {
+        auto without_primary = level;
+        without_primary.light_sets[4] = without_primary.light_sets[5] =
+            without_primary.light_sets[6] = 0;
+        const auto e = export_probe_scene(without_primary, 0, {.1f, .1f, .1f});
+        CHECK(e.scene.primary_directional_colour[0] == 1.0f);
+    }
+    CHECK(exported.scene.suns[0].irradiance[0] == std::numbers::pi_v<float>);
+    CHECK((exported.bounds_max == Float3{100, 200, 300}));
+    {
+        auto props = level;
+        auto& prop = props.instances[static_cast<std::size_t>(scene::Layer::Mobys)][0];
+        prop.bake_static = true;
+        prop.tint = {.5f, 1, 1, 1};
+
+        for (auto& v : props.vertices) {
+            std::fill(std::begin(v.colour), std::end(v.colour), 1.0f);
+        }
+
+        props.vertices[0].colour[0] = .25f;
+        auto selected = export_probe_scene(props, 0, {.1f, .1f, .1f});
+        CHECK(selected.scene.triangles.size() == 3);
+        CHECK(selected.instances[3] == 1 && selected.skipped_mobys == 0);
+        CHECK((selected.scene.triangles.back().vertices[0] == Float3{100, 200, 300}));
+        CHECK(selected.scene.triangles.back().multipliers[0][0] == .125f);
+        CHECK(selected.scene_hash != exported.scene_hash);
+        props.vertices[0].colour[0] = .5f;
+        CHECK(export_probe_scene(props, 0, {.1f, .1f, .1f}).scene_hash != selected.scene_hash);
+        auto excluded = [&] {
+            const auto e = export_probe_scene(props, 0, {.1f, .1f, .1f});
+            CHECK(e.scene.triangles.size() == 2);
+            CHECK(e.instances[3] == 0 && e.skipped_mobys == 1);
+        };
+        prop.stand_in = true;
+        excluded();
+        prop.stand_in = false;
+        props.models[0].joints = 1;
+        excluded();
+        props.models[0].joints = 0;
+        prop.palette = 0;
+        excluded();
+        prop.palette = -1;
+        prop.blend = 1;
+        excluded();
+        prop.blend = 0;
+        prop.tint[3] = .5f;
+        excluded();
+        prop.tint[3] = 1;
+        props.vertices[0].light_slot = -2;
+        const auto glow = export_probe_scene(props, 0, {.1f, .1f, .1f});
+        CHECK(glow.scene.triangles.size() == 2 && glow.skipped_glow == 1);
+        CHECK(exported.skipped_mobys == 1);  // no heuristic opt-in for unskinned objects
+        props.materials[0].emission = {0, 3, 0};
+        const auto emitting = export_probe_scene(props, 0, {.1f, .1f, .1f});
+        CHECK(emitting.emissive_triangles == 3);
+        CHECK(emitting.skipped_glow == 0);
+        CHECK((emitting.scene.triangles.back().diffuse == Float3{}));
+        CHECK((emitting.scene.triangles.back().emission == Float3{0, 3, 0}));
+        CHECK(emitting.scene_hash != selected.scene_hash);
+    }
+    {
+        auto sky_level = level;
+        sky_level.sky_panorama = renderer::Rgba8Image(2, 1);
+        sky_level.sky_panorama.pixels = {128, 128, 128, 255, 0, 0, 255, 255};
+        auto sky_export = export_probe_scene(sky_level, 0, {.1f, .1f, .1f});
+        CHECK(sky_export.scene.sky_width == 2 && sky_export.scene.sky_height == 1);
+        CHECK(std::abs(sky_export.scene.sky_radiance[0][0] - .21586f) < .0001f);
+        CHECK(sky_export.scene.sky_radiance[1][2] == 1);
+        CHECK(sky_export.scene_hash != exported.scene_hash);
+        sky_level.sky_panorama.pixels[6] = 0;
+        CHECK(
+            export_probe_scene(sky_level, 0, {.1f, .1f, .1f}).scene_hash != sky_export.scene_hash
+        );
+        sky_level.sky_panorama = renderer::Rgba8Image(512, 256);
+
+        for (int y = 0; y < 256; ++y) {
+            for (int x = 0; x < 512; ++x) {
+                sky_level.sky_panorama
+                    .set_texel(x, y, (x % 2 == 0 && y % 2 == 0) ? 0xffffffffu : 0xff000000u);
+            }
+        }
+
+        sky_export = export_probe_scene(sky_level, 0, {.1f, .1f, .1f});
+        CHECK(sky_export.scene.sky_width == 256 && sky_export.scene.sky_height == 128);
+
+        for (const auto& pixel : sky_export.scene.sky_radiance) {
+            CHECK(std::abs(pixel[0] - .25f) < .00001f);
+        }
+    }
+    level.vertices[0].colour[0] = 0;
+    CHECK(export_probe_scene(level, 0, {0.1f, 0.1f, 0.1f}).scene_hash != exported.scene_hash);
+    level.vertices[0].colour[0] = 100;
+
+    // Source shading normals are not bake geometry. Flipped, zero, non-unit
+    // and nonfinite normals must not enter transport or placement inputs.
+    for (Float3 normal :
+         {Float3{0, 0, 1},
+          Float3{0, 0, -1},
+          Float3{},
+          Float3{100, -50, 4},
+          Float3{std::numeric_limits<float>::quiet_NaN(), 0, 0},
+          Float3{0, std::numeric_limits<float>::infinity(), 0}}) {
+        for (auto& vertex : level.vertices) {
+            std::copy(normal.begin(), normal.end(), vertex.normal);
+        }
+
+        const auto changed = export_probe_scene(level, 0, {0.1f, 0.1f, 0.1f});
+        CHECK(changed.scene_hash == exported.scene_hash);
+        CHECK(changed.scene.triangles.size() == exported.scene.triangles.size());
+
+        for (std::size_t i = 0; i < changed.scene.triangles.size(); ++i) {
+            const auto& actual = changed.scene.triangles[i];
+            const auto& expected = exported.scene.triangles[i];
+            CHECK(actual.vertices == expected.vertices);
+            CHECK(actual.diffuse == expected.diffuse);
+            CHECK(actual.uv == expected.uv);
+            CHECK(actual.texture == expected.texture);
+            CHECK(actual.alpha_cutoff == expected.alpha_cutoff);
+        }
+    }
+
+    level.materials[0].colour[0] = 0.5f;
+    CHECK(export_probe_scene(level, 0, {0.1f, 0.1f, 0.1f}).scene_hash != exported.scene_hash);
+    const auto grid = sparse_probe_grid(exported, 128, 8);
+    grid.validate();
+    CHECK(grid.probe_count() > 0);
+    const auto local = bounded_probe_grid(exported, {10, 20, 30}, {30, 40, 50}, 4, 8);
+    CHECK((local.origin == Float3{8, 20, 28}));
+    CHECK((local.dimensions == std::array<std::uint32_t, 3>{7, 6, 7}));
+    CHECK(local.scene_hash == grid.scene_hash);
+    CHECK(std::abs(local.max_distance - 1.5f * std::sqrt(48.0f)) < 0.0001f);
+    const auto vertical =
+        bounded_probe_grid(exported, {10, 20, 30}, {30, 40, 50}, Float3{4, 4, 2}, 8);
+    CHECK((vertical.spacing == Float3{4, 4, 2}));
+    CHECK((vertical.origin == Float3{8, 20, 30}));
+    CHECK((vertical.dimensions == std::array<std::uint32_t, 3>{7, 6, 11}));
+    CHECK(vertical.max_distance == 9);  // 1.5 times the 4x4x2 cell diagonal
+    vertical.validate();
+    auto large_scene = exported;
+    large_scene.bounds_min = {-1000, -1000, -1000};
+    large_scene.bounds_max = {1000, 1000, 1000};
+    const auto fine_local = bounded_probe_grid(large_scene, {0, 0, 0}, {8, 8, 8}, 2, 8);
+    CHECK(fine_local.probe_count() == 125);
+    CHECK(std::abs(fine_local.max_distance - 1.5f * std::sqrt(12.0f)) < 0.0001f);
+    CHECK(
+        bounded_probe_grid(exported, {0, 0, 0}, {8, 8, 8}, 2, 8).max_distance
+        == fine_local.max_distance
+    );  // far-away scene bounds cannot inflate wall moments
+
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        CHECK(grid.origin[axis] < exported.bounds_min[axis]);
+        CHECK(
+            grid.origin[axis] + grid.spacing[axis] * static_cast<float>(grid.dimensions[axis] - 1)
+            > exported.bounds_max[axis]
+        );
+    }
+
+    BakeSettings settings;
+    const auto hash = probe_bake_settings_hash(grid, settings);
+    auto sky_settings = settings;
+    sky_settings.use_level_sky = false;
+    CHECK(probe_bake_settings_hash(grid, sky_settings) != hash);
+    sky_settings = settings;
+    sky_settings.sky_intensity = 2;
+    CHECK(probe_bake_settings_hash(grid, sky_settings) != hash);
+    sky_settings = settings;
+    sky_settings.sky_weight = 0.3f;
+    CHECK(probe_bake_settings_hash(grid, sky_settings) != hash);
+    sky_settings = settings;
+    sky_settings.sunlight_scale = {.4f, .7f, 1.2f};
+    CHECK(probe_bake_settings_hash(grid, sky_settings) != hash);
+    sky_settings = settings;
+    sky_settings.sunlight_direction = Float3{0, 1, -1};
+    CHECK(probe_bake_settings_hash(grid, sky_settings) != hash);
+    auto placement_settings = settings;
+    placement_settings.min_inside_fraction = 0.875f;
+    CHECK(probe_bake_settings_hash(grid, placement_settings) != hash);
+    settings.rays_per_probe *= 2;
+    CHECK(probe_bake_settings_hash(grid, settings) != hash);
+    level.materials[0].blend = true;
+    bool rejected = false;
+
+    try {
+        export_probe_scene(level, 0, {0.1f, 0.1f, 0.1f});
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+
+    CHECK(rejected);
+    // Runtime activation without a graphics context: correct inputs accepted;
+    // stale geometry, different settings and the wrong region are rejected.
+    level.materials[0].colour[0] = 1;
+    level.materials[0].blend = false;
+    auto active_grid = grid;
+    active_grid.game_version = "rac1-ntsc";
+    active_grid.level = 3;
+    ProbeActivation expected;
+    active_grid.settings_hash = probe_bake_settings_hash(active_grid, expected.bake);
+    auto volume = ProbeVolume::allocate(active_grid);
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path()
+                      / ("openrac_probe_activation_" + std::to_string(unique));
+
+    if (!std::filesystem::create_directory(root)) {
+        throw std::runtime_error("test directory already exists");
+    }
+
+    // Shared defaults, partial level/mod overrides and invalid profiles.
+    CHECK((LevelBakeProfile{}.sparse_spacing == Float3{256, 256, 256}));
+    CHECK((load_level_bake_profile(root).sparse_spacing == Float3{256, 256, 256}));
+    CHECK(BakeSettings{}.sky_intensity == 1.0f);
+    CHECK(BakeSettings{}.sky_weight == 0.7f);
+    CHECK(load_level_bake_profile(root).activation.bake.sky_weight == 0.7f);
+    CHECK(BakeSettings{}.terrain_vertex_albedo);
+    CHECK(load_level_bake_profile(root).activation.bake.terrain_vertex_albedo);
+    CHECK(load_level_bake_profile(root).activation.bake.sky_intensity == 1.0f);
+    const auto defaults = load_level_bake_profile(root);
+    CHECK(defaults.activation.bake.adaptive_rays);
+    CHECK(!defaults.explicit_ray_policy);
+    const auto profile_path = root / "probe-bake.json";
+    auto profile_source = [&](const char* text) {
+        std::ofstream output(profile_path);
+        output << text;
+    };
+    profile_source(
+        R"({"version":1,"rays":128,"adaptive_rays":true,"adaptive_split_visibility":false})"
+    );
+    const auto adaptive = load_level_bake_profile(root);
+    CHECK(adaptive.explicit_ray_policy);
+    CHECK(adaptive.activation.bake.adaptive_rays);
+    CHECK(!adaptive.legacy_sampling.split_visibility);
+    CHECK(adaptive.legacy_sampling.sobol);
+    profile_source(R"({"version":1})");
+    CHECK((load_level_bake_profile(root).sparse_spacing == Float3{256, 256, 256}));
+    CHECK(load_level_bake_profile(root).activation.bake.sky_weight == 0.7f);
+    CHECK(load_level_bake_profile(root).activation.bake.terrain_vertex_albedo);
+    profile_source(
+        R"({"version":1,"regions":{"coarse_bounds":"local_regions","coarse_padding":128}})"
+    );
+    CHECK((load_level_bake_profile(root).sparse_spacing == Float3{256, 256, 256}));
+    profile_source(R"({"version":1,"relocation_max_fraction":0.45})");
+    CHECK(load_level_bake_profile(root).activation.bake.relocation_max_fraction == 0.45f);
+    profile_source(R"({"version":1,"sunlight_direction":[0,3,-4]})");
+    const auto direction_profile = load_level_bake_profile(root);
+    CHECK(direction_profile.activation.bake.sunlight_direction.has_value());
+    CHECK(std::abs((*direction_profile.activation.bake.sunlight_direction)[1] - .6f) < 1e-6f);
+    CHECK(std::abs((*direction_profile.activation.bake.sunlight_direction)[2] + .8f) < 1e-6f);
+    profile_source(R"({"version":1,"sunlight_direction":null})");
+    CHECK(!load_level_bake_profile(root).activation.bake.sunlight_direction);
+    profile_source(R"({"version":1,"terrain_vertex_albedo":false})");
+    CHECK(!load_level_bake_profile(root).activation.bake.terrain_vertex_albedo);
+    profile_source(
+        R"({"version":1,"environment_probes":{"enabled":true,"resolution":64,"maximum_probes":8,"normal_bias":0.25}})"
+    );
+    const auto reflection_profile = load_level_bake_profile(root);
+    CHECK(reflection_profile.environment.enabled);
+    CHECK(reflection_profile.environment.resolution == 64);
+    CHECK(reflection_profile.environment.maximum_probes == 8);
+    profile_source(
+        R"({"version":1,"environment_probes":{"merge_enabled":false,"merge_overlap":0.97,"merge_loss_fraction":0,"merge_max_misses":0,"minimum_space_area":8,"merge_brightness_ratio":3,"merge_colour_distance":0.08}})"
+    );
+    const auto merging = load_level_bake_profile(root).environment;
+    CHECK(
+        !merging.merge_enabled && merging.merge_overlap == .97f && merging.merge_loss_fraction == 0
+        && merging.merge_max_misses == 0 && merging.minimum_space_area == 8
+        && merging.merge_brightness_ratio == 3 && merging.merge_colour_distance == .08f
+    );
+    profile_source(R"({"version":1,"environment_probes":{"enabled":true,"maximum_probes":256}})");
+    CHECK(load_level_bake_profile(root).environment.maximum_probes == 256);
+    CHECK(reflection_profile.environment.normal_bias == .25f);
+    profile_source(R"({"version":1,"sky_intensity":0.75,"sky_weight":0.3,"rays":32,"bounces":2,
+        "environment":[0.1,0.2,0.3],"sparse_spacing":[64,64,64],
+        "dense_spacing":[4,4,2],"resolution":6,"light_set":2,"sunlight_scale":[0.4,0.7,1.2],
+        "sunlight_direction":[0,3,-4]})");
+
+    auto profile = load_level_bake_profile(root);
+    CHECK(profile.activation.bake.sky_intensity == 0.75f);
+    CHECK(profile.activation.bake.sky_weight == 0.3f);
+    CHECK(profile.activation.bake.terrain_vertex_albedo);
+    CHECK((profile.activation.bake.sunlight_scale == Float3{.4f, .7f, 1.2f}));
+    const int profile_rounding = std::fegetround();
+    std::fesetround(FE_TOWARDZERO);
+    const auto game_profile = load_level_bake_profile(root);
+    CHECK(std::fegetround() == FE_TOWARDZERO);
+    std::fesetround(profile_rounding);
+    CHECK(game_profile.activation.bake.sunlight_scale == profile.activation.bake.sunlight_scale);
+    CHECK(
+        game_profile.activation.bake.sunlight_direction
+        == profile.activation.bake.sunlight_direction
+    );
+    CHECK(profile.activation.bake.rays_per_probe == 32);
+    CHECK(!profile.activation.bake.adaptive_rays);
+    CHECK(profile.activation.bake.bounces == 2);
+    CHECK(profile.activation.light_set == 2);
+    CHECK(profile.activation.environment[1] == 0.2f);
+    CHECK(profile.sparse_spacing[0] == 64);
+    CHECK(profile.dense_spacing[2] == 2);
+    CHECK(profile.activation.bake.surface_emission_scale == 1);
+    const auto mod = root / "mod";
+    std::filesystem::create_directory(mod);
+    {
+        std::ofstream output(mod / "probe-bake.json");
+        output
+            << R"({"version":1,"sky_intensity":2,"surface_emission_scale":6,"surface_emission_regions":[{"minimum":[1,2,3],"maximum":[4,5,6],"scale":8}],"sunlight_direction":null})";
+    }
+    profile = load_level_bake_profile(root, mod);
+    CHECK(profile.activation.bake.sky_intensity == 2);
+    CHECK(profile.activation.bake.surface_emission_scale == 6);
+    CHECK(profile.activation.bake.surface_emission_regions.size() == 1);
+    CHECK(profile.activation.bake.surface_emission_regions[0].scale == 8);
+    CHECK(profile.activation.bake.surface_emission_regions[0].minimum[1] == 2);
+    CHECK(!profile.activation.bake.sunlight_direction);
+    CHECK(profile.activation.bake.rays_per_probe == 32);
+    std::filesystem::remove(mod / "probe-bake.json");
+    std::filesystem::remove(mod);
+
+    for (const auto* invalid :
+         {R"({"version":2})",
+          R"({"version":1,"sky_intensitty":1})",
+          R"({"version":1,"sky_intensity":-1})",
+          R"({"version":1,"surface_emission_scale":-1})",
+          R"({"version":1,"surface_emission_regions":{}})",
+          R"({"version":1,"surface_emission_regions":[{"minimum":[1,2,3],"maximum":[0,5,6],"scale":8}]})",
+          R"({"version":1,"sky_weight":1.1})",
+          R"({"version":1,"sky_weight":-0.1})",
+          R"({"version":1,"sunlight_scale":[-0.1,1,1]})",
+          R"({"version":1,"sunlight_scale":[1,5,1]})",
+          R"({"version":1,"sunlight_scale":0.5})",
+          R"({"version":1,"sunlight_direction":[0,0,0]})",
+          R"({"version":1,"sunlight_direction":[0,1]})",
+          R"({"version":1,"sunlight_direction":[0,"bad",1]})",
+          R"({"version":1,"sunlight_direction":[0,1e30,1]})",
+          R"({"version":1,"terrain_vertex_albedo":1})",
+          R"({"version":1,"regions":[]})",
+          R"({"version":1,"rays":16.5})",
+          R"({"version":1,"rays":8})",
+          R"({"version":1,"sparse_spacing":[1,0,1]})",
+          R"({"version":1,"relocation_max_fraction":0.46})",
+          R"({"version":1,"relocation_max_fraction":0.5})"}) {
+        profile_source(invalid);
+        bool denied = false;
+
+        try {
+            load_level_bake_profile(root);
+        } catch (const std::runtime_error&) {
+            denied = true;
+        }
+
+        CHECK(denied);
+    }
+
+    std::filesystem::remove(profile_path);
+    level.dir = root;
+    const auto asset = root / "test.orpg", manifest = root / "manifest.json";
+    auto identity = [&](const char* version) {
+        std::ofstream output(manifest);
+        output << "{\"game\":\"rac1\",\"version\":\"" << version << "\"}";
+    };
+    identity("ntsc");
+    const auto geometry = root / "fixture.glb";
+    auto geometry_source = [&](const char* text) {
+        std::ofstream output(geometry);
+        output << text;
+    };
+    geometry_source("first geometry fixture");
+    volume.grid.scene_hash = export_probe_scene(level, 0, expected.environment).scene_hash;
+    // Activation fingerprints the same files without building the transport scene.
+    CHECK(probe_activation_hash(level, 0, expected.environment) == volume.grid.scene_hash);
+    {
+        std::ofstream(root / "pvs.json") << "camera-only visibility metadata";
+        std::ofstream(root / "pvs.bin", std::ios::binary) << "camera grid fixture";
+        CHECK(
+            export_probe_scene(level, 0, expected.environment).scene_hash == volume.grid.scene_hash
+        );
+        std::filesystem::remove(root / "pvs.json");
+        std::filesystem::remove(root / "pvs.bin");
+    }
+    {
+        const auto profile = root / "ocean-profile.json";
+        std::ofstream(profile) << R"({"wind_heading":90})";
+        CHECK(
+            export_probe_scene(level, 0, expected.environment).scene_hash == volume.grid.scene_hash
+        );
+        std::filesystem::remove(profile);
+    }
+    const auto bytes = encode_probes(volume);
+    {
+        std::ofstream output(asset, std::ios::binary);
+        output.write(
+            reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())
+        );
+    }
+    auto refuses = [&](const ProbeActivation& wanted) {
+        bool denied = false;
+
+        try {
+            load_level_probes(asset, level, wanted);
+        } catch (const std::runtime_error&) {
+            denied = true;
+        }
+
+        CHECK(denied);
+    };
+    CHECK(load_level_probes(asset, level, expected).grid.scene_hash == volume.grid.scene_hash);
+    auto adaptive_default = expected;
+    adaptive_default.bake.adaptive_rays = true;
+    refuses(adaptive_default);
+    ProbeAssetLoader previous_default_session(level, adaptive_default);
+    CHECK(
+        previous_default_session.load_with_previous_defaults(asset, {}).grid.settings_hash
+        == volume.grid.settings_hash
+    );
+    CHECK(previous_default_session.load(asset).grid.settings_hash == volume.grid.settings_hash);
+    {
+        auto old_adaptive = volume;
+        auto settings = adaptive_default.bake;
+        const LegacyProbeSampling legacy{.split_visibility = false};
+        old_adaptive.grid.settings_hash =
+            probe_bake_settings_hash(old_adaptive.grid, settings, &legacy);
+        const auto old_bytes = encode_probes(old_adaptive);
+        {
+            std::ofstream output(asset, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(old_bytes.data()), old_bytes.size());
+        }
+        ProbeAssetLoader session(level, adaptive_default);
+        LevelBakeProfile profile;
+        profile.legacy_sampling = legacy;
+        CHECK(
+            session.load_with_previous_defaults(asset, profile).grid.settings_hash
+            == old_adaptive.grid.settings_hash
+        );
+        CHECK(session.load(asset).grid.settings_hash == old_adaptive.grid.settings_hash);
+        std::ofstream output(asset, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+    {
+        const ProbeAssetLoader session(level, expected);
+        CHECK(session.load(asset).grid.scene_hash == volume.grid.scene_hash);
+        auto stale = volume;
+        stale.grid.scene_hash ^= 1;
+        const auto stale_bytes = encode_probes(stale);
+        {
+            std::ofstream output(asset, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(stale_bytes.data()), stale_bytes.size());
+        }
+        bool denied = false;
+
+        try {
+            session.load(asset);
+        } catch (const std::runtime_error&) {
+            denied = true;
+        }
+
+        CHECK(denied);
+        {
+            std::ofstream output(asset, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        CHECK(session.load(asset).grid.scene_hash == volume.grid.scene_hash);
+    }
+    const auto previous_rounding = std::fegetround();
+    std::fesetround(FE_TOWARDZERO);
+    CHECK(load_level_probes(asset, level, expected).grid.scene_hash == volume.grid.scene_hash);
+    std::fesetround(previous_rounding);
+    {
+        std::ofstream(root / "probe-emission.json") << "{\"fixture\":{\"runtime_intensity\":1}}";
+        refuses(expected);
+        std::filesystem::remove(root / "probe-emission.json");
+    }
+    geometry_source("changed geometry fixture");
+    refuses(expected);
+    geometry_source("first geometry fixture");
+    ProbeActivation different = expected;
+    different.bake.rays_per_probe *= 2;
+    refuses(different);
+    identity("pal");
+    refuses(expected);
+    std::filesystem::remove(asset);
+    std::filesystem::remove(manifest);
+    std::filesystem::remove(geometry);
+    std::filesystem::remove(root);
+    return test::result();
+}

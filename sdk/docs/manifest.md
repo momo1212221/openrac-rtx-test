@@ -1,0 +1,120 @@
+# The manifest: `openrac-mod.json`
+
+Every mod has one, at the top of its folder. The launcher reads it to show the
+mod and decide whether it can run; the game reads it again at start. Both apply
+the same rules, and the SDK's `tools/package_mod.py --check openrac-mod.json`
+checks a manifest the same way.
+
+## A script mod
+
+```json
+{
+  "format": 2,
+  "id": "button-swap",
+  "name": "Button swap",
+  "version": "1.0.0",
+  "author": "Your name",
+  "description": "Swaps two buttons of the pad.",
+  "license": "MIT",
+  "homepage": "https://github.com/you/your-mods",
+  "type": "script",
+  "api": "1.1",
+  "scripts": ["main.luau"],
+  "games": { "rac1": ["pal", "ntsc"] },
+  "settings": [
+    { "key": "pair", "name": "Buttons", "type": "choice", "default": "cross-square",
+      "choices": [ { "value": "cross-square", "name": "Cross and Square" },
+                   { "value": "l1-r1", "name": "L1 and R1" } ] }
+  ]
+}
+```
+
+## A native mod
+
+```json
+{
+  "format": 2,
+  "id": "lock-strafe",
+  "name": "Lock-strafe",
+  "version": "1.0.0",
+  "author": "OpenRAC contributors",
+  "description": "Strafe as in the later games.",
+  "api": "1.0",
+  "games": { "rac1": ["pal", "ntsc"] },
+  "plugin": {
+    "macos-arm64": "lib/macos-arm64/lock_strafe.dylib",
+    "linux-x86_64": "lib/linux-x86_64/lock_strafe.so",
+    "windows-x86_64": "lib/windows-x86_64/lock_strafe.dll"
+  },
+  "hooks": ["rac1.pad.process_report", "rac1.player.turn_to_heading"]
+}
+```
+
+You do not write `plugin` by hand: the SDK's CMake (`openrac_add_mod`) fills in
+the platform it built, and `package_mod.py --merge` joins the platforms
+([packaging](packaging-and-releases.md)).
+
+## Fields
+
+| Field | Required | What it is |
+|---|---|---|
+| `format` | yes | `2`. (A file with `"format": 1` is a data pack of textures, models or levels, made by the level editor.) |
+| `id` | yes | Lower-case letters, digits and single hyphens, at most 64 characters: `big-jump`. It never changes between versions: the launcher replaces an installed mod of the same id. |
+| `name` | yes | What players see. |
+| `version` | yes | `MAJOR.MINOR.PATCH`, optionally `-suffix` (`1.2.0`, `2.0.0-beta`). Raise it for each release: updates compare versions. |
+| `author`, `description`, `license` | no | Shown in the launcher. |
+| `homepage` | no | An `https://` address, shown as the mod's source. |
+| `type` | no | `"native"` (the default) or `"script"`. |
+| `api` | yes | The mod interface you wrote for, `MAJOR.MINOR`: `"1.0"` for native mods, `"1.1"` or later for script mods. A game whose interface has another major version, or a lower minor, does not load the mod and says why. |
+| `games` | yes | The games and the discs the mod is for: `{"rac1": ["pal", "ntsc"]}` (PAL and NTSC-U), or several games, `{"rac1": ["pal", "ntsc"], "rac2": ["ntsc", "pal", "ntsc2"]}` ([several games](#a-mod-for-several-games)). |
+| `scripts` | script mods | The `.luau` files to run at start, in order, as paths inside the mod (forward slashes). |
+| `plugin` | native mods | Platform to library path inside the mod. Platforms: `macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-arm64`, `android-arm64`. |
+| `hooks` | no | The hook points the mod takes, by id (`rac1.player.take_damage`) or alias (`Hero_TakeDamage`) ([hooks](hooks.md)); a mod for several games names them by id. `package_mod.py` checks each against the SDK's table of its game. The launcher shows which mods share a hook point. |
+| `settings` | no | Options for players ([settings](settings.md)). |
+| `vulkan_device` | no | `true` for a native mod of `api` 1.4 or later that makes the Vulkan device with the port (`setup_vulkan`, [views](views.md)): the mods then load before the window opens. Ignored otherwise. |
+| `multiplayer` | no | What the mod is to a multiplayer party (interface 1.14). `gameplay` (the default, the safe choice): every game of a party must have the same version and settings. `input`, `cosmetic`: each player's own. `solo`: it cannot be played in a party. A setting of a gameplay mod may say `"multiplayer": "own"` (each player's) or `"host"` (the host's party rules bring it): neither is compared. |
+| `requires` | no | Mods that must be on, and load before this one: `[{"id": "other-mod", "version": ">=1.2.0"}]` (`version` is `>=X.Y.Z`, `=X.Y.Z`, or left out). |
+| `conflicts` | no | Mods it cannot run with: `[{"id": "other-strafe", "reason": "both take L2 and R2"}]`. |
+| `load` | no | Order hints: `{"after": ["camera-tweaks"], "before": []}`. The launcher places the mod accordingly when it is switched on. |
+| `touch` | no | Since 1.13: a `.json` file in the mod with touch buttons and icons (MODS.md, "Touch controls"). The icons it names are packed too. |
+
+## A mod for several games
+
+One mod can serve several games: one manifest, one release, installed in each
+game it names. `games` lists each with its discs; the game passes its id and
+disc to the mod (`openrac_api.game` and `.version`, `openrac.game` and
+`openrac.version` in a script), and the mod runs its code for that game. A
+native mod is still one library per platform, with every game's code in it:
+
+```c
+OPENRAC_MOD_EXPORT int openrac_mod_load(const openrac_api* api, openrac_mod* mod) {
+    if (strcmp(api->game, "rac1") == 0) return rac1_load(api, mod);
+    if (strcmp(api->game, "rac2") == 0) return rac2_load(api, mod);
+    return 1; /* the manifest lists no other */
+}
+```
+
+- `hooks` names every game's hook points **by id**: `rac1.player.take_damage`,
+  `rac2.player.take_damage`. An id says its game, so each game counts only its
+  own; an alias could name a hook point of either. A rac2 hook point that does
+  a rac1 one's job has the same `<area>.<name>`.
+- `settings` are one list. A setting only some games can honour says so with
+  `"games": ["rac1"]`: the launcher shows it for those games only, and the
+  other games give the mod its default. Presets may still name it.
+- Everything else (`id`, `version`, `api`, `multiplayer`, `requires`, ...) is
+  the mod's, the same in every game; `api` is the newest any of its games needs.
+
+The openrac-mods repository's
+[docs/MULTI_GAME.md](https://github.com/OpenRAC/openrac-mods/blob/master/docs/MULTI_GAME.md)
+lays out such a mod's folder (`src/common`, `src/rac1`, `src/rac2`).
+
+## What gets a mod refused
+
+The launcher shows the reason on the mod's row, and the game writes it to
+`status.json` ([troubleshooting](troubleshooting.md)):
+
+- another game or disc than the one played;
+- an `api` the game's interface does not cover;
+- a native mod with no library for this computer's platform;
+- a mod it `requires` that is missing, off, too old, or later in the list;
+- a conflict with a mod that is on (either mod may list the other).

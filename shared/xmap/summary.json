@@ -1,0 +1,1264 @@
+{
+ "min_strict_bytes": 16,
+ "min_shape_bytes": 48,
+ "versions": {
+  "rac1/pal": {
+   "serial": "SCES_509.16",
+   "programs": 20,
+   "functions": {
+    "core": [
+     628,
+     116560
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     997,
+     343964
+    ],
+    "level": [
+     3202,
+     3195460
+    ]
+   },
+   "matched": [
+    4123,
+    3187340
+   ],
+   "open_matched_elsewhere": [
+    49,
+    23496
+   ]
+  },
+  "rac1/ntsc": {
+   "serial": "SCUS_971.99",
+   "programs": 20,
+   "functions": {
+    "core": [
+     625,
+     116240
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     996,
+     339884
+    ],
+    "level": [
+     3206,
+     3190252
+    ]
+   },
+   "matched": [
+    3800,
+    3040748
+   ],
+   "open_matched_elsewhere": [
+    352,
+    149536
+   ]
+  },
+  "rac2/ntsc": {
+   "serial": "SCUS_972.68",
+   "programs": 28,
+   "functions": {
+    "core": [
+     705,
+     122120
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     2409,
+     903244
+    ],
+    "level": [
+     4942,
+     4028032
+    ]
+   },
+   "matched": [
+    311,
+    27224
+   ],
+   "open_matched_elsewhere": [
+    515,
+    79596
+   ]
+  },
+  "rac3/ntsc": {
+   "serial": "SCUS_973.53",
+   "programs": 53,
+   "functions": {
+    "core": [
+     800,
+     153024
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     1699,
+     443392
+    ],
+    "level": [
+     11937,
+     6423840
+    ]
+   },
+   "matched": [
+    1179,
+    269252
+   ],
+   "open_matched_elsewhere": [
+    234,
+    29556
+   ]
+  },
+  "rac4/ntsc": {
+   "serial": "SCUS_974.65",
+   "programs": 48,
+   "functions": {
+    "core": [
+     1352,
+     285896
+    ],
+    "net": [
+     2112,
+     447848
+    ],
+    "game": [
+     4352,
+     1354380
+    ],
+    "level": [
+     7419,
+     3305632
+    ]
+   },
+   "matched": [
+    239,
+    26100
+   ],
+   "open_matched_elsewhere": [
+    328,
+    44372
+   ]
+  }
+ },
+ "pairs": {
+  "rac1/pal rac1/ntsc": {
+   "same": {
+    "core": [
+     577,
+     114724
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     867,
+     278632
+    ],
+    "level": [
+     2976,
+     2372300
+    ]
+   },
+   "shape": {
+    "core": [
+     0,
+     0
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     12,
+     6124
+    ],
+    "level": [
+     49,
+     63300
+    ]
+   },
+   "ports_same": [
+    338,
+    148720
+   ],
+   "ports_shape": [
+    3,
+    5300
+   ],
+   "similar": [
+    51,
+    39440
+   ],
+   "ports_similar": [
+    6,
+    500
+   ]
+  },
+  "rac1/pal rac2/ntsc": {
+   "same": {
+    "core": [
+     448,
+     81172
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     222,
+     27276
+    ],
+    "level": [
+     118,
+     10792
+    ]
+   },
+   "shape": {
+    "core": [
+     1,
+     60
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     9,
+     1624
+    ],
+    "level": [
+     16,
+     1136
+    ]
+   },
+   "ports_same": [
+    362,
+    60696
+   ],
+   "ports_shape": [
+    16,
+    1592
+   ],
+   "similar": [
+    108,
+    50232
+   ],
+   "ports_similar": [
+    53,
+    12924
+   ]
+  },
+  "rac1/pal rac3/ntsc": {
+   "same": {
+    "core": [
+     263,
+     32036
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     130,
+     14044
+    ],
+    "level": [
+     60,
+     3460
+    ]
+   },
+   "shape": {
+    "core": [
+     19,
+     5828
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     4,
+     536
+    ],
+    "level": [
+     9,
+     660
+    ]
+   },
+   "ports_same": [
+    174,
+    24576
+   ],
+   "ports_shape": [
+    23,
+    4920
+   ],
+   "similar": [
+    76,
+    16192
+   ],
+   "ports_similar": [
+    33,
+    6940
+   ]
+  },
+  "rac1/pal rac4/ntsc": {
+   "same": {
+    "core": [
+     265,
+     31364
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     63,
+     7456
+    ],
+    "level": [
+     23,
+     1472
+    ]
+   },
+   "shape": {
+    "core": [
+     19,
+     5828
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     2,
+     240
+    ],
+    "level": [
+     0,
+     0
+    ]
+   },
+   "ports_same": [
+    155,
+    21880
+   ],
+   "ports_shape": [
+    18,
+    4936
+   ],
+   "similar": [
+    58,
+    16144
+   ],
+   "ports_similar": [
+    33,
+    7500
+   ]
+  },
+  "rac1/ntsc rac1/pal": {
+   "same": {
+    "core": [
+     577,
+     114724
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     864,
+     278060
+    ],
+    "level": [
+     2979,
+     2372872
+    ]
+   },
+   "shape": {
+    "core": [
+     0,
+     0
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     12,
+     6124
+    ],
+    "level": [
+     49,
+     63300
+    ]
+   },
+   "ports_same": [
+    33,
+    22528
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    51,
+    38756
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  },
+  "rac1/ntsc rac2/ntsc": {
+   "same": {
+    "core": [
+     446,
+     81004
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     221,
+     27140
+    ],
+    "level": [
+     118,
+     10792
+    ]
+   },
+   "shape": {
+    "core": [
+     1,
+     60
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     8,
+     1308
+    ],
+    "level": [
+     16,
+     1136
+    ]
+   },
+   "ports_same": [
+    300,
+    51332
+   ],
+   "ports_shape": [
+    8,
+    680
+   ],
+   "similar": [
+    106,
+    49764
+   ],
+   "ports_similar": [
+    49,
+    12280
+   ]
+  },
+  "rac1/ntsc rac3/ntsc": {
+   "same": {
+    "core": [
+     258,
+     31272
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     130,
+     14044
+    ],
+    "level": [
+     60,
+     3460
+    ]
+   },
+   "shape": {
+    "core": [
+     19,
+     5828
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     4,
+     536
+    ],
+    "level": [
+     9,
+     660
+    ]
+   },
+   "ports_same": [
+    138,
+    16424
+   ],
+   "ports_shape": [
+    17,
+    4532
+   ],
+   "similar": [
+    76,
+    15936
+   ],
+   "ports_similar": [
+    33,
+    7020
+   ]
+  },
+  "rac1/ntsc rac4/ntsc": {
+   "same": {
+    "core": [
+     262,
+     31180
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     63,
+     7456
+    ],
+    "level": [
+     23,
+     1472
+    ]
+   },
+   "shape": {
+    "core": [
+     19,
+     5828
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     2,
+     240
+    ],
+    "level": [
+     0,
+     0
+    ]
+   },
+   "ports_same": [
+    135,
+    16200
+   ],
+   "ports_shape": [
+    17,
+    4888
+   ],
+   "similar": [
+    58,
+    16144
+   ],
+   "ports_similar": [
+    33,
+    7580
+   ]
+  },
+  "rac2/ntsc rac1/pal": {
+   "same": {
+    "core": [
+     447,
+     81144
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     269,
+     30164
+    ],
+    "level": [
+     72,
+     7932
+    ]
+   },
+   "shape": {
+    "core": [
+     0,
+     0
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     11,
+     1724
+    ],
+    "level": [
+     17,
+     1164
+    ]
+   },
+   "ports_same": [
+    1,
+    24
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    108,
+    51580
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  },
+  "rac2/ntsc rac1/ntsc": {
+   "same": {
+    "core": [
+     445,
+     80976
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     268,
+     30028
+    ],
+    "level": [
+     72,
+     7932
+    ]
+   },
+   "shape": {
+    "core": [
+     0,
+     0
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     10,
+     1408
+    ],
+    "level": [
+     17,
+     1164
+    ]
+   },
+   "ports_same": [
+    1,
+    16
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    107,
+    51292
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  },
+  "rac2/ntsc rac3/ntsc": {
+   "same": {
+    "core": [
+     388,
+     42848
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     477,
+     68140
+    ],
+    "level": [
+     259,
+     33236
+    ]
+   },
+   "shape": {
+    "core": [
+     20,
+     5880
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     28,
+     3668
+    ],
+    "level": [
+     43,
+     8072
+    ]
+   },
+   "ports_same": [
+    43,
+    3884
+   ],
+   "ports_shape": [
+    2,
+    456
+   ],
+   "similar": [
+    125,
+    33608
+   ],
+   "ports_similar": [
+    1,
+    16
+   ]
+  },
+  "rac2/ntsc rac4/ntsc": {
+   "same": {
+    "core": [
+     361,
+     35412
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     179,
+     20640
+    ],
+    "level": [
+     46,
+     2960
+    ]
+   },
+   "shape": {
+    "core": [
+     20,
+     5880
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     5,
+     292
+    ],
+    "level": [
+     9,
+     1072
+    ]
+   },
+   "ports_same": [
+    42,
+    3976
+   ],
+   "ports_shape": [
+    1,
+    388
+   ],
+   "similar": [
+    78,
+    24928
+   ],
+   "ports_similar": [
+    7,
+    632
+   ]
+  },
+  "rac3/ntsc rac1/pal": {
+   "same": {
+    "core": [
+     263,
+     32624
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     113,
+     12816
+    ],
+    "level": [
+     81,
+     4820
+    ]
+   },
+   "shape": {
+    "core": [
+     19,
+     5828
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     5,
+     592
+    ],
+    "level": [
+     11,
+     740
+    ]
+   },
+   "ports_same": [
+    16,
+    968
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    95,
+    18208
+   ],
+   "ports_similar": [
+    10,
+    496
+   ]
+  },
+  "rac3/ntsc rac1/ntsc": {
+   "same": {
+    "core": [
+     256,
+     31720
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     113,
+     12816
+    ],
+    "level": [
+     81,
+     4820
+    ]
+   },
+   "shape": {
+    "core": [
+     19,
+     5828
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     5,
+     592
+    ],
+    "level": [
+     11,
+     740
+    ]
+   },
+   "ports_same": [
+    14,
+    816
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    95,
+    17948
+   ],
+   "ports_similar": [
+    10,
+    496
+   ]
+  },
+  "rac3/ntsc rac2/ntsc": {
+   "same": {
+    "core": [
+     388,
+     42840
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     302,
+     47648
+    ],
+    "level": [
+     434,
+     53736
+    ]
+   },
+   "shape": {
+    "core": [
+     23,
+     6044
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     20,
+     2364
+    ],
+    "level": [
+     58,
+     9544
+    ]
+   },
+   "ports_same": [
+    139,
+    16868
+   ],
+   "ports_shape": [
+    12,
+    1552
+   ],
+   "similar": [
+    194,
+    50824
+   ],
+   "ports_similar": [
+    97,
+    25856
+   ]
+  },
+  "rac3/ntsc rac4/ntsc": {
+   "same": {
+    "core": [
+     589,
+     105936
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     323,
+     48052
+    ],
+    "level": [
+     1887,
+     413008
+    ]
+   },
+   "shape": {
+    "core": [
+     2,
+     116
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     51,
+     6068
+    ],
+    "level": [
+     187,
+     31864
+    ]
+   },
+   "ports_same": [
+    188,
+    23104
+   ],
+   "ports_shape": [
+    46,
+    5740
+   ],
+   "similar": [
+    93,
+    23736
+   ],
+   "ports_similar": [
+    58,
+    12384
+   ]
+  },
+  "rac4/ntsc rac1/pal": {
+   "same": {
+    "core": [
+     269,
+     32120
+    ],
+    "net": [
+     1,
+     28
+    ],
+    "game": [
+     72,
+     7868
+    ],
+    "level": [
+     13,
+     1064
+    ]
+   },
+   "shape": {
+    "core": [
+     20,
+     6348
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     2,
+     104
+    ],
+    "level": [
+     1,
+     192
+    ]
+   },
+   "ports_same": [
+    0,
+    0
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    64,
+    16576
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  },
+  "rac4/ntsc rac1/ntsc": {
+   "same": {
+    "core": [
+     265,
+     31888
+    ],
+    "net": [
+     1,
+     28
+    ],
+    "game": [
+     72,
+     7868
+    ],
+    "level": [
+     13,
+     1064
+    ]
+   },
+   "shape": {
+    "core": [
+     20,
+     6348
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     2,
+     104
+    ],
+    "level": [
+     1,
+     192
+    ]
+   },
+   "ports_same": [
+    2,
+    1868
+   ],
+   "ports_shape": [
+    0,
+    0
+   ],
+   "similar": [
+    64,
+    16576
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  },
+  "rac4/ntsc rac2/ntsc": {
+   "same": {
+    "core": [
+     365,
+     35532
+    ],
+    "net": [
+     4,
+     124
+    ],
+    "game": [
+     146,
+     16716
+    ],
+    "level": [
+     71,
+     6640
+    ]
+   },
+   "shape": {
+    "core": [
+     26,
+     6652
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     4,
+     252
+    ],
+    "level": [
+     9,
+     1056
+    ]
+   },
+   "ports_same": [
+    36,
+    5776
+   ],
+   "ports_shape": [
+    1,
+    52
+   ],
+   "similar": [
+    77,
+    25396
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  },
+  "rac4/ntsc rac3/ntsc": {
+   "same": {
+    "core": [
+     599,
+     106224
+    ],
+    "net": [
+     10,
+     284
+    ],
+    "game": [
+     803,
+     127696
+    ],
+    "level": [
+     1387,
+     332792
+    ]
+   },
+   "shape": {
+    "core": [
+     7,
+     944
+    ],
+    "net": [
+     0,
+     0
+    ],
+    "game": [
+     70,
+     8856
+    ],
+    "level": [
+     163,
+     27388
+    ]
+   },
+   "ports_same": [
+    51,
+    6672
+   ],
+   "ports_shape": [
+    5,
+    288
+   ],
+   "similar": [
+    59,
+    16360
+   ],
+   "ports_similar": [
+    0,
+    0
+   ]
+  }
+ },
+ "matched_somewhere": [
+  5759,
+  4334392
+ ],
+ "in_every_version": {
+  "core": [
+   241,
+   29568
+  ],
+  "net": [
+   0,
+   0
+  ],
+  "game": [
+   59,
+   7032
+  ],
+  "level": [
+   19,
+   1372
+  ]
+ },
+ "in_two_or_more_games": [
+  3814,
+  738400
+ ]
+}

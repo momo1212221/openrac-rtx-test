@@ -1,0 +1,129 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 the OpenRAC contributors
+ *
+ * Ratchet & Clank: what the window's own menus and drawing need of the game (game_host.h,
+ * openrac_front_end): the developer menu's level start, the front end's page menu that the
+ * Planets entry and the port's Video rows go into (port/game/common/debug_menu.cpp,
+ * options_menu.cpp), and the words the window reads. boot.c installs it. One table for every disc: the addresses are
+ * games/rac1's, each version's through its rac1_version.h.
+ */
+#include "hero_attachments.h"
+#include "rac1.h"
+
+const char* const rac1_level_names[] = {
+    "Veldin",  "Novalis", "Aridia",     "Kerwan",       "Eudora",         "Rilgar", "Blarg Station",
+    "Umbris",  "Batalia", "Gaspar",     "Orxon",        "Pokitaru",       "Hoven",  "Gemlik Base",
+    "Oltanis", "Quartu",  "Kalebo III", "Drek's Fleet", "Veldin (final)",
+};
+
+/* The planet names in the game's text, by level (the final Veldin is Veldin again). */
+static const int16_t planet_texts[] =
+    {20190,
+     20173,
+     20174,
+     20175,
+     20176,
+     20177,
+     20159,
+     20179,
+     20180,
+     20181,
+     20182,
+     20183,
+     20184,
+     20166,
+     20186,
+     20187,
+     20188,
+     20170,
+     20190};
+
+static void menu_sound(int sound, gaddr moby) {
+    func_0022ED80(0, sound, moby);
+}
+
+/* One of the frame moby class's menu sounds (game_host.h, menu_cue). */
+static void menu_cue(int cue, gaddr moby) {
+    func_0022ED80(cue, 0x11, moby);
+}
+
+/* The page menu's frame mobys (panel_slots): one cut to a frame of a seq and played on at a speed,
+ * as update_menu_system's page switch does (pause.c): MobySetAnimation, then the speed at +0x58.
+ * A seq's frame count is the class's seq table's (class +0x24, seqs +0x48, count +0x10). */
+#define PANEL_SLOTS RAC1_ADDR(0x001D6120u)
+#define PANEL_SLOT_COUNT 14
+#define MOBY_CLASS 0x24u
+#define CLASS_SEQS 0x48u
+#define SEQ_FRAMES 0x10u
+#define MOBY_ANIM_SPEED 0x58u
+
+static void panel_animation(int slot, int seq, int last, float speed) {
+    if (slot < 0 || slot >= PANEL_SLOT_COUNT || seq < 0) {
+        return;
+    }
+    const gaddr moby = GREF(gaddr, PANEL_SLOTS + 4u * (unsigned)slot);
+    /* The menu's mobys exist only while it is open. */
+    if (moby == 0) {
+        return;
+    }
+    int frame = 0;
+    if (last) {
+        const gaddr seqs = GREF(gaddr, moby + MOBY_CLASS) + CLASS_SEQS;
+        frame = (int)GREF(uint8_t, GREF(gaddr, seqs + 4u * (unsigned)seq) + SEQ_FRAMES) - 1;
+    }
+    func_00213D28(moby, seq, frame);
+    GREF(float, moby + MOBY_ANIM_SPEED) = speed;
+}
+
+/* HeroAttachState is resident and uses the same slot layout in PAL and NTSC (level_hero_attach.c). */
+static unsigned hero_shadow_casters(gaddr* addresses, unsigned capacity) {
+    return openrac_rac1_hero_attachments(
+        openrac_guest_base, openrac_guest_ram_size, RAC1_ADDR(0x0013F450u), addresses, capacity
+    );
+}
+
+_Static_assert(
+    sizeof(rac1_level_names) / sizeof(rac1_level_names[0])
+        == sizeof(planet_texts) / sizeof(planet_texts[0]),
+    "Each level needs a planet label"
+);
+
+const openrac_front_end rac1_front_end = {
+    .levels = sizeof(rac1_level_names) / sizeof(rac1_level_names[0]),
+    .level_names = rac1_level_names,
+    .start_level = rac1_start_level,
+    .menu_sound = menu_sound,
+    .page_menu = RAC1_ADDR(0x001D5F70u),
+    .options_list = RAC1_ADDR(0x001D4BE8u),
+    .options_items = RAC1_ADDR(0x001D4B90u),
+    .video_item = RAC1_ADDR(0x001D4B9Cu), /* PAL's list's second item */
+    .language_page = RAC1_ADDR(0x001D4CC0u),
+    .language_title = RAC1_ADDR(0x001D4D48u),
+    .language_list = RAC1_ADDR(0x001D4DE8u),
+    .planets_text = 20216,
+    .planet_texts = planet_texts,
+    .video_page = RAC1_ADDR(0x001D4E38u),
+    .video_list = RAC1_ADDR(0x001D4F40u),
+    .video_rows = RAC1_ADDR(0x001D4F18u),
+    .sound_hint = RAC1_ADDR(0x001CE720u),
+    .sound_list_seq = 0xD2,
+    .sound_hint_seq = 0xD7,
+    .pad = RAC1_ADDR(0x0013CA40u),
+    .video_mode = RAC1_ADDR(0x0016044Cu),
+    .game_mode = RAC1_ADDR(0x0015F6E8u),
+    .light_bank = RAC1_ADDR(0x0019BEC0u),
+    .occlusion = RAC1_ADDR(0x001940C0u),
+    .level = RAC1_ADDR(0x0015EE84u),
+    .dialog = RAC1_ADDR(0x00193400u),
+    .title_exit = RAC1_ADDR(0x0015F690u),
+    .ship_state = RAC1_ADDR(0x0013E150u),
+    .hero_shadow_casters = hero_shadow_casters,
+    .language = RAC1_ADDR(0x0015EE88u),
+    .main_page = RAC1_ADDR(0x001D4948u),
+    .options_page = RAC1_ADDR(0x001D4B08u),
+    .prompt = RAC1_ADDR(0x001D29D0u),
+    .panel_slots = PANEL_SLOTS,
+    .menu_cue = menu_cue,
+    .panel_animation = panel_animation,
+    .fonts = {RAC1_ADDR(0x001DF3D0u), RAC1_ADDR(0x001DF770u), RAC1_ADDR(0x001DFB10u)},
+};

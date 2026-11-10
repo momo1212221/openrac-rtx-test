@@ -1,0 +1,262 @@
+<script lang="ts">
+  import GameRunning from "$components/GameRunning.svelte";
+  import Header from "$components/Header.svelte";
+  import LaunchScreen from "$components/LaunchScreen.svelte";
+  import Toasts from "$components/Toasts.svelte";
+  import ModSetReview from "$components/ModSetReview.svelte";
+  import ModUpdateModal from "$components/ModUpdateModal.svelte";
+  import DeepLinkInstall from "$components/DeepLinkInstall.svelte";
+  import { startDeepLinks } from "$lib/deepLink.svelte";
+  import { startGameRequests } from "$lib/gameRequest";
+  import { startAutoUpdates } from "$lib/modAutoUpdate.svelte";
+  import UpdateModal from "$components/UpdateModal.svelte";
+  import { errorText, onAndroid } from "$lib/api";
+  import {
+    app,
+    openDevelop,
+    openVersion,
+    refresh,
+    showLaunch,
+    start,
+    updateDiscordPresence,
+    type Page,
+  } from "$lib/app.svelte";
+  import { followCodeLinks } from "$lib/modCodes.svelte";
+  import { lookForModUpdates } from "$lib/modUpdates.svelte";
+  import { preloadArt } from "$lib/media";
+  import { slide, slides } from "$lib/motion";
+  import { applyPalette } from "$lib/palettes";
+  import { applyAccent } from "$lib/themes";
+  import Game from "./pages/Game.svelte";
+  import Library from "./pages/Library.svelte";
+  import Settings from "./pages/Settings.svelte";
+
+  // Mods, Activity and Develop load the first time they are opened, so starting the launcher reads
+  // only what the game page needs; they are fetched while the launcher idles after it starts, so
+  // opening them later is instant. Opened before that, the page's slide waits for them.
+  const once = <T,>(load: () => Promise<T>) => {
+    let loaded: Promise<T> | null = null;
+    return () => (loaded ??= load());
+  };
+  const modsPage = once(() => import("./pages/Mods.svelte"));
+  const tasksPage = once(() => import("./pages/Tasks.svelte"));
+  const developPage = once(() => import("./pages/Develop.svelte"));
+  const lazyPages: Partial<Record<Page, () => Promise<unknown>>> = {
+    mods: modsPage,
+    tasks: tasksPage,
+    develop: developPage,
+  };
+  $effect(() => {
+    const later = setTimeout(() => {
+      void modsPage();
+      void tasksPage();
+      if (app.config?.developer) void developPage();
+    }, 2000);
+    return () => {
+      clearTimeout(later);
+    };
+  });
+
+  // A mod code's link: listened for once the library knows the games it can apply to.
+  let linksFollowed = false;
+  $effect(() => {
+    if (linksFollowed || !app.library || !app.config?.setupComplete) return;
+    linksFollowed = true;
+    void followCodeLinks();
+  });
+
+  // Android: the Games tab's pictures ready before it is first shown (media.ts).
+  if (onAndroid) preloadArt();
+
+  $effect(() => {
+    // The launcher's accent is the picked game's own (themes.ts), the colour easing from one to the
+    // next (app.css). main.ts put the last one on; it stays until the settings say which game shows,
+    // and that first one goes on at once too (a first start, or another game than the kept one).
+    const game = app.version?.split("/")[0] ?? null;
+    if (!app.config && !game) return;
+    applyAccent(game, app.config?.gameColors ?? true);
+    const root = document.documentElement;
+    if ("starting" in root.dataset)
+      requestAnimationFrame(() => requestAnimationFrame(() => delete root.dataset.starting));
+  });
+
+  $effect(() => {
+    // The theme (Settings → General); main.ts put the last one on before the settings loaded.
+    if (app.config) applyPalette(app.config.theme);
+  });
+
+  $effect(() => {
+    // The layout (Settings → Appearance): src/layouts/compact.css applies only to "compact".
+    document.documentElement.dataset.layout = app.config?.layout ?? "compact";
+  });
+
+  // The page shown. One page gives way to the next in a slide (motion.ts, app.css): the one leaving
+  // fades away as the next comes in, in the order of the tabs (from the right for a tab further
+  // along the bar; on Android from below for one further down the rail).
+  const ORDER: Record<Page, number> = { library: 0, game: 1, mods: 2, tasks: 3, develop: 4, settings: 5 };
+  let page = $state<Page>(app.page);
+  $effect(() => {
+    const next = app.page;
+    if (next === page) return;
+    // On a desktop the Games tab and a game's page are one tab: the game list opens the game in place.
+    const sameTab = !onAndroid && Math.max(ORDER[next], ORDER[page]) <= ORDER.game;
+    if (sameTab) page = next;
+    else
+      slide(
+        () => {
+          // Another tab pressed while this page's code was on its way: that tab's change is the one.
+          if (app.page === next) page = next;
+        },
+        ORDER[next] >= ORDER[page] ? "forward" : "back",
+        lazyPages[next]?.(),
+      );
+  });
+  $effect(() => {
+    if (slides) document.documentElement.dataset.motion = "slides";
+  });
+
+  // Another page starts at its top, as it arrives (app.css: its sections rise in turn).
+  let view = $state<HTMLElement | null>(null);
+  let shown: Page | null = null;
+  $effect(() => {
+    if (page === shown) return;
+    shown = page;
+    view?.scrollTo({ top: 0 });
+  });
+
+  $effect(() => {
+    // With developer tools on, what the launcher ran is Develop's console (a game's menu still
+    // asks for Activity).
+    if (app.page === "tasks" && app.config?.developer) openDevelop("console");
+  });
+
+  $effect(() => {
+    // Sync Discord Rich Presence when page or game changes
+    updateDiscordPresence(app.page, app.version);
+  });
+
+  $effect(() => {
+    // ?page=tasks (and ?version=rac1/pal) open a page directly: handy for screenshots.
+    // ?page=develop opens Develop on ?version, or on ?develop=checkout|console.
+    const params = new URLSearchParams(location.search);
+    void start()
+      .then(() => {
+        const version = params.get("version");
+        if (version) {
+          app.version = version;
+          app.page = "game";
+        }
+        const page = params.get("page") as Page | null;
+        if (page === "develop") openDevelop(params.get("develop") ?? version ?? undefined);
+        else if (page) app.page = page;
+        // ?update&modal=update: the update window open on the preview's update (mock.ts).
+        if (params.get("modal") === "update") app.showUpdateModal = true;
+        // The installed mods are looked at once a day, where they came from a link: what is found
+        // is offered in one window and read by the Mods tab, so GitHub is not asked twice.
+        if (app.config?.checkModUpdates) void lookForModUpdates().catch(() => undefined);
+        // openrac:// links (the website's Install buttons): the start's own, then each one sent.
+        void startDeepLinks().catch(() => undefined);
+        // A shortcut's game that could not start: the page for it (gameRequest.ts).
+        void startGameRequests(openVersion).catch(() => undefined);
+        // Mods from the index kept current: now, then every 6 hours (lib/modAutoUpdate).
+        stopAutoUpdates = startAutoUpdates();
+        // ?launch: the version's start (Android's spinning disc), as Play shows it.
+        if (params.has("launch") && version) {
+          const game = app.library?.games.find((g) => g.id === version.split("/")[0]);
+          if (game) showLaunch(game.id, game.title);
+        }
+      })
+      .catch((e: unknown) => {
+        // start() says what went wrong itself; this is the last word for anything else.
+        app.startError = errorText(e);
+      });
+    // Pick up what changed outside the launcher (a build in a terminal, a new disc).
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
+    let stopAutoUpdates: () => void = () => undefined;
+    return () => {
+      stopAutoUpdates();
+      window.removeEventListener("focus", onFocus);
+    };
+  });
+</script>
+
+{#if !app.config}
+  <div class="loading">
+    {#if app.startError}
+      <p>The launcher could not start: {app.startError}</p>
+      <button class="primary" onclick={() => void start()}>Try again</button>
+    {:else}
+      <span class="spinner"></span>
+      {#if app.preparing}<p>Preparing OpenRAC's tools. This happens once after installing or updating.</p>{/if}
+    {/if}
+  </div>
+{:else}
+  <div class="shell">
+    <!-- The first run has the bar with only the name (Android's rail is only its tabs). -->
+    {#if app.config.setupComplete}<Header shown={page} />{:else if !onAndroid}<Header setup />{/if}
+    <main bind:this={view}>
+      {#if !app.config.setupComplete}<Settings setup />
+      {:else if page === "game"}<Game />
+      {:else if page === "mods"}{#await modsPage() then loaded}<loaded.default />{/await}
+      {:else if page === "tasks"}{#await tasksPage() then loaded}<loaded.default />{/await}
+      {:else if page === "develop"}{#await developPage() then loaded}<loaded.default />{/await}
+      {:else if page === "settings"}<Settings />
+      {:else}<Library />
+      {/if}
+    </main>
+  </div>
+{/if}
+<LaunchScreen />
+<GameRunning />
+<Toasts />
+<UpdateModal />
+<ModUpdateModal />
+<ModSetReview />
+<DeepLinkInstall />
+
+<style>
+  .loading {
+    height: 100%;
+    display: grid;
+    place-items: center;
+    place-content: center;
+    gap: 16px;
+    padding: 0 24px;
+    text-align: center;
+    color: var(--amber);
+  }
+
+  .loading p {
+    margin: 0;
+    color: var(--dim);
+  }
+
+  .shell {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Android: the navigation rail beside the page, or its bar under it on a narrow window
+     (Header.svelte). */
+  :global(html[data-platform="android"]) .shell {
+    flex-direction: row;
+    /* Nothing beside the page scrolls the window: no strip of the background under the rail. */
+    overflow: hidden;
+  }
+
+  @media (max-width: 599px) {
+    :global(html[data-platform="android"]) .shell {
+      flex-direction: column-reverse;
+    }
+  }
+
+  /* A page scrolls down, never sideways: what is wider than the window is the page's to fit. */
+  main {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden auto;
+  }
+</style>

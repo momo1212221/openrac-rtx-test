@@ -1,0 +1,942 @@
+<script lang="ts">
+  // Gameplay mods: the game's native and script mods (docs/port/MODS.md, core/src/plugins.rs), on
+  // My mods for a game with a port. The list is an overview: a row per mod in load order with its
+  // switch, its name and a line, one badge (it cannot load, an update, what it runs) and the way
+  // into its own page, where its settings are (ModPage.svelte, opened through lib/modNav so Back
+  // and Escape return here). Up, down and Remove are in its menu. Adding is AddMod's. The Mods switch under Play
+  // on the game's page starts the game with them or with none; off, a notice here says so. Every change is written at once to the
+  // list the game reads at its next start (plugins.json). A mod installed from a link keeps its
+  // source, offers its updates (looked for once a day, at start: lib/modUpdates) and can be kept at its version. No folder
+  // shows here: a mod's is in its page's folded About. Above the mods, for a version that has it,
+  // the built-in Enhanced graphics entry (core/src/enhanced.rs): a row and a page as a mod's, its
+  // values in the game's own settings file, and the lighting bake it needs (the probe-bake action),
+  // started when it is first switched on. With many mods, My mods' toolbar (ModsToolbar.svelte)
+  // finds, shows one kind and sorts them by name; in load order a row's grip drags it to its place.
+  // Mods that are only a page in the launcher (tools) sit apart, under the gameplay mods: the game
+  // loads nothing of theirs, so their order means nothing.
+  import {
+    api,
+    ask,
+    type EnhancedView,
+    type ModSources,
+    type ModUpdate,
+    type PluginView,
+    type VersionView,
+  } from "$lib/api";
+  import { addMods } from "$lib/addMods";
+  import { app, guardShown, jobs, run } from "$lib/app.svelte";
+  import { modBadge, hasSettings } from "$lib/plugins";
+  import * as T from "$lib/modsText";
+  import { closeMod, modNav, openMod } from "$lib/modNav.svelte";
+  import { tick } from "svelte";
+  import Icon from "./Icon.svelte";
+  import Menu from "./Menu.svelte";
+  import ModPage from "./ModPage.svelte";
+  import ModTool from "./ModTool.svelte";
+  import Reason from "./Reason.svelte";
+  import { hidePaths } from "$lib/paths";
+  import { checkDue, markChecked, modUpdates } from "$lib/modUpdates.svelte";
+  import { checkIndex } from "$lib/modAutoUpdate.svelte";
+  import { modCode } from "$lib/modCodes.svelte";
+  import ModSetSaved from "./ModSetSaved.svelte";
+  import ModSetShare from "./ModSetShare.svelte";
+  import { copyText } from "$lib/clipboard";
+  import { openChangeSet } from "$lib/deepLink.svelte";
+  import { shareLink } from "$lib/shareSetup";
+  import { dragSort } from "$lib/dragSort";
+  import { arrange, groupOf, matches, steps } from "$lib/modsList";
+  import { forget, modsView, movable, report, searching, shows } from "$lib/modsView.svelte";
+
+  let {
+    version: v,
+    reload = 0,
+    onpack = () => undefined,
+  }: {
+    version: VersionView;
+    /** Bumped when a mod was added elsewhere on the page (AddMod): the list is read again. */
+    reload?: number;
+    /** A texture and model pack came in from here (an update): the packs' list is read again. */
+    onpack?: () => void;
+  } = $props();
+
+  const developer = $derived(app.config?.developer ?? false);
+  /** The Mods switch under Play is off (the default): Play starts the game without these. */
+  const purist = $derived(!(app.config?.playWithMods ?? false));
+
+  let mods = $state<PluginView[]>([]);
+  let listError = $state<string | null>(null);
+  /** What the last add or change said, in a sentence. */
+  let said = $state<{ text: string; failed: boolean } | null>(null);
+
+  /** Where each installed mod came from (sources.json), and the updates the last check found. */
+  let sources = $state<ModSources["mods"]>({});
+  let updates = $state<Record<string, ModUpdate>>({});
+  let checking = $state(false);
+  let updating = $state<string | null>(null);
+
+  /** The built-in Enhanced graphics entry, for a version that has it. */
+  let enhanced = $state<EnhancedView | null>(null);
+  const isEnhanced = (id: string | null) => id === T.ENHANCED.id;
+
+  /** The mod whose own page (ModTool.svelte) is shown over its page, if one is. */
+  let toolOpen = $state<string | null>(null);
+
+  /** The mod whose page is open, when it is one of this game's. */
+  const page = $derived(
+    isEnhanced(modNav.mod) && enhanced ? enhanced.mod : (mods.find((m) => m.id === modNav.mod) ?? null),
+  );
+
+  /** The lighting bake running or waiting for this version, if one is. */
+  const bakeJob = $derived(
+    jobs.list.find(
+      (j) =>
+        j.actionId === "probe-bake" &&
+        j.scope.kind === "version" &&
+        j.scope.key === v.key &&
+        (j.state === "queued" || j.state === "running"),
+    ) ?? null,
+  );
+  const bakeAction = $derived(v.actions.find((a) => a.id === "probe-bake" && a.thisPlatform) ?? null);
+
+  let enhancedRequest = 0;
+  async function loadEnhanced() {
+    const request = ++enhancedRequest;
+    const view = await api.enhancedView(v.game, v.name).catch(() => null);
+    if (request === enhancedRequest) enhanced = view;
+  }
+
+  const lightingContext = $derived(`${v.key}:${reload}:${purist}:${isEnhanced(modNav.mod)}`);
+  $effect(() => {
+    if (lightingContext) void loadEnhanced();
+  });
+
+  function bake() {
+    if (bakeAction && !bakeJob) void run({ kind: "version", key: v.key }, bakeAction);
+  }
+
+  /** Every bake of this version gone, after the player says yes. */
+  async function deleteBakes() {
+    const b = enhanced?.bake;
+    if (!b || bakeJob) return;
+    if (!(await ask(T.ENHANCED.removeAsk(b.ready + b.partial + b.failed), T.ENHANCED.removeYes))) return;
+    try {
+      const request = ++enhancedRequest;
+      const view = await api.enhancedDeleteBakes(v.game, v.name);
+      if (request === enhancedRequest) enhanced = view;
+      said = { text: T.ENHANCED.removed, failed: false };
+    } catch (e) {
+      said = { text: message(e), failed: true };
+    }
+  }
+
+  async function setEnhanced(on: boolean) {
+    try {
+      const request = ++enhancedRequest;
+      const view = await api.enhancedSetEnabled(v.game, v.name, on);
+      if (request === enhancedRequest) enhanced = view;
+      said = null;
+    } catch (e) {
+      said = { text: message(e), failed: true };
+      return;
+    }
+    // Switched on: the lighting is baked for the levels that have none yet.
+    const b = enhanced?.bake;
+    if (on && b && b.available && b.ready < b.levels) bake();
+  }
+
+  // The bake ended: its status again.
+  let wasBaking = false;
+  $effect(() => {
+    const now = bakeJob !== null;
+    if (wasBaking && !now) void loadEnhanced();
+    wasBaking = now;
+  });
+  let loaded = $state(false);
+
+  $effect(() => {
+    // A mod asked for that is not here (removed, another game's): the list.
+    if (loaded && modNav.mod !== null && !page && !isEnhanced(modNav.mod)) closeMod();
+  });
+
+  /** The mod whose page was last open: its row takes the focus back. */
+  let returning: string | null = null;
+  $effect(() => {
+    if (page) returning = page.id;
+    else if (returning) {
+      const id = returning;
+      returning = null;
+      void tick().then(() => document.getElementById(`open-${id}`)?.focus());
+    }
+  });
+
+  const message = (e: unknown) => (typeof e === "string" ? e : String(e));
+
+  async function load() {
+    try {
+      mods = await api.pluginsList(v.game, v.name);
+      listError = null;
+      loaded = true;
+    } catch (e) {
+      listError = message(e);
+    }
+    try {
+      sources = (await api.pluginsSources(v.game)).mods;
+    } catch {
+      sources = {};
+    }
+  }
+
+  async function checkUpdates(quiet = false) {
+    checking = true;
+    // Asked for: the mods the index lists are looked at too, from a fresh fetch of it (the
+    // per-repository look below leaves them out). First, so that look knows which they are.
+    let index: T.IndexFound | null = null;
+    const errors: string[] = [];
+    if (!quiet) {
+      try {
+        index = await checkIndex(v);
+        if (index.updated > 0) await load();
+      } catch (e) {
+        errors.push(message(e));
+      }
+    }
+    try {
+      const found = await api.pluginsCheckUpdates(v.game, v.name);
+      updates = Object.fromEntries(found.updates.map((u) => [u.id, u]));
+      markChecked(v.game);
+      if (!quiet) {
+        const n = found.updates.length;
+        errors.push(...found.errors);
+        const any = n > 0 || (index !== null && index.updated + index.waiting + index.held > 0);
+        said = { text: T.updatesFound(n, errors, index), failed: errors.length > 0 && !any };
+      }
+    } catch (e) {
+      if (!quiet) said = { text: message(e), failed: true };
+    }
+    checking = false;
+  }
+
+  async function runUpdate(id: string) {
+    updating = id;
+    try {
+      const done = await api.pluginsUpdate(v.game, v.name, id);
+      if (done.kind === "pack") {
+        const added = await addMods(v, [done.path]);
+        said = { text: added.text, failed: added.failed };
+        onpack();
+      } else {
+        said = { text: T.updated(done.name, done.version), failed: false };
+      }
+      updates = Object.fromEntries(Object.entries(updates).filter(([k]) => k !== id));
+    } catch (e) {
+      said = { text: message(e), failed: true };
+    }
+    updating = null;
+    await load();
+  }
+
+  /** Every update the last check found, one after another (a pinned mod has none). */
+  async function updateAll() {
+    const ids = Object.keys(updates).filter((id) => !sources[id]?.pin);
+    let failed = 0;
+    for (const id of ids) {
+      await runUpdate(id);
+      if (said?.failed) failed++;
+    }
+    said = { text: T.updatedAll(ids.length - failed, failed), failed: failed > 0 };
+  }
+
+  const pending = $derived(Object.keys(updates).filter((id) => !sources[id]?.pin).length);
+
+  async function setPin(id: string, pin: boolean) {
+    try {
+      sources = (await api.pluginsSetPin(v.game, id, pin)).mods;
+      if (pin) {
+        updates = Object.fromEntries(Object.entries(updates).filter(([k]) => k !== id));
+      }
+    } catch (e) {
+      said = { text: message(e), failed: true };
+    }
+  }
+
+  const hasSources = $derived(Object.keys(sources).length > 0);
+
+  $effect(() => {
+    // The launcher's own look at start (lib/modUpdates) already found these: shown without asking
+    // GitHub again. Else, once a day by itself, when a mod came from a link.
+    const found = modUpdates.found[v.game];
+    if (found && Object.keys(updates).length === 0) {
+      updates = Object.fromEntries(found.updates.map((u) => [u.id, u]));
+      return;
+    }
+    if (hasSources && !checking && checkDue(v.game)) void checkUpdates(true);
+  });
+
+  $effect(() => {
+    // Again whenever RELOAD is bumped, and for another game.
+    if (reload >= 0 && v.key) void load();
+  });
+
+  /** The Share window is open. */
+  let sharing = $state(false);
+
+  // A code applied or a saved set restored (they live above this panel): the list is read again.
+  let seen = modCode.revision;
+  $effect(() => {
+    if (modCode.revision === seen) return;
+    seen = modCode.revision;
+    void load();
+  });
+
+  /** A change to the list: the list as it now is, or the reason it was refused, said under the head. */
+  async function change(work: Promise<PluginView[]>) {
+    try {
+      mods = await work;
+      said = null;
+    } catch (e) {
+      said = { text: typeof e === "string" ? e : String(e), failed: true };
+      await load();
+    }
+  }
+
+  /** On: with the dependencies it needs, said in a line. Off: the mods that need it are asked
+   *  about first, and turned off with it. */
+  async function setOn(mod: PluginView, on: boolean) {
+    if (on) {
+      try {
+        const turned = await api.pluginsTurnOn(v.game, v.name, mod.id);
+        mods = turned.views;
+        said = turned.alsoOn.length > 0 ? { text: T.alsoTurnedOn(turned.alsoOn), failed: false } : null;
+      } catch (e) {
+        said = { text: typeof e === "string" ? e : String(e), failed: true };
+        await load();
+      }
+      return;
+    }
+    const needers = await api.pluginsDependents(v.game, mod.id).catch(() => []);
+    if (needers.length > 0) {
+      if (
+        !(await ask(
+          T.turnOffAsk(
+            needers.map(([, name]) => name),
+            mod.name,
+          ),
+          T.DEPS.turnOffYes,
+        ))
+      ) {
+        await load();
+        return;
+      }
+      for (const [id] of needers) await api.pluginsSetEnabled(v.game, v.name, id, false).catch(() => undefined);
+    }
+    await change(api.pluginsSetEnabled(v.game, v.name, mod.id, false));
+  }
+
+  async function remove(mod: PluginView) {
+    if (!(await ask(T.removeConfirm(mod.name), T.PANEL.remove))) return;
+    if (modNav.mod === mod.id) closeMod();
+    // What only it needed: the launcher's own installs go (Clean up unused dependencies), the
+    // player's own are asked about.
+    const orphans = app.config?.cleanupUnusedDeps ? await api.pluginsOrphans(v.game, mod.id).catch(() => []) : [];
+    const also = orphans.filter((o) => o.auto).map((o) => o.id);
+    const mine = orphans.filter((o) => !o.auto);
+    if (mine.length > 0 && (await ask(T.removeDepsAsk(mine.map((o) => o.name)), T.DEPS.removeYes))) {
+      also.push(...mine.map((o) => o.id));
+    }
+    await change(api.pluginsRemoveWith(v.game, v.name, mod.id, also));
+    if (also.length > 0 && !said?.failed) said = { text: T.removedDeps(also.length), failed: false };
+  }
+
+  /** The mods that are on and in the index, as a link a friend installs the same set from. */
+  async function share() {
+    const index = await api.indexFetch().catch(() => null);
+    const ids = new Set(index?.index.mods.map((m) => m.id) ?? []);
+    const link = shareLink(mods, (id) => ids.has(id), v.game, v.name);
+    if (!link) {
+      said = { text: T.DEPS.shareNone, failed: true };
+      return;
+    }
+    const ok = await copyText(link, T.DEPS.shareRefused);
+    said = ok ? { text: T.DEPS.shareCopied, failed: false } : { text: T.DEPS.shareRefused, failed: true };
+  }
+
+  /** Saves one setting from the mod's page; the list as the core now has it. */
+  async function saveSetting(mod: PluginView, key: string, value: unknown) {
+    if (isEnhanced(mod.id)) {
+      enhanced = await api.enhancedSetSetting(v.game, v.name, key, value);
+      return;
+    }
+    mods = await api.pluginsSetSetting(v.game, v.name, mod.id, key, value);
+  }
+
+  function openFolder(mod: PluginView) {
+    void guardShown(api.openOutput(mod.path));
+  }
+
+  /** The gameplay mods and the tools, each as shown: searched, in load order or by name. */
+  const words = (m: PluginView) => [m.name, m.description, m.author, m.id];
+  const gameplay = $derived(
+    arrange(
+      mods.filter((m) => groupOf(m.kind) === "gameplay"),
+      modsView.query,
+      modsView.sort,
+      words,
+    ),
+  );
+  const tools = $derived(
+    arrange(
+      mods.filter((m) => groupOf(m.kind) === "tools"),
+      modsView.query,
+      modsView.sort,
+      words,
+    ),
+  );
+  /** The panel's title: the kind shown alone, else Gameplay mods. */
+  const title = $derived(
+    modsView.filter === "tools" ? T.VIEW.toolsTitle : modsView.filter === "looks" ? T.VIEW.builtInTitle : T.PANEL.title,
+  );
+
+  /** The lists shown: the gameplay mods, then the tools apart. */
+  const groups = $derived([
+    ...(shows("gameplay") ? [{ id: "gameplay" as const, rows: gameplay }] : []),
+    ...(shows("tools") && tools.length > 0 ? [{ id: "tools" as const, rows: tools }] : []),
+  ]);
+  const enhancedShown = $derived(
+    !!enhanced && shows("looks") && matches(modsView.query, enhanced.mod.name, enhanced.mod.description),
+  );
+
+  /** Rows the search and the kind show. */
+  const found = $derived(groups.reduce((n, g) => n + g.rows.length, 0) + (enhancedShown ? 1 : 0));
+
+  // What the list holds, for the toolbar (counts, Mods off, a search that finds nothing).
+  $effect(() => {
+    report("plugins", {
+      counts: {
+        gameplay: mods.filter((m) => groupOf(m.kind) === "gameplay").length,
+        tools: mods.filter((m) => groupOf(m.kind) === "tools").length,
+        looks: enhanced ? 1 : 0,
+      },
+      on: mods.filter((m) => m.enabled && m.kind !== "tool").length + (enhanced?.mod.enabled ? 1 : 0),
+      found,
+    });
+  });
+  $effect(() => () => {
+    forget("plugins");
+  });
+
+  /** A move is running: the next waits (each is several one-place moves). */
+  let moving = $state(false);
+
+  /** Moves MOD to where TARGET is in the load order, one place at a time (the core moves by one). */
+  async function moveTo(mod: PluginView | undefined, target: PluginView | undefined) {
+    if (moving || !mod || !target || target.id === mod.id) return;
+    const from = mods.findIndex((m) => m.id === mod.id);
+    const to = mods.findIndex((m) => m.id === target.id);
+    if (from < 0 || to < 0) return;
+    moving = true;
+    try {
+      await change(
+        (async () => {
+          let list = mods;
+          for (const up of steps(from, to)) list = await api.pluginsMove(v.game, v.name, mod.id, up);
+          return list;
+        })(),
+      );
+    } finally {
+      moving = false;
+    }
+  }
+</script>
+
+{#if page?.tool && toolOpen === page.id}
+  {@const mod = page}
+  <ModTool mod={{ ...mod, tool: mod.tool ?? "" }} game={v.game} version={v.name} onclose={() => (toolOpen = null)} />
+{:else if page}
+  {@const mod = page}
+  <ModPage
+    {mod}
+    source={sources[mod.id] ?? null}
+    update={updates[mod.id] ?? null}
+    {purist}
+    {developer}
+    updating={updating === mod.id}
+    onsave={(key, value) => saveSetting(mod, key, value)}
+    onenable={(on) => void (isEnhanced(mod.id) ? setEnhanced(on) : setOn(mod, on))}
+    builtIn={isEnhanced(mod.id) && enhanced
+      ? { bake: enhanced.bake, job: bakeJob, onbake: bake, ondelete: deleteBakes }
+      : null}
+    onupdate={() => void runUpdate(mod.id)}
+    onpin={(pin) => void setPin(mod.id, pin)}
+    onfolder={() => {
+      openFolder(mod);
+    }}
+    onhomepage={() => void guardShown(api.openUrl(mod.homepage))}
+    onremove={() => void remove(mod)}
+    ontool={() => (toolOpen = mod.id)}
+  />
+  {#if said}<Reason text={said.text} tone={said.failed ? "err" : "ok"} role="status" />{/if}
+{:else}
+  {#if (shows("gameplay") || enhancedShown || (shows("tools") && tools.length > 0)) && !(searching() && found === 0)}
+    <section class="panel plugins" aria-label={title}>
+      <div class="head">
+        <h2>{title}</h2>
+        {#if shows("gameplay") && mods.some((m) => m.enabled)}
+          <button class="small share" title={T.MOD_CODES.shareHint} onclick={() => (sharing = true)}
+            ><Icon name="share" size={14} />{T.MOD_CODES.share}</button
+          >
+        {/if}
+        {#if shows("gameplay") && mods.some((m) => m.enabled && !isEnhanced(m.id))}
+          <button class="small" onclick={() => void share()}><Icon name="globe" size={14} />{T.DEPS.shareSetup}</button>
+        {/if}
+        {#if hasSources && shows("gameplay")}
+          {#if pending > 1}
+            <button class="small" disabled={checking || updating !== null} onclick={() => void updateAll()}
+              ><Icon name="refresh" size={14} />{T.PANEL.updateAll(pending)}</button
+            >
+          {/if}
+          <button class="small" disabled={checking} onclick={() => void checkUpdates()}
+            >{#if checking}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if}{T.PANEL
+              .checkUpdates}</button
+          >
+        {/if}
+      </div>
+
+      {#if said}<Reason text={said.text} tone={said.failed ? "err" : "ok"} role="status" />{/if}
+
+      {#if enhanced && enhancedShown}
+        {@const entry = enhanced.mod}
+        {@const badge = modBadge(entry, null, purist)}
+        <ul class="built-in">
+          <li class="mod" class:off={!entry.enabled}>
+            <input
+              type="checkbox"
+              role="switch"
+              class="switch"
+              aria-label={T.useAria(entry.name)}
+              checked={entry.enabled}
+              onchange={(e) => void setEnhanced(e.currentTarget.checked)}
+            />
+            <button
+              class="open"
+              id={`open-${entry.id}`}
+              aria-label={T.settingsAria(entry.name)}
+              onclick={() => {
+                openMod(entry.id);
+              }}
+            >
+              <span class="words">
+                <span class="name">{entry.name}</span>
+                <span class="desc">{entry.description}</span>
+              </span>
+              <span class={`badge ${badge.tone}`} title={badge.hint}><span class="dot"></span>{badge.text}</span>
+              <span class="go">{T.PANEL.settings}<Icon name="next" size={16} /></span>
+            </button>
+          </li>
+        </ul>
+      {/if}
+
+      {#if listError}
+        <Reason text={listError} tone="err" />
+      {:else if !loaded}
+        <!-- Still reading the list: nothing yet, rather than "no mods" for a moment. -->
+      {:else if mods.length === 0}
+        {#if shows("gameplay")}<p class="empty">{T.PANEL.empty}</p>{/if}
+      {:else}
+        {#each groups as group (group.id)}
+          {#if group.id === "tools" && modsView.filter !== "tools"}
+            <div class="subhead">
+              <h3>{T.VIEW.toolsTitle}</h3>
+              <p class="sub">{T.VIEW.toolsSub}</p>
+            </div>
+          {/if}
+          {#if group.rows.length === 0}
+            <p class="empty">{modsView.query ? T.VIEW.none(modsView.query) : T.VIEW.noneInGroup}</p>
+          {:else}
+            <ul
+              use:dragSort={{
+                enabled: group.id === "gameplay" && movable() && !moving,
+                onmove: (from, to) => void moveTo(group.rows[from], group.rows[to]),
+              }}
+            >
+              {#each group.rows as mod, i (mod.id)}
+                {@const update = sources[mod.id]?.pin ? null : (updates[mod.id]?.available ?? null)}
+                {@const badge = modBadge(mod, update, purist)}
+                <li class="mod" class:off={!mod.enabled && mod.kind !== "tool"}>
+                  {#if group.id === "gameplay" && movable() && group.rows.length > 1}
+                    <span class="grip" data-grip title={T.VIEW.grip(mod.name)} aria-hidden="true"
+                      ><Icon name="grip" size={16} /></span
+                    >
+                  {/if}
+                  {#if mod.kind === "tool"}
+                    <!-- A tool can't be off: its switch shows on, greyed, with why. -->
+                    <span class="always" title={T.VIEW.toolAlwaysOn}
+                      ><input
+                        type="checkbox"
+                        role="switch"
+                        class="switch"
+                        aria-label={`${mod.name}: ${T.VIEW.toolAlwaysOn}`}
+                        checked
+                        disabled
+                      /></span
+                    >
+                  {:else}
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      class="switch"
+                      aria-label={T.useAria(mod.name)}
+                      checked={mod.enabled}
+                      disabled={!mod.enabled && mod.blocked !== ""}
+                      title={!mod.enabled && mod.blocked ? hidePaths(mod.blocked).text : undefined}
+                      onchange={(e) => void setOn(mod, e.currentTarget.checked)}
+                    />
+                  {/if}
+                  <button
+                    class="open"
+                    id={`open-${mod.id}`}
+                    aria-label={T.settingsAria(mod.name)}
+                    onclick={() => {
+                      openMod(mod.id);
+                    }}
+                  >
+                    <span class="words">
+                      <span class="name">{mod.name}</span>
+                      {#if mod.description}<span class="desc">{mod.description}</span>{/if}
+                    </span>
+                    <span class={`badge ${badge.tone}`} title={hidePaths(badge.hint).text}
+                      ><span class="dot"></span>{badge.text}</span
+                    >
+                    <span class="go"
+                      >{hasSettings(mod) ? T.PANEL.settings : T.PANEL.details}<Icon name="next" size={16} /></span
+                    >
+                  </button>
+                  {#if mod.missing?.length}
+                    {@const missing = mod.missing}
+                    <button
+                      class="small"
+                      onclick={() =>
+                        void openChangeSet(
+                          missing.map((id) => ({ id, version: null })),
+                          v.game,
+                        )}>{T.fixInstall(missing.join(", "))}</button
+                    >
+                  {/if}
+                  {#if update}
+                    <button
+                      class="small update"
+                      disabled={updating !== null}
+                      aria-label={T.MOD_PAGE.update(update)}
+                      onclick={() => void runUpdate(mod.id)}
+                      >{#if updating === mod.id}<span class="spinner"></span>{:else}<Icon
+                          name="refresh"
+                          size={14}
+                        />{/if}{T.PANEL.updateRow}</button
+                    >
+                  {/if}
+                  <Menu
+                    label={T.moreAria(mod.name)}
+                    items={[
+                      ...(update && updating !== mod.id
+                        ? [
+                            {
+                              label: T.MOD_PAGE.update(update),
+                              icon: "refresh" as const,
+                              run: () => void runUpdate(mod.id),
+                            },
+                          ]
+                        : []),
+                      ...(group.id === "gameplay" && movable()
+                        ? [
+                            ...(i > 1
+                              ? [
+                                  {
+                                    label: T.VIEW.moveTop,
+                                    icon: "up" as const,
+                                    run: () => void moveTo(mod, group.rows[0]),
+                                  },
+                                ]
+                              : []),
+                            ...(i > 0
+                              ? [
+                                  {
+                                    label: T.PANEL.moveUp,
+                                    icon: "up" as const,
+                                    run: () => void moveTo(mod, group.rows[i - 1]),
+                                  },
+                                ]
+                              : []),
+                            ...(i < group.rows.length - 1
+                              ? [
+                                  {
+                                    label: T.PANEL.moveDown,
+                                    icon: "down" as const,
+                                    run: () => void moveTo(mod, group.rows[i + 1]),
+                                  },
+                                ]
+                              : []),
+                            ...(i < group.rows.length - 2
+                              ? [
+                                  {
+                                    label: T.VIEW.moveBottom,
+                                    icon: "down" as const,
+                                    run: () => void moveTo(mod, group.rows.at(-1)),
+                                  },
+                                ]
+                              : []),
+                          ]
+                        : []),
+                      {
+                        label: T.PANEL.openFolder,
+                        icon: "folder" as const,
+                        run: () => {
+                          openFolder(mod);
+                        },
+                      },
+                      { label: T.PANEL.remove, icon: "trash" as const, danger: true, run: () => void remove(mod) },
+                    ]}
+                  />
+                </li>
+              {/each}
+            </ul>
+            {#if group.id === "gameplay" && movable() && group.rows.length > 1}
+              <p class="order" title={T.PANEL.orderTitle}>{T.PANEL.orderTitle}</p>
+            {:else if group.id === "gameplay" && !movable()}
+              <p class="order">{T.VIEW.orderFrozen}</p>
+            {/if}
+          {/if}
+        {/each}
+      {/if}
+      {#if shows("gameplay")}<ModSetSaved version={v} />{/if}
+    </section>
+  {/if}
+{/if}
+{#if sharing}<ModSetShare version={v} onclose={() => (sharing = false)} />{/if}
+
+<style>
+  .plugins {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .update {
+    flex: none;
+  }
+
+  .head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px 12px;
+  }
+
+  h2 {
+    font-size: 1rem;
+    margin-right: auto;
+  }
+
+  .subhead {
+    margin-top: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line-strong);
+  }
+
+  .subhead h3 {
+    font-size: 0.9375rem;
+  }
+
+  .sub {
+    margin: 2px 0 0;
+    font-size: 0.8125rem;
+    color: var(--dim);
+  }
+
+  /* The Mods switch off: says so above the list, with the way to turn it on. */
+  .notice {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 8px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--card-hi);
+    --control: var(--control-card);
+    --control-hi: var(--control-card-hi);
+    font-size: 0.8125rem;
+    color: var(--body);
+  }
+
+  .notice > :global(svg) {
+    flex: none;
+    color: var(--amber);
+  }
+
+  ul {
+    margin: 0 -10px;
+    padding: 0;
+    list-style: none;
+  }
+
+  /* The built-in entry: above the installed mods, a rule between them. */
+  ul.built-in {
+    border-bottom: 1px solid var(--line);
+  }
+
+  /* No menu of its own: its row ends where the others' menus start. */
+  ul.built-in .mod {
+    padding-right: 44px;
+  }
+
+  /* A mod: its switch, then one wide target into its page (name, line, badge, Settings ›), then
+     its menu. */
+  .mod {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 4px 4px 10px;
+    border-top: 1px solid var(--line);
+  }
+
+  .mod:first-child {
+    border-top: 0;
+  }
+
+  /* A mod that is only a page in the launcher: its switch on and greyed, with why on hover. */
+  .always {
+    flex: none;
+    display: inline-flex;
+  }
+
+  .mod > input.switch:focus-visible {
+    outline: 2px solid var(--amber);
+    outline-offset: 2px;
+  }
+
+  .open {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 16px;
+    min-height: 64px;
+    padding: 10px 12px 10px 12px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    box-shadow: none;
+    color: var(--text);
+    text-align: left;
+    font-weight: 400;
+  }
+
+  @media (hover: hover) {
+    :global(html:where(:not([data-input="pad"]))) .open:hover:not(:disabled) {
+      background: var(--control);
+    }
+
+    :global(html:where(:not([data-input="pad"]))) .open:hover .go {
+      color: var(--amber);
+    }
+  }
+
+  .open:active:not(:disabled) {
+    transform: none;
+    background: var(--card-hi);
+    --control: var(--control-card);
+    --control-hi: var(--control-card-hi);
+  }
+
+  .words {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+  }
+
+  .words > span {
+    max-width: 100%;
+  }
+
+  .name {
+    font-size: 0.9375rem;
+    font-weight: 600;
+  }
+
+  .desc {
+    font-size: 0.8125rem;
+    color: var(--soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mod.off .name,
+  .mod.off .desc {
+    color: var(--dim);
+  }
+
+  /* One badge: a dot and a few words (STYLE.md). */
+  .badge {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.8125rem;
+    color: var(--soft);
+    white-space: nowrap;
+  }
+
+  .badge .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .badge.ok .dot {
+    background: var(--ok);
+  }
+
+  .badge.warn {
+    color: var(--warn);
+  }
+
+  .badge.err {
+    color: var(--err);
+  }
+
+  .badge.off {
+    color: var(--dim);
+  }
+
+  .go {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--lav);
+    transition: color var(--fast) var(--ease);
+  }
+
+  .order {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--dim);
+  }
+
+  .empty {
+    margin: 0;
+    padding: 4px 0;
+    font-size: 0.875rem;
+    color: var(--soft);
+  }
+</style>

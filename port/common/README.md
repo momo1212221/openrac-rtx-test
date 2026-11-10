@@ -1,0 +1,136 @@
+# common
+
+The bottom layer of the port: what every module may use, and nothing that belongs to one of them.
+The log, the crash report, the statistics, the environment variables, the system's description, a
+JSON reader, the console's float arithmetic, and small helpers. It draws nothing, opens no window
+and includes no other module of the port; a helper only one module uses stays in that module.
+
+Library `openrac_common`. Each header has a namespace of its own under `openrac` (the table below);
+`joining_thread.h` and `result.h` declare their types in `openrac` itself.
+
+## Interface
+
+| Header | Declares |
+|---|---|
+| [`log.h`](log.h) | `openrac::log`: the port's log, its levels, the session file and the fatal error |
+| [`line_ring.h`](line_ring.h) | `openrac::log::LineRing`: the log's last lines, kept in memory for a crash report |
+| [`crash.h`](crash.h) | `openrac::crash`: the crash report, written from a signal handler, and the game's state it names |
+| [`breadcrumbs.h`](breadcrumbs.h) | `openrac::crash`: bounded main/game and render activity merged by monotonic time in crash reports |
+| [`env.h`](env.h) | `openrac::env`: the table of every `OPENRAC_*` variable the port reads (its kind, what holds when it is unset, what it does) and their typed reads |
+| [`stats.h`](stats.h) | `openrac::stats`: counters, timed sections and frames for the debug overlay, and the environment probes |
+| [`profiler.h`](profiler.h) | `openrac::profiling`: optional Tracy zones, thread names and frame markers, independent of the debug overlay ([guide](../../docs/port/PROFILING.md)) |
+| [`system_info.h`](system_info.h) | `openrac::system_info`: the system, processor and memory a report names |
+| [`build_info.h`](build_info.h) | `openrac::build_info`: OpenRAC's version and the checkout's commit, written at each build |
+| [`staged_file.h`](staged_file.h) | `openrac::StagedFile`: exclusive staging and atomic publication for authored metadata |
+| [`json.h`](json.h) | `openrac::json`: a JSON reader (a tree of values, parsed whole) for the editor's exports, mod manifests and the tools' files |
+| [`ps2_float.h`](ps2_float.h) | `openrac::ps2`: the PS2's FPU and vector-unit float arithmetic on raw bit patterns, for the asset readers, the world renderers and the runtime's C entry points (`openrac/ps2float.h`) |
+| [`float_encoding.h`](float_encoding.h) | `openrac::float_encoding`: IEEE floats packed to the small float formats of half-float metadata and irradiance channels |
+| [`joining_thread.h`](joining_thread.h) | `openrac::JoiningThread`: a thread its owner joins when it goes (`std::jthread` without the stop token) |
+| [`result.h`](result.h) | `openrac::Result<T>` and `openrac::Error`: what a public function that can fail returns, a value or an error message; the port's own `std::expected` (C++23) under its names, `Result<void>` included |
+| [`c_boundary.h`](c_boundary.h) | `openrac::c_boundary`: the wrapper a C entry point written in C++ runs its body through, which stops every exception, reports it and returns the entry point's failure value |
+
+`process.cpp` implements the process's memory and processor time that `stats.h` declares.
+
+## Depends on
+
+Nothing of the port's: `common` is the lowest layer (section 18 of
+[CODING_CONVENTIONS.md](../docs/CODING_CONVENTIONS.md)). It uses the C++ standard library and the
+system's own interfaces (`dladdr` and the backtrace on Unix, `dbghelp` on Windows, the Android
+compatibility library for the backtrace below API 33).
+`OPENRAC_TRACY=ON` links the pinned Tracy client; ordinary builds omit it.
+
+On Windows, startup checks the executable's local PDB by resolving a known function and source
+line. Keep the matching build's `.pdb` beside its `.exe`, including after moving the build. The
+working directory does not need to be the build folder. A short `Windows symbols` log entry and
+`Symbols` crash-report line say whether lookup succeeded; reports contain names and source lines,
+never the PDB itself. Missing or mismatched symbols leave module offsets as the fallback.
+
+## State and threads
+
+- The log is one per process, guarded by its own lock: any thread may write to it.
+- The crash report's buffers are set up once by `crash::configure()`; `crash::report()` then runs in
+  a signal handler using fixed formatting buffers. Windows DbgHelp symbol lookup is best-effort,
+  not async-signal-safe; its session and executable symbols are prepared at startup. Each thread
+  that runs game code calls `crash::prepare_thread()` once.
+- Breadcrumbs retain 32 entries per trail, each with at most 63 message bytes and an optional
+  numeric ID. Game-tick events use `tick=`; render snapshots use `frame=`; level loads use `level=`.
+  Tick/handoff/presentation, level program/data loading and upload, and major render
+  passes appear chronologically in the crash file and session log. Passes include scene upload,
+  depth, shadows, lighting, GTAO, world/liquids/effects/HUD, temporal resolve, motion blur and tone
+  mapping. The section adds under 8 KiB. Recording and snapshotting allocate nothing and never
+  wait: an occupied slot is skipped. These describe CPU activity, not GPU completion. Scoped
+  context keeps synchronous rendering on Main and worker passes on Render, using captured frames.
+- Statistics have one frame/section owner at a time. The frontend can transfer that ownership to
+  its render worker, then drains it before closing or reading the frame. Game timing fields stay
+  on the game thread; lazy probe registration is locked.
+- `env` reads every variable of its table once, the first time any is asked for, and keeps the
+  values for the life of the program: any thread may read them. `env::system_variable` reads a
+  variable the port does not own at each call.
+- `json` and `ps2` hold no state: a parsed `json::Value` belongs to its caller, and the float
+  functions are pure.
+
+## Errors
+
+- `result.h` is the form new interfaces across the port report failure in (section 13.3 of
+  [CODING_CONVENTIONS.md](../docs/CODING_CONVENTIONS.md)): `Result<T>` holds the value or an
+  `Error` whose message follows section 17.3, and `value()` or `error()` on the wrong side throws
+  `std::bad_variant_access`, a mistake of the caller's rather than a way to learn of the failure.
+- `c_boundary::call` keeps exceptions from crossing into C (section 13.4). It knows no reporter
+  above `common`, so the caller names one: the game side passes `openrac_game_crash`
+  (`game_host.h`), which writes the crash report; the host side keeps the default, which logs the
+  report as an error, and goes on with the failure value. The report reads `<where>: <what>`, or
+  `<where>: unknown exception` for a thrown value that is not a `std::exception`, built in a
+  fixed buffer so that a `std::bad_alloc` can still be reported.
+- `json::parse` and `json::parse_file` return `false` and say where in their `std::string& error`.
+- `log::fatal` writes the crash report and ends the program; it is for what the program cannot go
+  on from.
+- The float arithmetic has no failure: a division by zero gives ±`kMax`, as the console's does.
+- `env` has no failure: an unset variable reads as the caller's fallback, and a value that is not a
+  number reads as 0, as `std::strtoll` and `std::strtod` read it.
+
+## Configuration
+
+`env.cpp`'s table lists every `OPENRAC_*` variable the port reads, and
+[docs/port/DEBUGGING.md](../../docs/port/DEBUGGING.md) documents each one; the `env` test holds the
+two to the same list. C++ reads its variables through `env.h`; C, which cannot include it
+(section 14.3 of [CODING_CONVENTIONS.md](../docs/CODING_CONVENTIONS.md)), reads them through the
+runtime's C entry point `openrac/host_env.h`, which looks the name up with `env::find` and hands
+back the kept value (`env::value`'s view ends in a NUL for it). The library replacements of
+`game/common/lib` and rac1's host C (`game/rac1/host`) read through it; the one `getenv` of an
+`OPENRAC_*` variable left is a test's (`tests/vulkan_uniform_test.cpp`, to know what to expect).
+
+`log.cpp` reads `OPENRAC_LOG`, the log's level, through `env.h` at the first call that asks the
+level rather than at static initialisation, so that the table's one reading of the environment is
+not taken before `main` (a test sets its variables first). `env.cpp` does not log, so the two do not
+wait on each other. The home folder `log::tidy` hides is read from `HOME` (`USERPROFILE` on
+Windows), which are the system's variables and not the port's, with `getenv`.
+
+`stats::probe` reads each switch a module declares through it from the table: the variable's row,
+found by its name with `env::find`, and its value through `env::flag`. Every probe's row is a flag
+read as `Truth::Set`, on when set to anything, as `probe` read it when it called `getenv`, which the
+`stats` test pins; a name the table does not hold as a flag starts off, with a warning in the log.
+The overlay then turns each probe on and off while the game runs, without touching the table.
+
+## Tests
+
+| ctest | Proves |
+|---|---|
+| `log` | the log's sessions and kept runs, its memory of last lines, and the crash report's pieces |
+| `joining_thread` | an owner going, or assigned over, waits for its thread |
+| `result` | a value or an error through each accessor, the wrong side throwing, copies and moves (a move-only value included), and `Result<void>` |
+| `c_boundary` | a body that returns passes through unreported; a `std::exception` and a non-standard thrown value are reported and the failure value returned; a void body; a long message cut to the buffer; the default and a null reporter write to the log |
+| `env` | each kind of variable reads as the `getenv` calls it replaced read it, the values are read once, a variable is found by its whole name, and DEBUGGING.md documents the table's variables and no other |
+| `stats` | a probe is on when its variable is set, whatever the value, and off when it is unset; a variable has one probe, which keeps its first description; the list switches a probe for its callers; every probed variable is a flag of the table read as set, and a name that is no flag of it starts off |
+| `host_env` | the table read from C through `openrac/host_env.h` (runtime/README.md) |
+| `viewer` | the JSON reader's values and its errors (with the viewer's own checks) |
+| `mod_manifest`, `mod_loader`, `mod_scripts` | the mod manifests and status files, read through the JSON reader |
+| `assets_world_collision` | the float model against values the console computes, beside the collision queries that use it |
+| `geometry_moby_animation`, `geometry_tfrag`, `geometry_shrub_lighting`, ... | the float model in the game's lighting and animation, to the byte |
+| `ps2float` | the C entry points over the float model, as hostgen's translated C calls them |
+
+## Further reading
+
+- [docs/port/HARDWARE_SEMANTICS.md](../../docs/port/HARDWARE_SEMANTICS.md): where the console's
+  float arithmetic differs from the host's, and when the port reproduces it.
+- [docs/port/DEBUGGING.md](../../docs/port/DEBUGGING.md): the log, the crash reports and the
+  switches.

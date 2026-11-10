@@ -1,0 +1,170 @@
+{
+  "id": "rac3",
+  "title": "Ratchet & Clank: Up Your Arsenal",
+  "year": 2004,
+  "titles": {
+    "pal": "Ratchet & Clank 3"
+  },
+  "decomp": {
+    "dir": "games/rac3/decomp",
+    "name": "rac3-decomp",
+    "repo": "https://github.com/OpenRAC/rac3-decomp",
+    "branch": "master",
+    "license": "GPL-3.0",
+    "commit": "68377e3007a04205ece5166c039e0132f9fbbf6c",
+    "date": "2026-11-08",
+    "imported": "2026-11-08"
+  },
+  "versions": {
+    "ntsc": {
+      "region": "NTSC-U (North America)",
+      "serial": "SCUS_973.53",
+      "bytematch": "OpenRAC/rac3-decomp",
+      "disc": {
+        "file": "SCUS_973.53.iso",
+        "volume": "RATCHETANDCLANK3",
+        "version": "1.00",
+        "video": "NTSC",
+        "size": 4379377664,
+        "crc32": "2b9b91f7",
+        "md5": "ba9f2b38c7346e7b6e5b8e87717d5893",
+        "sha1": "b080139c5a94688ef9472b78d5f5585a756d1ee4",
+        "sha256": "d2bb15c7c5b2205db868713fc0362c2b10e87751ca5bcc4e96c1e244a8c42444"
+      },
+      "boot": {
+        "file": "SCUS_973.53",
+        "size": 771008,
+        "crc32": "01affd24",
+        "md5": "c6075c4a296f656648bc9f64f4f1b09b",
+        "sha1": "601012bb03ef1213ad1253baebae8a071b8a7df7",
+        "sha256": "200068cb4186715521cdc1c20bc6c5a88054d0da54aa336ffdb2022633351c7d"
+      },
+      "target": "rac3-decomp's NTSC-U version: the three core programs (frontbin, the front end; boot_elf, the main program; i5bootn, the launcher) and the 51 level programs read from the disc, each rebuilt byte for byte from src/'s shared C (PAL's names, carried to NTSC-U by config/us/map.tsv), src/us/'s NTSC-U-only C and assembly.",
+      "dir": "games/rac3/decomp",
+      "source": {
+        "shared": "decomp",
+        "name": "rac3-decomp",
+        "repo": "https://github.com/OpenRAC/rac3-decomp",
+        "branch": "master",
+        "license": "GPL-3.0",
+        "commit": "68377e3007a04205ece5166c039e0132f9fbbf6c",
+        "date": "2026-11-08",
+        "imported": "2026-11-08"
+      },
+      "build": {
+        "host": "Linux natively (wibo, binutils 2.10-ee); macOS through wibo-macos; the NTSC-U programs with tools/asm_build.py --version us (docs/versions.md)",
+        "readme": "games/rac3/decomp/docs/versions.md"
+      },
+      "progress": {
+        "report": "games/rac3/decomp/progress/us/report.json",
+        "format": "objdiff",
+        "note": "rac3-decomp's NTSC-U report (SCUS_973.53_report): a C function counts as final only when every NTSC-U program that has it builds it from C (docs/versions.md, The counts)."
+      },
+      "inputs": [
+        {
+          "from": "link",
+          "path": "toolchains/eegcc_2.95.3_sn_v1.36",
+          "target": "toolchains/sn-prodg-3.01/usr/local/sce/ee/gcc"
+        }
+      ],
+      "setup": "in games/rac3/decomp: python3 tools/levels.py --version us dump (baserom/SCUS_973.53.iso), then python3 tools/c_objects.py and python3 tools/asm_build.py --version us --c (docs/versions.md)",
+      "xmap": {
+        "code": [
+          {
+            "program": "boot",
+            "path": "build/rac3/wrench_out/uya_scus_973_53/boot_elf.elf",
+            "format": "elf"
+          },
+          {
+            "program": "frontbin",
+            "path": "build/rac3/wrench_out/uya_scus_973_53/globals/misc/frontbin.elf",
+            "format": "elf"
+          },
+          {
+            "program": "level",
+            "glob": "build/rac3/wrench_out/uya_scus_973_53/levels/*/*/overlay.elf",
+            "format": "elf"
+          }
+        ],
+        "matched": {
+          "kind": "rac3",
+          "program": "frontbin"
+        },
+        "setup": "wrenchbuild unpack baserom/SCUS_973.53.iso -o build/rac3/wrench_out -s (games/rac3/README.md)"
+      }
+    },
+    "pal": {
+      "region": "PAL (Europe)",
+      "serial": "SCES_524.56",
+      "bytematch": "OpenRAC/rac3-decomp",
+      "disc": {
+        "file": "SCES_524.56.iso",
+        "volume": "RATCHETANDCLANK3",
+        "version": "1.00",
+        "video": "PAL",
+        "size": 4464115712,
+        "crc32": "e8ca9b89",
+        "md5": "c2319842fd6706cd9d1914071faccfd4",
+        "sha1": "5593eab45eac8814ce4b95fa1c23510fc0a21ebf",
+        "sha256": "71743350507de0fd29579384ef3e2e3daea14329fb13220f168e6f1b2d1d7093"
+      },
+      "boot": {
+        "file": "SCES_524.56",
+        "size": 771648,
+        "crc32": "43a9942f",
+        "md5": "004e6a69bc2c7fa25d0f14ea057481c0",
+        "sha1": "e3a8f37d6033b007a80f63dfbfca9afe24f27a47",
+        "sha256": "e3418079d3d3c8a8b31f28fb7a5ac5c13bcd4f89fcc933b11233a5ff55d3a3a5"
+      },
+      "target": "rac3-decomp's primary version: the three core programs (frontbin, the front end; boot_elf, the main program; i5bootn, the launcher) and the 49 level programs read from the disc, each rebuilt byte for byte from src/'s C and assembly.",
+      "dir": "games/rac3/decomp",
+      "source": {
+        "shared": "decomp",
+        "name": "rac3-decomp",
+        "repo": "https://github.com/OpenRAC/rac3-decomp",
+        "branch": "master",
+        "license": "GPL-3.0",
+        "commit": "68377e3007a04205ece5166c039e0132f9fbbf6c",
+        "date": "2026-11-08",
+        "imported": "2026-11-08"
+      },
+      "build": {
+        "host": "Linux natively (wibo, binutils 2.10-ee); macOS through wibo-macos; tools/build.py for the core programs and tools/build_levels.py for the levels (README.md)",
+        "readme": "games/rac3/decomp/README.md"
+      },
+      "progress": {
+        "report": "games/rac3/decomp/progress/report.json",
+        "format": "objdiff",
+        "note": "rac3-decomp's PAL report: the three core programs and the 49 level programs; a function counts as matched when its C builds into a program that equals retail."
+      },
+      "inputs": [
+        {
+          "from": "link",
+          "path": "toolchains/eegcc_2.95.3_sn_v1.36",
+          "target": "toolchains/sn-prodg-3.01/usr/local/sce/ee/gcc"
+        }
+      ],
+      "setup": "in games/rac3/decomp: unpack baserom/SCES_524.56.iso with Wrench and copy boot_elf.elf, frontbin.elf and i5bootn.elf into baserom/, then python3 tools/setup_asm.py --target all and python3 tools/build.py --target all (README.md); the levels with python3 tools/levels.py dump and tools/build_levels.py --setup",
+      "xmap": {
+        "code": [
+          {
+            "program": "boot",
+            "path": "build/rac3/wrench_out/uya_sces_524_56/boot_elf.elf",
+            "format": "elf"
+          },
+          {
+            "program": "frontbin",
+            "path": "build/rac3/wrench_out/uya_sces_524_56/globals/misc/frontbin.elf",
+            "format": "elf"
+          },
+          {
+            "program": "level",
+            "glob": "build/rac3/wrench_out/uya_sces_524_56/levels/*/*/overlay.elf",
+            "format": "elf"
+          }
+        ],
+        "setup": "wrenchbuild unpack baserom/SCES_524.56.iso -o build/rac3/wrench_out -s (games/rac3/README.md)"
+      }
+    }
+  }
+}

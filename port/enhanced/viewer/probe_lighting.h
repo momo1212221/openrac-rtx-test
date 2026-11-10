@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <future>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "enhanced/lighting/probe_regions.h"
+#include "enhanced/lighting/probes.h"
+#include "enhanced/tools/baker/sources/activation.h"
+#include "enhanced/viewer/area_light_overlay.h"
+#include "enhanced/viewer/environment_lighting.h"
+#include "enhanced/viewer/medial_axis_overlay.h"
+#include "enhanced/viewer/probe_selection.h"
+#include "enhanced/viewer/probe_sphere_culling.h"
+#include "renderer/renderer.h"
+#include "renderer/shader.h"
+#include "scene/level.h"
+
+namespace openrac::lighting {
+// The scene's mesh fragment shader `source` (viewer/shaders/mesh.frag) with the probe lighting's
+// GLSL put in, and its early-lit variant; unchanged where enhanced rendering is unavailable.
+std::string probe_mesh_fragment(std::string source);
+std::string probe_early_fragment(std::string source);
+std::string probe_shader_source(std::string source);
+
+// Where the player's own bakes are (the launcher's `--probes`, bake_all.py's output): one
+// level_NN folder each, holding sparse.orpg. OPENRAC_PROBE_GI, when set, names one bake instead.
+// A level without a bake, or with one that does not match it, keeps the original lighting.
+void set_probe_root(std::filesystem::path root);
+const std::filesystem::path& probe_root();
+
+// Whether ProbeLighting::load reads a level's bake on another thread, the level drawn with its
+// original lighting until the bake is uploaded (update_regions), instead of before load returns.
+// The game turns it on; tools and tests that look at the result of a load leave it off.
+void set_probe_background_load(bool background);
+
+// A level's bake as read and verified away from the rendering thread, before its upload.
+struct ProbeBakeRead {
+    std::string path;  // The sparse grid's file; its folder holds the companion files.
+    lighting::ProbeActivation expected;
+    std::vector<ProbeLookRegion> look_regions;
+    lighting::ProbeVolume volume;
+    std::vector<lighting::ProbeVolume> regions;
+    double seconds = 0;  // How long the read took.
+    std::string error;   // Why the bake was refused; nothing else is set then.
+};
+
+class ProbeLighting {
+public:
+    bool upload(
+        const lighting::ProbeVolume& volume,
+        std::string& error,
+        const lighting::ProbeVolume* dense = nullptr
+    );
+    bool upload_regions(
+        const lighting::ProbeVolume& volume,
+        std::vector<lighting::ProbeVolume> regions,
+        std::string& error
+    );
+    void update_regions(
+        lighting::Float3 camera, float seconds = -1, const renderer::Mat4* world_to_clip = nullptr
+    );
+
+    const auto& region_slots() const { return m_selector.slots; }
+
+    bool compute_selection() const { return active() && m_selection.available(); }
+
+    // True when the most recent sphere draw consumed device-generated instances and arguments.
+    bool gpu_spheres_active() const { return m_sphere_indirect; }
+
+    void select_visible_regions(
+        unsigned depth, const renderer::Camera& camera, int width, int height
+    ) {
+        if (compute_selection()) {
+            m_selection.dispatch(depth, camera, width, height);
+        }
+    }
+
+    // Activation through OPENRAC_PROBE_GI, else the level's bake under probe_root(). Missing or
+    // invalid assets report why and leave the original lighting active. With
+    // set_probe_background_load, the bake is read on another thread and uploaded by the first
+    // update_regions after it is ready.
+    void load(const scene::LevelData& level);
+
+    // Whether a bake is still being read in the background.
+    bool loading() const { return m_pending_read.valid(); }
+
+    void bind(
+        const renderer::Shader& shader,
+        scene::Layer layer,
+        bool all_static_receivers = false,
+        const renderer::Camera* camera = nullptr,
+        bool depth_matched = true
+    ) const;
+    void release();
+    // Draws placement overlays and the nominal volumes containing the optional snapshot player.
+    void draw_spheres(
+        const renderer::FrameInput& input,
+        renderer::RenderState& state,
+        std::optional<lighting::Float3> player = std::nullopt
+    );
+
+    const std::string& load_error() const { return m_load_error; }
+
+    bool has_data() const { return m_textures[0] != 0; }
+
+    bool active() const { return enabled && has_data() && mode != 0; }
+
+    // Resolves the runtime override, verified level override, then authored travel direction.
+    lighting::Float3 sunlight_direction(lighting::Float3 authored) const {
+        // The submitted frame clears the runtime override outside enhanced graphics.
+        return runtime_sunlight_direction.value_or(
+            active() ? m_sunlight_direction.value_or(authored) : authored
+        );
+    }
+
+    std::optional<lighting::Float3> runtime_sunlight_direction;
+    bool enabled = true;
+    float gi_multiplier = 1.0f;
+    float normal_bias = 0.5f;
+    float view_bias = 0.5f;
+    int mode = 1;
+    bool backlight = false;
+    bool show_spheres = false;
+    bool gpu_spheres = true;  // GPU compaction; false retains the CPU reference for verification.
+    bool show_medial_axis = false;
+    bool show_area_lights = false;  // Exact generated source rectangles and emitting directions.
+    bool show_environment_probes = false;  // Reflection capture positions and their actual bounds.
+    bool environment_spheres = false;
+    bool sphere_xray = false;
+    bool all_volume_bounds = false;  // OPENRAC_PROBE_SPHERES=all: every resident region.
+
+private:
+    EnvironmentLighting m_environment;  // Reflection captures matching the active diffuse bake.
+    // Two baked rows share each runtime row before further widening for device height limits.
+    static constexpr unsigned kMinimumAtlasTilesX = 128;
+    // Draws nominal boxes around the supplied snapshot player, never around the camera.
+    void draw_volume_bounds(
+        const renderer::FrameInput& input,
+        renderer::RenderState& state,
+        std::optional<lighting::Float3> player
+    );
+    DebugLines m_volume_bounds;  // Player-containing boxes, owned by the rendering thread.
+    std::vector<int> m_containing_regions;  // Cached dense indices, or -1 for sparse fallback.
+    std::string m_load_error;
+    // The bake being read in the background (load), its level and the flag that stops the read.
+    std::future<ProbeBakeRead> m_pending_read;
+    std::shared_ptr<std::atomic<bool>> m_cancel_read;
+    int m_pending_level = -1;
+    // Uploads a background read once it is ready; nothing while it is still running.
+    void poll_load();
+    // Stops a background read and waits for it to end.
+    void cancel_load();
+    // Uploads a verified bake and turns probe lighting on; throws when the upload fails.
+    void finish_load(ProbeBakeRead read);
+    // Releases the lighting and reports `why` as the load error.
+    void fail_load(std::string why);
+    bool m_volume_bounds_failed = false;  // Suppresses repeated shader errors until release.
+    MedialAxisOverlay m_medial_axis;
+    AreaLightOverlay m_area_lights;  // Companion report geometry, owned by the rendering thread.
+    std::array<unsigned, 5> m_textures{};
+    int m_depth_mode = 0;  // Legacy moments, decoded ASTC, native ASTC, or packed RG8 scalars.
+    unsigned m_atlas_tiles_x = kMinimumAtlasTilesX;  // Runtime width in probe tiles.
+    lighting::ProbeGrid m_grid;
+    lighting::Float3 m_sunlight_scale{1, 1, 1};
+    // Loaded only after scene and bake settings verification; cleared on release.
+    std::optional<lighting::Float3> m_sunlight_direction;
+    float m_terrain_vertex_albedo = 0;   // Authored terrain tint strength of the loaded bake.
+    std::vector<float> m_look_uniforms;  // Two packed vec4 values per look region.
+    std::vector<lighting::ProbeVolume> m_regions;
+    std::vector<lighting::ProbeGrid> m_region_grids;
+    lighting::ProbeRegionSelector m_selector;
+    std::array<int, lighting::kDenseProbeSlots> m_gpu_regions{-1, -1, -1};
+    std::size_t m_region_capacity = 0;
+    ProbeSelection m_selection;
+    bool m_full_residency = false;
+    std::vector<unsigned> m_region_offsets;
+    bool m_camera_started = false;
+    std::chrono::steady_clock::time_point m_region_time{};
+    void upload_region(unsigned slot, int region);
+    // Uploads complete canonical rows at `offset` without changing the packed probe bytes.
+    void upload_volume(const lighting::ProbeVolume& volume, std::size_t offset);
+    std::size_t m_sparse_capacity = 0;
+    std::size_t region_offset(unsigned slot, int region) const;
+
+    // Shared packed CPU/compute instance record.
+    using Sphere = ProbeSphere;
+    ProbeSphereCulling
+        m_sphere_culling;  // Resident source and generated instance/argument buffers.
+    bool m_sphere_gpu_attempted = false;  // Failed preparation is not retried each frame.
+    bool m_sphere_indirect = false;       // Current draw uses the generated command.
+    // Prepares the GPU candidate list; false selects the CPU reference/fallback path.
+    bool prepare_gpu_spheres(const renderer::FrameInput& input, float range);
+    // Filters and uploads the reference list when GPU compaction is unavailable.
+    void prepare_cpu_spheres(const renderer::FrameInput& input, float range);
+    // Binds the packed record layout for either CPU or compute output.
+    void bind_sphere_attributes(unsigned buffer);
+
+    std::vector<Sphere> m_spheres, m_visible_spheres;
+    renderer::Shader m_sphere_shader;
+    unsigned m_sphere_vao = 0, m_sphere_buffer = 0, m_sphere_indices = 0;
+};
+}  // namespace openrac::lighting

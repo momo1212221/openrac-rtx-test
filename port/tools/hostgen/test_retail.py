@@ -1,0 +1,397 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 the OpenRAC contributors
+"""Tests for retail.py, the retail program's instructions read from its bytes, and for what asm.py
+reads besides glabel functions (a function spimdisasm took for data, an entry with no label).
+
+    python3 -m unittest port/tools/hostgen/test_retail.py
+
+The bytes are the tests' own (tests/assembler.py assembles them); the ones that translate and run a
+program need Clang, as test_hostgen.py's do.
+"""
+from __future__ import annotations
+
+import re
+import shutil
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "tests"))
+
+import asm  # noqa: E402
+import assembler  # noqa: E402
+import retail  # noqa: E402
+
+JUMP_TABLE = """
+        sltiu $2, $4, 3
+        beq $2, $0, other
+        sll $4, $4, 2
+        lui $2, %hi(jtbl_00300000)
+        addiu $2, $2, %lo(jtbl_00300000)
+        addu $4, $4, $2
+        lw $4, 0($4)
+        jr $4
+        nop
+    case0:
+        jr $31
+        addiu $2, $0, 10
+    case1:
+        jr $31
+        lw $2, -0x10($28)
+    case2:
+        lui $3, %hi(D_00300010)
+        lw $2, %lo(D_00300010)($3)
+        jr $31
+        addiu $2, $2, 1
+    other:
+        jr $31
+        addiu $2, $0, -1
+"""
+SYMBOLS = {"jtbl_00300000": 0x00300000, "D_00300010": 0x00300010}
+
+
+def words_of(text: str) -> list[int]:
+    return [int.from_bytes(bytes.fromhex(m.split()[2]), "little")
+            for m in (l.split("/*")[1].split("*/")[0] for l in text.splitlines() if "/*" in l and "*/" in l)
+            if len(m.split()) == 3]
+
+
+def elf(segments: list[tuple[int, bytes]]) -> bytes:
+    """A minimal EE executable: the ELF header and one loadable program header a segment."""
+    n = len(segments)
+    head = 52 + 32 * n
+    out = bytearray(struct.pack("<4s5B7x2H5I6H", b"\x7fELF", 1, 1, 1, 0, 0, 2, 8, 1, segments[0][0], 52, 0, 0,
+                                52, 32, n, 40, 0, 0))
+    offset = head
+    for va, data in segments:
+        out += struct.pack("<8I", 1, offset, va, va, len(data), len(data), 7, 16)
+        offset += len(data)
+    for _, data in segments:
+        out += data
+    return bytes(out)
+
+
+def program(words: dict[int, list[int]]) -> retail.Retail:
+    r = retail.Retail(None, {}, 0x00200000)
+    r.exe = [retail.Part("text", base, struct.pack(f"<{len(w)}I", *w), True) for base, w in words.items()]
+    return r
+
+
+class Pairs(unittest.TestCase):
+    def test_entry_discovery_excludes_plain_jump_labels(self):
+        r = program({0x100000: [0x0C040040, 0, 0x08040080, 0],
+                     0x100100: [0x03E00008, 0], 0x100200: [0x03E00008, 0]})
+        self.assertIn((-1, 0x100100), r.called(include_jumps=False))
+        self.assertNotIn((-1, 0x100200), r.called(include_jumps=False))
+        self.assertIn((-1, 0x100200), r.called())
+
+    def code(self, r: retail.Retail, starts: dict[int, str]) -> retail.RetailCode:
+        return retail.RetailCode(r, {-1: starts}, r.low)
+
+    def test_relocations_and_jump_table_as_the_assembly_says(self):
+        text = assembler.assemble("func_00100000", 0x00100000, JUMP_TABLE, SYMBOLS)
+        labels = assembler.label_addresses(0x00100000, JUMP_TABLE)
+        words = words_of(text)
+        table = [labels["case0"], labels["case1"], labels["case2"]]
+        r = program({0x00100000: words, 0x00300000: table + [0, 41]})
+        code = self.code(r, {0x00100000: "func_00100000"})
+        lines = {a: code.get((-1, a))[0] for a in range(0x00100000, 0x00100000 + 4 * len(words), 4)}
+        from_text = {l.addr: l.reloc for l in asm.parse_file(self._file(text))[0].lines if l.reloc}
+        # Each lui the assembly writes as %hi(symbol) has its pair here: the table, then a global.
+        lui = {a: l.reloc for a, l in lines.items() if l.reloc}
+        self.assertEqual(sorted(lui), sorted(a for a, rel in from_text.items() if rel[0] == "hi"))
+        self.assertEqual([rel[1] for _, rel in sorted(lui.items())], ["jtbl_00300000", "D_00300010"])
+        block = code.get((-1, 0x00100000))[1]
+        self.assertEqual(list(block.tables.values()), [table])
+
+    def test_a_levels_six_digit_name_starts_nothing_in_the_executable(self):
+        # Going Commando's level 2 C calls func_316150, level 2's function at that address. In
+        # the executable 0x316150 is inside func_00315E20, whose jump table goes past it.
+        class Program:
+            functions = {"func_00315E20": None, "func_316150": None, "func_00316248": None, "func_80316248": None}
+            level_short_names = re.compile(r"^func_(?:80(?=[0-9A-F]{6}$))?(?P<addr>[0-9A-F]{6,8})$")
+            executable_starts = {0x315E20, 0x316248}
+
+            def code_places(self, sym):
+                return [(-1, int(sym[-6:], 16))] + ([(2, 0x316150)] if sym == "func_316150" else [])
+
+        starts = retail.starts_of(Program())
+        self.assertEqual(sorted(starts[-1]), [0x315E20, 0x316248])
+        self.assertEqual(starts[2], {0x316150: "func_316150"})
+
+    def test_a_lui_in_a_delay_slot_pairs_at_the_branch_target(self):
+        source = """
+            bne $4, $0, there
+            lui $3, %hi(D_00300040)
+            jr $31
+            daddu $2, $0, $0
+        there:
+            jr $31
+            lw $2, %lo(D_00300040)($3)
+        """
+        words = words_of(assembler.assemble("func_00100000", 0x00100000, source, {"D_00300040": 0x00300040}))
+        code = self.code(program({0x00100000: words}), {0x00100000: "func_00100000"})
+        self.assertEqual(code.get((-1, 0x00100004))[0].reloc, ("hi", "D_00300040", 0))
+
+    def test_a_lui_in_a_likely_branch_slot_is_not_completed_on_the_way_past(self):
+        # Going Commando's func_L00_004195C8: bc1tl's slot holds the callback's lui, completed at
+        # the target; the fall-through's addiu through the same register completes another value
+        # the slot never gave it.
+        source = """
+            beql $4, $0, there
+            lui $3, %hi(D_00300040)
+            addiu $3, $3, 0x30
+            jr $31
+            daddu $2, $3, $0
+        there:
+            jr $31
+            lw $2, %lo(D_00300040)($3)
+        """
+        words = words_of(assembler.assemble("func_00100000", 0x00100000, source, {"D_00300040": 0x00300040}))
+        code = self.code(program({0x00100000: words}), {0x00100000: "func_00100000"})
+        self.assertEqual(code.get((-1, 0x00100004))[0].reloc, ("hi", "D_00300040", 0))
+
+    def test_a_function_address_names_the_function(self):
+        source = """
+            lui $4, %hi(func_00100100)
+            jr $31
+            addiu $4, $4, %lo(func_00100100)
+        """
+        words = words_of(assembler.assemble("func_00100000", 0x00100000, source, {"func_00100100": 0x00100100}))
+        r = program({0x00100000: words, 0x00100100: [0x03E00008, 0]})
+        code = self.code(r, {0x00100000: "func_00100000", 0x00100100: "func_00100100"})
+        self.assertEqual(code.get((-1, 0x00100000))[0].reloc, ("hi", "func_00100100", 0))
+        # Calls and the code addresses handed on, for entries with no label of their own.
+        r.low = 0x00100000
+        self.assertIn((-1, 0x00100100), r.called())
+
+    def test_elf_sections_or_segments(self):
+        image = elf([(0x00100000, struct.pack("<2I", 0x03E00008, 0))])
+        (part,) = retail.elf_parts(image)
+        self.assertEqual((part.base, part.code, part.word(0x00100000)), (0x00100000, True, 0x03E00008))
+
+    def _file(self, text: str) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        p = d / "func_00100000.s"
+        p.write_text(text)
+        return p
+
+
+class AssemblyFiles(unittest.TestCase):
+    def test_a_function_written_as_data_is_code(self):
+        text = "\n".join([
+            ".align 3", "nonmatching func_00100000", "", "dlabel func_00100000",
+            "    /* 0 00100000 0800E003 */ .word 0x03E00008",
+            "    /* 4 00100004 00000000 */ .word 0x00000000", "", "nonmatching D_00100008", "",
+            "dlabel D_00100008", "    /* 8 00100008 FF00FF00 */ .word 0x00FF00FF", ""])
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "func_00100000.s"
+            p.write_text(text)
+            (block,) = asm.parse_file(p)
+        self.assertEqual(block.name, "func_00100000")
+        self.assertEqual([l.word for l in block.lines], [0x03E00008, 0])
+
+    def test_an_entry_with_no_label(self):
+        text = assembler.assemble("func_00100000", 0x00100000, "addiu $2, $0, 1\njr $31\nnop\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "func_00100000.s").write_text(text)
+            index = asm.read_index([Path(tmp)], lambda name: -1)
+        # Inside the function: only for the decompilation's own stub, or where code calls it.
+        self.assertIsNone(index.find(["func_00100004"], [(-1, 0x00100004)]))
+        self.assertEqual(index.find(["func_00100004"], [(-1, 0x00100004)], own=True), (-1, 0x00100004))
+        index.called.add((-1, 0x00100004))
+        self.assertEqual(index.find(["func_00100004"], [(-1, 0x00100004)]), (-1, 0x00100004))
+
+
+try:
+    import test_hostgen  # noqa: E402
+    HAVE_CLANG = test_hostgen.have_compiler()
+except Exception:   # noqa: BLE001
+    HAVE_CLANG = False
+
+
+@unittest.skipUnless(HAVE_CLANG, "needs Clang on a POSIX host")
+class FromRetail(unittest.TestCase):
+    """The same program translated from the retail bytes gives the same C and the same results as
+    from its assembly files."""
+
+    def run_both(self, c: str, start: int, source: str, data: dict[int, list[int]]) -> tuple[list[str], list[str]]:
+        t = test_hostgen.FromAssembly("run_asm")
+        text = assembler.assemble("func_00100000", start, source, SYMBOLS,
+                             {"jtbl_00300000": ["case0", "case1", "case2"]})
+        from_files = t.run_program({"a.c": c}, config=test_hostgen.ASM_CONFIG,
+                                   extra_files={"game/asm/func_00100000.s": text})
+        files_c = t.last_generated
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "game.elf"
+            exe.write_bytes(elf([(start, struct.pack(f"<{len(words_of(text))}I", *words_of(text)))]
+                                + [(a, struct.pack(f"<{len(w)}I", *w)) for a, w in data.items()]))
+            from_bytes = t.run_program({"a.c": c}, config=test_hostgen.ASM_CONFIG,
+                                       hostgen_args=["--retail-exe", str(exe)])
+            self.assertEqual(t.last_report["functions_from_assembly"], 1)
+        bytes_c = t.last_generated
+        strip = lambda s: "\n".join(l for l in s.splitlines() if "translated from its assembly" not in l)
+        self.assertEqual(strip(files_c), strip(bytes_c))
+        return from_files, from_bytes
+
+    def test_jump_table_and_globals(self):
+        labels = assembler.label_addresses(0x00100000, JUMP_TABLE)
+        c = f"""
+            extern unsigned int D_00300000[8];
+            extern int D_0017FFF0;
+            INCLUDE_ASM("asm", func_00100000);
+            extern int func_00100000(int);
+            int test_main(void) {{
+                D_00300000[0] = 0x{labels['case0']:08X}u;
+                D_00300000[1] = 0x{labels['case1']:08X}u;
+                D_00300000[2] = 0x{labels['case2']:08X}u;
+                D_00300000[4] = 41;
+                D_0017FFF0 = 20;
+                test_print(func_00100000(0)); test_print(func_00100000(1));
+                test_print(func_00100000(2)); test_print(func_00100000(9));
+                return 0;
+            }}
+        """
+        table = [labels["case0"], labels["case1"], labels["case2"]]
+        a, b = self.run_both(c, 0x00100000, JUMP_TABLE, {0x00300000: table})
+        self.assertEqual(a, ["10", "20", "42", "-1"])
+        self.assertEqual(b, a)
+
+
+@unittest.skipUnless(HAVE_CLANG, "needs Clang on a POSIX host")
+class SoftDoubles(unittest.TestCase):
+    """A double is software on the EE, its 64 bits in one general register: a parameter, an
+    argument passed on and a result. ei and di do nothing (the port takes no interrupts)."""
+
+    def test_double_in_a_general_register(self):
+        c = """
+            double func_00200000(double d, int k) { test_print((int)(d * 10.0)); test_print(k); return d * 2.0; }
+            INCLUDE_ASM("asm", func_00100000);
+            extern double func_00100000(double d, int k);
+            int test_main(void) { test_print((int)(func_00100000(1.5, 7) * 10.0)); return 0; }
+        """
+        source = """
+            addiu $29, $29, -16
+            sq $31, 0($29)
+            di
+            jal func_00200000         # (d, k) as they came, in $a0 and $a1
+            nop
+            ei
+            lq $31, 0($29)
+            jr $31
+            addiu $29, $29, 16
+        """
+        t = test_hostgen.FromAssembly("run_asm")
+        out = t.run_asm(c, {"func_00100000": (0x00100000, source)}, symbols={"func_00200000": 0x00200000})
+        self.assertEqual(out, ["15", "7", "30"])
+        self.assertEqual(t.last_report["functions_from_assembly"], 1)
+
+
+@unittest.skipUnless(HAVE_CLANG, "needs Clang on a POSIX host")
+class CallsThroughRegisters(unittest.TestCase):
+    """A jalr in C from assembly reaches the callee's parameters as the EE passes them, by the
+    cast (System V, AArch64) and by each function's thunk (Windows x64; OPENRAC_REGS_THUNKS)."""
+
+    def test_floats_and_integers_reach_their_parameters(self):
+        c = """
+            float func_00200000(float a, int b, float c, int d) {
+                test_print_float(a); test_print(b); test_print_float(c); test_print(d);
+                return a * 2.0f + (float)(b + d);
+            }
+            int func_00200100(int a, int b) { return a - b; }
+            INCLUDE_ASM("asm", func_00100000);
+            extern int func_00100000(int a, int b, float f);
+            int test_main(void) { test_print(func_00100000(7, 3, 1.5f)); return 0; }
+        """
+        source = """
+            addiu $29, $29, -16
+            sq $31, 0($29)
+            lui $25, %hi(func_00200000)
+            addiu $25, $25, %lo(func_00200000)
+            mov.s $f13, $f12          # c = f
+            jalr $31, $25             # (f, a, f, b): the floats in $f12, $f13, the integers in $a0, $a1
+            nop
+            cvt.w.s $f0, $f0
+            mfc1 $16, $f0
+            lui $25, %hi(func_00200100)
+            addiu $25, $25, %lo(func_00200100)
+            daddu $4, $16, $0
+            jalr $31, $25             # (result, b)
+            addiu $5, $0, 4
+            lq $31, 0($29)
+            jr $31
+            addiu $29, $29, 16
+        """
+        symbols = {"func_00200000": 0x00200000, "func_00200100": 0x00200100}
+        t = test_hostgen.FromAssembly("run_asm")
+        files = {"game/asm/func_00100000.s": assembler.assemble("func_00100000", 0x00100000, source, symbols)}
+        want = ["1.500", "7", "1.500", "3", "9"]
+        for flags in ([], ["-DOPENRAC_REGS_THUNKS=1"]):
+            with self.subTest(flags=flags):
+                out = t.run_program({"a.c": c}, config=test_hostgen.ASM_CONFIG, extra_files=files, cflags=flags)
+                self.assertEqual(out, want)
+
+
+def tiny_iso(files: dict[str, bytes]) -> bytes:
+    """A flat ISO 9660 image of FILES (root directory only), one sector per 2 KiB of each file."""
+    sector = 2048
+
+    def record(name: bytes, lba: int, size: int, flags: int = 0) -> bytes:
+        n = 33 + len(name) + (1 - len(name) % 2)
+        r = bytearray(n)
+        r[0] = n
+        struct.pack_into("<I", r, 2, lba)
+        struct.pack_into(">I", r, 6, lba)
+        struct.pack_into("<I", r, 10, size)
+        struct.pack_into(">I", r, 14, size)
+        r[25] = flags
+        r[32] = len(name)
+        r[33:33 + len(name)] = name
+        return bytes(r)
+
+    root_lba, lba = 18, 19
+    records = [record(b"\0", root_lba, sector, 2), record(b"\1", root_lba, sector, 2)]
+    body = {}
+    for name, data in files.items():
+        body[lba] = data
+        records.append(record(name.encode() + b";1", lba, len(data)))
+        lba += max(1, -(-len(data) // sector))
+    image = bytearray(lba * sector)
+    pvd = bytearray(sector)
+    pvd[0:7] = b"\x01CD001\x01"
+    struct.pack_into("<H", pvd, 128, sector)
+    struct.pack_into(">H", pvd, 130, sector)
+    pvd[156:190] = record(b"\0", root_lba, sector, 2)
+    image[16 * sector:17 * sector] = pvd
+    image[17 * sector] = 0xFF
+    image[root_lba * sector:root_lba * sector + sum(map(len, records))] = b"".join(records)
+    for at, data in body.items():
+        image[at * sector:at * sector + len(data)] = data
+    return bytes(image)
+
+
+class ReadImageTests(unittest.TestCase):
+    def test_a_disc_the_editor_does_not_know_gives_its_boot_executable_and_no_levels(self):
+        exe = b"\x7fELF" + bytes(60)
+        cnf = b"BOOT2 = cdrom0:\\SCUS_972.68;1\r\nVER = 1.00\r\n"
+        with tempfile.TemporaryDirectory() as d:
+            image = Path(d) / "gc.iso"
+            image.write_bytes(tiny_iso({"SYSTEM.CNF": cnf, "SCUS_972.68": exe, "OTHER.BIN": b"x" * 5000}))
+            got, levels = retail.read_image(image)
+        self.assertEqual(got, exe)
+        self.assertEqual(levels, {})
+
+    def test_an_image_with_no_boot_line_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            image = Path(d) / "x.iso"
+            image.write_bytes(tiny_iso({"A.BIN": b"a"}))
+            with self.assertRaises(ValueError):
+                retail.read_image(image)
+
+
+if __name__ == "__main__":
+    unittest.main()

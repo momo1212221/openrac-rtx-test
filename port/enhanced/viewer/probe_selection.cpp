@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "enhanced/viewer/probe_selection.h"
+
+#include <utility>
+#include <vector>
+
+#include "common/log.h"
+#include "common/stats.h"
+#include "enhanced/renderer/compute_graph.h"
+#include "enhanced_viewer_shaders.h"
+#include "renderer/gl.h"
+#include "renderer/render_opt.h"
+#include "renderer/world/gl_world.h"
+
+namespace openrac::lighting {
+using namespace openrac::gl;
+namespace wgl = renderer::world::gl;
+
+namespace {
+
+void block(const renderer::Shader& shader) {
+    const auto at = glGetUniformBlockIndex(shader.id(), "ProbeRegions");
+    if (at != wgl::GL_INVALID_INDEX) {
+        glUniformBlockBinding(shader.id(), at, 7);
+    }
+}
+}  // namespace
+
+bool ProbeSelection::supported() {
+    if (!enhanced_rendering_available()) {
+        return false;
+    }
+    static const bool& off =
+        stats::probe("OPENRAC_PROBE_COMPUTE_OFF", "Use the CPU/frustum probe selector");
+    if (off || !glDispatchCompute || !glMemoryBarrier) {
+        return false;
+    }
+    GLint bindings = 0;
+    glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &bindings);
+    GLint block_bytes = 0;
+    glGetIntegerv(0x8A30, &block_bytes);  // GL_MAX_UNIFORM_BLOCK_SIZE
+    return bindings >= 9 && block_bytes >= int(std::size_t{capacity} * 3 * 4 * sizeof(float));
+}
+
+void ProbeSelection::ensure_buffers() const {
+    if (m_buffers[0]) {
+        return;
+    }
+    glGenBuffers(3, m_buffers.data());
+    std::array<float, capacity * 3 * 4> zeros{};
+    glBindBuffer(wgl::GL_UNIFORM_BUFFER, m_buffers[0]);
+    glBufferData(wgl::GL_UNIFORM_BUFFER, sizeof(zeros), zeros.data(), GL_STATIC_DRAW);
+    glBindBuffer(wgl::GL_TEXTURE_BUFFER, m_buffers[1]);
+    glBufferData(wgl::GL_TEXTURE_BUFFER, sizeof(unsigned), zeros.data(), GL_DYNAMIC_DRAW);
+    glGenTextures(1, &m_mask_texture);
+    glActiveTexture(GL_TEXTURE0 + 15);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_mask_texture);
+    glTexBuffer(wgl::GL_TEXTURE_BUFFER, wgl::GL_R32UI, m_buffers[1]);
+    glBindBuffer(wgl::GL_TEXTURE_BUFFER, m_buffers[2]);
+    glBufferData(
+        wgl::GL_TEXTURE_BUFFER, (selected_capacity + 1) * sizeof(unsigned), nullptr, GL_DYNAMIC_DRAW
+    );
+    glGenTextures(1, &m_secondary_texture);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_secondary_texture);
+    glTexBuffer(wgl::GL_TEXTURE_BUFFER, wgl::GL_R32UI, m_buffers[2]);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+bool ProbeSelection::prepare(
+    std::span<const lighting::ProbeGrid> grids,
+    std::span<const unsigned> offsets,
+    std::string& error
+) {
+    release();
+    ensure_buffers();
+    if (!supported() || grids.empty() || grids.size() > capacity
+        || offsets.size() != grids.size()) {
+        return false;
+    }
+    bool split = false;
+    if (renderer::render_opt::enabled(renderer::render_opt::Opt::ProbeSelectionVariants)) {
+        std::string tile_source(shaders::probe_selection_comp), select_source(tile_source);
+        select_source.insert(select_source.find('\n') + 1, "#define OPENRAC_PROBE_SHORTLIST 1\n");
+        tile_source.insert(tile_source.find('\n') + 1, "#define OPENRAC_PROBE_TILES 1\n");
+        split = m_select.build_compute("probe region shortlist", select_source, error)
+                && m_cull.build_compute("tiled probe-volume culling", tile_source, error);
+        if (!split) {
+            log::warn("Split probe kernels unavailable: {}; using the combined kernel", error);
+            m_select.release();
+            m_cull.release();
+            error.clear();
+        }
+    }
+    if (!split
+        && !m_cull.build_compute(
+            "tiled probe-volume culling", shaders::probe_selection_comp, error
+        )) {
+        return false;
+    }
+    m_count = static_cast<unsigned>(grids.size());
+    std::array<std::array<float, 4>, capacity * 3> metadata{};
+    for (unsigned i = 0; i < m_count; ++i) {
+        for (unsigned a = 0; a < 3; ++a) {
+            metadata[i * 3][a] = grids[i].origin[a];
+            metadata[i * 3 + 1][a] = grids[i].spacing[a];
+            metadata[i * 3 + 2][a] = float(grids[i].dimensions[a]);
+        }
+        metadata[i * 3][3] = float(offsets[i]);
+        metadata[i * 3 + 1][3] = grids[i].frame.axis[0];
+        metadata[i * 3 + 2][3] = grids[i].frame.axis[1];
+    }
+    glBindBuffer(wgl::GL_UNIFORM_BUFFER, m_buffers[0]);
+    glBufferData(wgl::GL_UNIFORM_BUFFER, sizeof(metadata), metadata.data(), GL_STATIC_DRAW);
+    block(m_cull);
+    if (m_select.id()) {
+        block(m_select);
+    }
+    return true;
+}
+
+void ProbeSelection::dispatch(
+    unsigned depth, const renderer::Camera& camera, int width, int height
+) {
+    if (!available() || !depth || width <= 0 || height <= 0) {
+        return;
+    }
+    constexpr unsigned kWords = selected_capacity / 32;
+    const auto tiles_x = (width + 15) / 16, tiles_y = (height + 15) / 16;
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, m_buffers[1]);
+    if (width != m_width || height != m_height) {
+        std::vector<unsigned> zeros(
+            selected_capacity + 1 + std::size_t(tiles_x) * tiles_y * kWords * 2, 0
+        );
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_buffers[1]);
+        glBufferData(
+            GL_SHADER_STORAGE_BUFFER, zeros.size() * sizeof(unsigned), zeros.data(), GL_DYNAMIC_DRAW
+        );
+    }
+    glBindBufferBase(wgl::GL_UNIFORM_BUFFER, 7, m_buffers[0]);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, depth);
+    m_clip = renderer::multiply(camera.projection, camera.view);
+    m_translucent_tiles =
+        renderer::render_opt::enabled(renderer::render_opt::Opt::ProbeTranslucentTiles);
+    if (!dispatch_masks(camera, static_cast<unsigned>(tiles_x), static_cast<unsigned>(tiles_y))) {
+        m_started = false;
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return;
+    }
+    m_started = true;
+    m_width = width;
+    m_height = height;
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void ProbeSelection::bind(
+    const renderer::Shader& shader, const renderer::Camera* camera, bool depth_matched
+) const {
+    ensure_buffers();
+    GLint viewport[4]{};
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    static const bool& reference = stats::probe(
+        "OPENRAC_PROBE_TILED_REFERENCE", "Evaluate all selected probe volumes per fragment"
+    );
+    const bool same_view =
+        !camera || renderer::multiply(camera->projection, camera->view) == m_clip;
+    // Secondary views get their own nearest-128 lookup without changing the
+    // primary view's tile masks. Cache until their camera changes.
+    if (active() && !same_view && camera) {
+        const auto clip = renderer::multiply(camera->projection, camera->view);
+        if (!m_secondary_valid || clip != m_secondary_clip
+            || camera->position != m_secondary_position) {
+            glBindBufferBase(wgl::GL_UNIFORM_BUFFER, 7, m_buffers[0]);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, m_buffers[2]);
+            const auto& select = m_select.id() ? m_select : m_cull;
+            select.use();
+            const std::array<enhanced::ComputeOutput, 1> outputs{
+                {{m_buffers[2], (selected_capacity + 1) * sizeof(unsigned)}}
+            };
+            std::string error;
+            // Secondary shortlists read metadata only; the combined kernel's depth branch is inactive.
+            if (!enhanced::run_compute_graph(
+                    "secondary probe shortlist",
+                    outputs,
+                    [&] { dispatch_shortlist(clip, camera->position); },
+                    error,
+                    enhanced::ComputeInputs::UniformBlocks
+                )) {
+                log::warn("secondary probe graph unavailable: {}", error);
+                m_secondary_valid = false;
+                shader.use();
+                glUniform1i(shader.uniform("probe_gpu_selection"), 0);
+                return;
+            }
+            shader.use();
+            m_secondary_clip = clip;
+            m_secondary_position = camera->position;
+            m_secondary_valid = true;
+        }
+    }
+    const bool tiled = !reference && same_view && viewport[0] == 0 && viewport[1] == 0
+                       && viewport[2] == m_width && viewport[3] == m_height;
+    // Blended receivers use the complete tile frustum, never opaque depth bounds.
+    // Secondary cameras and mismatched viewports keep the full selected lookup.
+    const bool broad =
+        camera && m_translucent_tiles
+        && renderer::render_opt::enabled(renderer::render_opt::Opt::ProbeTranslucentTiles);
+    const int mode = tiled ? (depth_matched ? 1 : broad ? 3 : 2) : 2;
+    glUniform1i(shader.uniform("probe_gpu_selection"), active() ? mode : 0);
+    glUniform1i(shader.uniform("probe_region_count"), static_cast<int>(m_count));
+    glUniform2f(shader.uniform("probe_tile_extent"), float(m_width), float(m_height));
+    glUniform1i(shader.uniform("probe_region_masks"), 15);
+    block(shader);
+    glBindBufferBase(wgl::GL_UNIFORM_BUFFER, 7, m_buffers[0]);
+    glActiveTexture(GL_TEXTURE0 + 15);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, same_view ? m_mask_texture : m_secondary_texture);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+void ProbeSelection::release() {
+    m_cull.release();
+    m_select.release();
+    if (m_buffers[0]) {
+        glDeleteBuffers(3, m_buffers.data());
+    }
+    if (m_mask_texture) {
+        glDeleteTextures(1, &m_mask_texture);
+    }
+    if (m_secondary_texture) {
+        glDeleteTextures(1, &m_secondary_texture);
+    }
+    m_secondary_texture = 0;
+    m_secondary_valid = false;
+    m_buffers = {};
+    m_mask_texture = 0;
+    m_width = m_height = 0;
+    m_count = 0;
+    m_started = false;
+    m_translucent_tiles = false;
+}
+}  // namespace openrac::lighting

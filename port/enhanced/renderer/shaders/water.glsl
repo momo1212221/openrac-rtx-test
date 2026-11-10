@@ -1,0 +1,440 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef OPENRAC_EFFECT_WORLD
+in vec3 v_world;
+#endif
+in vec3 v_water_rest;
+flat in vec2 v_water_art_axis;
+uniform samplerBuffer water_bodies;
+uniform sampler2D water_coast_map;
+uniform sampler2D water_wave_map;
+uniform vec4 water_atlas[64];
+uniform vec2 water_atlas_extent;
+uniform samplerBuffer water_light;
+uniform int water_body_count;
+uniform int water_surface;
+uniform float water_time;
+uniform float water_current_scale;
+uniform float water_fine_strength;
+uniform vec3 water_eye;
+uniform int water_debug_view;
+uniform float water_debug_height_limit;
+
+vec4 water_cell(samplerBuffer field, int offset, ivec2 extent, ivec2 p) {
+    p=clamp(p,ivec2(0),extent-1);
+    return texelFetch(field,offset+p.y*extent.x+p.x);
+}
+vec4 water_cached_light(int offset,ivec2 extent,vec2 p) {
+    ivec2 i=ivec2(floor(p));vec2 f=fract(p);
+    vec4 a=water_cell(water_light,offset,extent,i),b=water_cell(water_light,offset,extent,i+ivec2(1,0));
+    vec4 c=water_cell(water_light,offset,extent,i+ivec2(0,1)),d=water_cell(water_light,offset,extent,i+ivec2(1,1));
+    vec4 weights=vec4((1.-f.x)*(1.-f.y),f.x*(1.-f.y),(1.-f.x)*f.y,f.x*f.y)
+                 *step(vec4(0),vec4(a.w,b.w,c.w,d.w));
+    float sum=dot(weights,vec4(1));
+    return sum>.001?(a*weights.x+b*weights.y+c*weights.z+d*weights.w)/sum:vec4(vec3(3.14159265*.65),1);
+}
+// Smooth simulation slopes, independent of the displacement mesh's triangle edges.
+vec4 water_surface_gradients(vec2 cell,vec2 origin,vec2 extent,float dx,float height,out float rotation,out float compression,out float curvature) {
+    vec2 lo=clamp(cell-1.,vec2(.5),extent-.5);
+    vec2 hi=clamp(cell+1.,vec2(.5),extent-.5);
+    vec2 centre=clamp(cell,vec2(.5),extent-.5);
+    vec4 left=textureLod(water_wave_map,(origin+vec2(lo.x,centre.y))/water_atlas_extent,0.);
+    vec4 right=textureLod(water_wave_map,(origin+vec2(hi.x,centre.y))/water_atlas_extent,0.);
+    vec4 bottom=textureLod(water_wave_map,(origin+vec2(centre.x,lo.y))/water_atlas_extent,0.);
+    vec4 top=textureLod(water_wave_map,(origin+vec2(centre.x,hi.y))/water_atlas_extent,0.);
+    // Reuse the four filtered taps for physical height and advected surface detail.
+    vec2 span=max(hi-lo,vec2(.001))*dx;
+    rotation=(right.z-left.z)/span.x-(top.y-bottom.y)/span.y;
+    compression=-(right.y-left.y)/span.x-(top.z-bottom.z)/span.y;
+    vec2 lower_step=(centre-lo)*dx,upper_step=(hi-centre)*dx;
+    curvature=-water_shore_curvature(left.x,height,right.x,lower_step.x,upper_step.x)
+              -water_shore_curvature(bottom.x,height,top.x,lower_step.y,upper_step.y);
+    return vec4((right.x-left.x)/span.x,(top.x-bottom.x)/span.y,
+                (right.w-left.w)/span.x,(top.w-bottom.w)/span.y);
+}
+vec2 water_height_gradient(vec2 cell,vec2 origin,vec2 extent,float dx) {
+    float rotation,compression,curvature;
+    return water_surface_gradients(cell,origin,extent,dx,0.,rotation,compression,curvature).xy;
+}
+vec3 water_smooth_normal(vec3 rest_normal,vec2 gradient) {
+    // Novalis rest surfaces and displacement are height fields in world XY/Z.
+    if(rest_normal.z<0.) rest_normal=-rest_normal;
+    vec2 rest_gradient=-rest_normal.xy/max(rest_normal.z,1e-5);
+    // Small slope changes must survive normalization and the specular response.
+    return normalize(vec3(-(rest_gradient+gradient),1.));
+}
+// Air/water interface (IOR 1.333); shared Schlick Fresnel and GGX/Smith BRDF.
+uniform vec3 water_material; // Roughness, normal-incidence reflectivity, reflection strength.
+#ifdef OPENRAC_OCEAN_SPECTRUM
+uniform vec3 water_ocean_colour;
+uniform vec3 water_ocean_absorption;
+#endif
+float water_fresnel(float cosine) {
+    // Keep the water interface response FP32 while retaining live material controls.
+    float f=1.-clamp(cosine,0.,1.);
+    return water_material.y+(1.-water_material.y)*f*f*f*f*f;
+}
+float water_specular(vec3 n, vec3 eye, vec3 light, float roughness) {
+    return ggx_specular_fp32(n, eye, light, roughness, water_material.y);
+}
+vec3 water_transmittance(float depth,float nv) {
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    // The ocean can have long optical paths and zero absorption in individual channels.
+    float transmitted_cosine=sqrt(1.-(1.-nv*nv)/(1.333*1.333));
+    return exp(-water_ocean_absorption*max(depth,0.)/transmitted_cosine);
+#elif defined(OPENRAC_USE_FP16)
+    mp_float cosine=mp_float(clamp(nv,0.,1.)),ior=mp_float(1.333);
+    mp_float transmitted_cosine=sqrt(mp_float(1)-(mp_float(1)-cosine*cosine)/(ior*ior));
+    return vec3(exp(-mp_vec3(.85,.24,.12)*mp_float(max(depth,0.))/transmitted_cosine));
+#else
+    float transmitted_cosine=sqrt(1.-(1.-nv*nv)/(1.333*1.333));
+    return exp(-vec3(.85,.24,.12)*max(depth,0.)/transmitted_cosine);
+#endif
+}
+vec3 water_direct_specular(vec3 p,vec3 n,vec3 eye,float roughness,float shadow,out vec3 irradiance) {
+    vec3 result=vec3(0);
+    irradiance=vec3(0);
+    for(int light=0;light<2;++light) {
+        vec3 direction=light_sets[light*2+1].xyz;
+        if(light==0 && probe_sunlight_direction.w!=0.) direction=probe_sunlight_direction.xyz;
+        if(dot(direction,direction)<1e-8) continue;
+        vec3 radiance=max(light_sets[light*2].rgb,vec3(0));
+        if(light==0) radiance*=probe_sunlight_scale*shadow;
+        vec3 light_direction=-normalize(direction);
+        irradiance+=radiance*float(max(dot(mp_vec3(n),mp_vec3(light_direction)),mp_float(0)));
+        result+=radiance*water_specular(n,eye,light_direction,roughness);
+    }
+    LOCAL_LIGHT_LOOP(i) {
+        vec3 delta=LOCAL_POSITION(i).xyz-p;
+        float radius=LOCAL_POSITION(i).w,distance=length(delta);
+        if(radius<=0. || distance>=radius || distance<1e-6) continue;
+        vec3 radiance=max(LOCAL_COLOUR(i).rgb,vec3(0))*LOCAL_ATTENUATION(distance,radius)*LOCAL_CONE(i,delta/distance);
+        irradiance+=radiance*float(max(dot(mp_vec3(n),mp_vec3(delta/distance)),mp_float(0)));
+        result+=radiance*water_specular(n,eye,delta/distance,roughness);
+    }
+    return result;
+}
+// Fine ripples are stylised optical detail independent of simulation resolution.
+// Inputs are explicit so the same production helpers can be checked on the GPU.
+vec2 water_art_direction(vec2 dpdx,vec2 dpdy,vec2 dtdx,vec2 dtdy,vec2 fallback) {
+    vec2 axis=dpdx*dtdy.y-dpdy*dtdx.y;
+    if(dot(axis,axis)<1e-14) axis=fallback;
+    if(dot(axis,axis)<1e-8) axis=vec2(1,0);
+    axis=normalize(axis);
+    // Mirrored UVs must not flip the fine pattern at otherwise identical seams.
+    if(axis.x<0. || (abs(axis.x)<1e-5 && axis.y<0.)) axis=-axis;
+    return axis;
+}
+float water_ripple_band(vec2 k,vec2 dpdx,vec2 dpdy) {
+    float footprint=max(dot(abs(k),abs(dpdx)),dot(abs(k),abs(dpdy)));
+    // Fade wavelengths approaching two pixels, avoiding distant sparkling.
+    return 1.-smoothstep(1.,3.14159265,footprint);
+}
+// Analytic slopes of broad, curved wavelets. Low-frequency bending and a
+// varying envelope break up the straight repeating lines without texture reads.
+vec2 water_stylised_gradient(vec2 p,vec2 axis,float time,vec2 dpdx,vec2 dpdy) {
+    vec2 side=vec2(-axis.y,axis.x);
+    vec2 bend_k=axis*.61+side*.93;
+    float bend_phase=dot(p,bend_k)+time*.19;
+    float bend=sin(bend_phase);
+    vec2 bend_gradient=bend_k*cos(bend_phase);
+    vec2 envelope_k=axis*.83-side*.47;
+    float envelope_phase=dot(p,envelope_k)-time*.13;
+    float envelope=.7+.3*sin(envelope_phase);
+    vec2 envelope_gradient=.3*envelope_k*cos(envelope_phase);
+    vec2 k1=(axis*.94+side*.34)*(6.28318531/1.1);
+    vec2 k2=(-axis*.35+side*.94)*(6.28318531/.67);
+    float phase1=dot(p,k1)+1.6*bend-time*.75;
+    float phase2=dot(p,k2)-1.1*bend+time*.53+.8;
+    // Filter with a conservative bound on the bent phase derivatives.
+    float a1=.014*water_ripple_band(abs(k1)+1.6*abs(bend_k),dpdx,dpdy);
+    float a2=.006*water_ripple_band(abs(k2)+1.1*abs(bend_k),dpdx,dpdy);
+    float height=a1*sin(phase1)+a2*sin(phase2);
+    vec2 slope=a1*(k1+1.6*bend_gradient)*cos(phase1)
+              +a2*(k2-1.1*bend_gradient)*cos(phase2);
+    return envelope*slope+envelope_gradient*height;
+}
+vec2 water_fine_gradient(vec2 p,vec2 velocity,vec2 axis,float time,vec2 dpdx,vec2 dpdy,float strength) {
+    if(strength<=0.) return vec2(0);
+    // Two overlapping flow phases reset distortion invisibly at zero weight.
+    // The pattern also moves at zero velocity, including the still pond.
+    float phase=fract(time/1.5);
+    vec2 q0=p-velocity*(phase*1.5);
+    vec2 q1=p-velocity*(fract(phase+.5)*1.5);
+    vec2 g0=water_stylised_gradient(q0,axis,time,dpdx,dpdy);
+    vec2 g1=water_stylised_gradient(q1,axis,time,dpdx,dpdy);
+    return strength*mix(g1,g0,1.-abs(phase*2.-1.));
+}
+float water_shore_weight(vec4 coast) {
+    return clamp(coast.x,0.,1.)*smoothstep(0.,1.2,coast.y)*smoothstep(.03,.4,coast.z);
+}
+// Raised plateaus and broad swells do not create foam: only sharp, steep or converging crests.
+float water_breaking_foam(vec2 slope,float curvature,float compression,float marker) {
+    float sharp=smoothstep(.35,1.5,curvature);
+    float steep=smoothstep(.12,.35,length(slope));
+    float converging=smoothstep(.5,2.5,compression);
+    float breakup=.25+.75*smoothstep(.25,.85,marker);
+    return .18*sharp*max(steep,converging)*breakup;
+}
+#ifdef OPENRAC_OCEAN
+uniform int water_mesh;
+#endif
+#ifdef OPENRAC_OCEAN_SPECTRUM
+uniform vec4 water_ocean_dry[8];
+uniform int water_ocean_dry_count;
+#endif
+vec3 effect_material(vec3 painted) {
+#ifdef OPENRAC_OCEAN
+    if (water_mesh==0) return painted;
+#endif
+    if (water_surface==0) return painted;
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    for (int i=0;i<water_ocean_dry_count;++i) {
+        vec4 bounds=water_ocean_dry[i];
+        if (all(greaterThanEqual(v_water_rest.xy,bounds.xy))
+            && all(lessThan(v_water_rest.xy,bounds.zw))) discard;
+    }
+#endif
+    int chosen=-1; vec2 uv=vec2(0);
+    for (int i=0;i<water_body_count;++i) {
+        vec4 origin=texelFetch(water_bodies,i*5);
+        if (int(origin.w)!=water_surface) continue;
+        vec4 u=texelFetch(water_bodies,i*5+1),v=texelFetch(water_bodies,i*5+2);
+        float dx=texelFetch(water_bodies,i*5+4).z;
+        vec3 delta=v_water_rest-origin.xyz;
+        vec2 p=vec2(dot(delta,u.xyz),dot(delta,v.xyz))/dx;
+#ifdef OPENRAC_OCEAN
+        chosen=i; uv=p-.5; break;
+#else
+        if (all(greaterThanEqual(p,vec2(0))) && all(lessThan(p,vec2(u.w,v.w)))) {
+            chosen=i; uv=p-.5; break;
+        }
+#endif
+    }
+    // Pixels off every body stay in the quad: dFdx below is undefined once a neighbour has returned.
+    const bool outside=chosen<0;
+    if(outside) chosen=0;
+    vec4 origin=texelFetch(water_bodies,chosen*5);
+    vec4 u=texelFetch(water_bodies,chosen*5+1),v=texelFetch(water_bodies,chosen*5+2);
+    vec4 plane=texelFetch(water_bodies,chosen*5+3);
+    vec4 flow=texelFetch(water_bodies,chosen*5+4);
+    int offset=int(plane.w); ivec2 size=ivec2(u.w,v.w); float dx=flow.z;
+    vec2 map_uv=(water_atlas[chosen].xy+clamp(uv+.5,vec2(.5),vec2(size)-.5))/water_atlas_extent;
+    vec4 coast=texture(water_coast_map,map_uv);
+#ifdef OPENRAC_OCEAN
+    if (any(lessThan(uv+.5,vec2(0.))) || any(greaterThanEqual(uv+.5,vec2(size)))) {
+        coast=vec4(1.,2.,1.,v_water_rest.z);
+    }
+#endif
+    vec2 maintained_current=flow.xy*.8*water_current_scale;
+    int sample_body=water_sim_shared_body(chosen,v_water_rest.z);
+    vec4 wave=water_sim_sample(water_wave_map,v_water_rest.xy,sample_body,map_uv,maintained_current);
+    float h=wave.x;
+    if(water_debug_view==1) {
+        float value=clamp(h/max(water_debug_height_limit,.001),-1.,1.);
+        return vec3(.5)+vec3(value,0,-value)*.5;
+    }
+    if(water_debug_view==2) return vec3(clamp(.5+wave.yz/5.,vec2(0),vec2(1)),0.);
+    if(water_debug_view==3) return vec3(coast.x,exp(-coast.y*.7),0.);
+    if(water_debug_view==4) return vec3(wave.w);
+
+    // Keep the actual face for shadow receiver-plane bias, but shade smooth wave slopes.
+    vec3 surface_normal=normalize(cross(dFdx(v_world),dFdy(v_world)));
+    if(surface_normal.z<0.) surface_normal=-surface_normal;
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    // The ocean's rest surface is a plane. Its optical reference must not
+    // change with the displaced triangles or the camera-centred LOD rings.
+    vec3 rest_normal=vec3(0.,0.,1.);
+#else
+    vec3 rest_normal=normalize(cross(dFdx(v_water_rest),dFdy(v_water_rest)));
+#endif
+    float rotation,compression,crest_curvature;
+    vec4 gradients=water_sim_local!=0
+        ?water_sim_gradients(water_wave_map,v_water_rest.xy,sample_body,maintained_current,h,rotation,compression,crest_curvature)
+        :water_surface_gradients(uv+.5,water_atlas[chosen].xy,vec2(size),dx,h,rotation,compression,crest_curvature);
+    // A small optical ripple carried by the simulated flow makes horizontal
+    // eddies visible without inventing extra mesh displacement.
+    vec2 gradient=gradients.xy+gradients.zw*.045;
+#ifndef OPENRAC_OCEAN_SPECTRUM
+    // The FFT ocean already supplies fine normals. The legacy art-aligned
+    // ripple trains would otherwise repeat across the whole surface.
+    if(water_fine_strength>0.) {
+        vec2 dpdx=dFdx(v_water_rest.xy),dpdy=dFdy(v_water_rest.xy);
+        vec2 texture_uv=v_stq.xy/v_stq.z;
+        // Still pools share a ripple direction and phase across their authored triangles.
+        vec2 axis=vec2(1,0);
+        if(dot(flow.xy,flow.xy)>1e-8) {
+            axis=dot(v_water_art_axis,v_water_art_axis)>.5?v_water_art_axis
+                :water_art_direction(dpdx,dpdy,dFdx(texture_uv),dFdy(texture_uv),flow.xy);
+        }
+        float painted_weight=.9+.1*clamp(dot(painted,vec3(.2126,.7152,.0722)),0.,1.);
+        // Include the maximum flow-phase stretch in the filter footprint.
+        vec2 filter_dx=abs(dpdx)+1.5*abs(dFdx(wave.yz));
+        vec2 filter_dy=abs(dpdy)+1.5*abs(dFdy(wave.yz));
+        gradient+=water_fine_gradient(v_water_rest.xy,wave.yz,axis,water_time,filter_dx,filter_dy,
+                                      water_fine_strength*painted_weight);
+    }
+#endif
+    vec3 smooth_normal=water_smooth_normal(rest_normal,gradient);
+    // Transform both smooth tangents by the Gerstner Jacobian, including the
+    // bank taper. Rest coordinates keep the wave and simulation lookup attached.
+    // Sample shoreline data per fragment: derivatives of vertex-interpolated
+    // taper/direction change at triangle edges and facet the optical normal.
+    vec2 cell=uv+.5;
+    vec2 lo=clamp(cell-1.,vec2(.5),vec2(size)-.5);
+    vec2 hi=clamp(cell+1.,vec2(.5),vec2(size)-.5);
+    vec2 centre=clamp(cell,vec2(.5),vec2(size)-.5);
+    vec4 left=textureLod(water_coast_map,(water_atlas[chosen].xy+vec2(lo.x,centre.y))/water_atlas_extent,0.);
+    vec4 right=textureLod(water_coast_map,(water_atlas[chosen].xy+vec2(hi.x,centre.y))/water_atlas_extent,0.);
+    vec4 bottom=textureLod(water_coast_map,(water_atlas[chosen].xy+vec2(centre.x,lo.y))/water_atlas_extent,0.);
+    vec4 top=textureLod(water_coast_map,(water_atlas[chosen].xy+vec2(centre.x,hi.y))/water_atlas_extent,0.);
+    vec2 span=max(hi-lo,vec2(.001))*dx;
+    vec2 distance_gradient=vec2(right.y-left.y,top.y-bottom.y)/span;
+    vec3 boundary=vec3(coast.y,u.xy*distance_gradient.x+v.xy*distance_gradient.y);
+    float swell_weight=water_shore_weight(coast);
+    vec2 local_weight_gradient=vec2(water_shore_weight(right)-water_shore_weight(left),
+                                   water_shore_weight(top)-water_shore_weight(bottom))/span;
+    vec2 weight_gradient=u.xy*local_weight_gradient.x+v.xy*local_weight_gradient.y;
+#ifdef OPENRAC_OCEAN_FINE
+    // Project pixel rays onto the flat ocean plane so triangle slopes cannot change the wave filter.
+    vec3 ocean_ray=v_world-water_eye;
+    float ocean_range=length(ocean_ray);
+    ocean_ray/=max(ocean_range,1e-5);
+    vec3 ray_dx=dFdx(ocean_ray),ray_dy=dFdy(ocean_ray);
+    float ray_z=abs(ocean_ray.z)<1e-4?(ocean_ray.z<0.?-1e-4:1e-4):ocean_ray.z;
+    vec2 ray_slope=ocean_ray.xy/ray_z;
+    water_ocean_footprint=ocean_range*max(length(ray_dx.xy-ray_slope*ray_dx.z),
+                                          length(ray_dy.xy-ray_slope*ray_dy.z));
+#endif
+    vec3 sx,sy;
+    vec3 swell=water_swell(v_water_rest.xy,water_time,swell_weight,weight_gradient,sx,sy);
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    sx.xy+=water_ocean_horizontal_gradient[0];
+    sy.xy+=water_ocean_horizontal_gradient[1];
+    float ocean_compression=max(0.,1.-determinant(mat2(1.)+water_ocean_horizontal_gradient));
+#endif
+    vec3 boundary_swell=water_boundary_swell(boundary,water_time,swell_weight);
+    // Derive the shoreline direction spatially, never from pixel-quad differences.
+    float ll=textureLod(water_coast_map,(water_atlas[chosen].xy+lo)/water_atlas_extent,0.).y;
+    float lr=textureLod(water_coast_map,(water_atlas[chosen].xy+vec2(hi.x,lo.y))/water_atlas_extent,0.).y;
+    float ul=textureLod(water_coast_map,(water_atlas[chosen].xy+vec2(lo.x,hi.y))/water_atlas_extent,0.).y;
+    float ur=textureLod(water_coast_map,(water_atlas[chosen].xy+hi)/water_atlas_extent,0.).y;
+    // Unequal sample spacing at atlas edges needs a nonuniform second difference.
+    vec2 lower_step=(centre-lo)*dx,upper_step=(hi-centre)*dx;
+    vec2 curvature=vec2(
+        water_shore_curvature(left.y,coast.y,right.y,lower_step.x,upper_step.x),
+        water_shore_curvature(bottom.y,coast.y,top.y,lower_step.y,upper_step.y));
+    float mixed=(ur-ul-lr+ll)/(span.x*span.y);
+    vec2 gradient_u=u.xy*curvature.x+v.xy*mixed;
+    vec2 gradient_v=u.xy*mixed+v.xy*curvature.y;
+    vec3 boundary_dx=vec3(boundary.y,gradient_u*u.x+gradient_v*v.x);
+    vec3 boundary_dy=vec3(boundary.z,gradient_u*u.y+gradient_v*v.y);
+    sx+=water_boundary_tangent(boundary,boundary_dx,water_time,swell_weight,weight_gradient.x);
+    sy+=water_boundary_tangent(boundary,boundary_dy,water_time,swell_weight,weight_gradient.y);
+    swell+=boundary_swell;
+    vec2 slope=-smooth_normal.xy/max(smooth_normal.z,1e-5);
+    smooth_normal=normalize(cross(vec3(1,0,slope.x)+sx,vec3(0,1,slope.y)+sy));
+    vec3 eye=normalize(water_eye-v_world);
+    vec3 n=dot(smooth_normal,eye)<0.?-smooth_normal:smooth_normal;
+    vec4 cached=water_cached_light(int(flow.w),(size+3)/4+1,uv/4.);
+    // Shadow the actual displaced receiver; do not retain the opaque shader's 10% sun floor.
+    float visibility=sun_shadow_visibility(v_world,n,surface_normal);
+    float roughness=water_material.x;
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    // Add unresolved slope variance to the microfacet width instead of dropping that energy.
+    float alpha=roughness*roughness;
+    roughness=pow(clamp(alpha*alpha+water_ocean_unresolved_variance,0.,1.),.25);
+#endif
+    vec3 direct;
+    vec3 specular=water_direct_specular(v_world,n,eye,roughness,visibility,direct);
+    vec3 illumination=max(cached.rgb/3.14159265+direct,vec3(0));
+    float nv=max(dot(n,eye),.001),fresnel=water_fresnel(nv);
+    vec3 view_position=(water_scene_view*vec4(v_world,1.)).xyz;
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    vec3 refraction_reference=dot(rest_normal,eye)<0.?-rest_normal:rest_normal;
+#else
+    vec3 refraction_reference=surface_normal;
+#endif
+    vec2 normal_offset=(water_scene_view*vec4(n-refraction_reference,0.)).xy;
+    float thickness;
+    bool scene_valid=water_scene_sample(gl_FragCoord.xy/water_scene_extent,gl_FragCoord.z,
+                                       view_position,normal_offset,nv,abs(dot(plane.xyz,eye)),
+                                       water_debug_view!=17,water_background,thickness);
+    vec3 transmittance=scene_valid?water_transmittance(thickness,nv):vec3(0);
+    // Original art contributes only the stylised medium tint and ripple detail, never a fake bed.
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    vec3 body_colour=water_art_tint(water_ocean_colour,probe_linear(painted));
+#else
+    vec3 body_colour=water_art_tint(vec3(.025,.19,.30),probe_linear(painted));
+#endif
+    vec3 transmission=body_colour*(1.-transmittance)*illumination;
+    water_background_weight=(1.-fresnel)*transmittance;
+    water_composite_active=true;
+    // Missing capture coverage uses the same broad local-GI fallback as chrome and glass.
+    vec3 fallback=gi_specular_fallback(cached.rgb*probe_gi_multiplier,nv,water_material.y);
+    // Reflection comes from the viewing side of the interface, not the underwater fade band.
+    // The actual displaced surface still anchors box-projected reflection rays.
+    vec3 reflection=water_debug_view==12
+        ?environment_specular(v_world,n,eye,roughness,water_material.y,fallback)
+        :environment_specular_surface(v_world,v_world+n*.5,n,eye,roughness,water_material.y,fallback);
+    if(water_debug_view>=5 && water_debug_view<=11) {
+        water_contact_coverage=1.;
+        water_background_weight=vec3(0);
+        water_radiance=water_debug_view==5?specular*water_material.z
+                      :water_debug_view==6?reflection*water_material.z
+                      :water_debug_view==7?illumination
+                      :water_debug_view==8?vec3(1)
+                      :water_debug_view==9?environment_specular_surface(v_world,v_world+n*.5,n,eye,roughness,water_material.y,vec3(0))
+                      :water_debug_view==10?fallback:cached.rgb/3.14159265;
+        return probe_display(max(water_radiance,vec3(0)));
+    }
+    vec3 lit=(1.-fresnel)*transmission+(reflection+specular)*water_material.z;
+    float shore_phase=coast.y*5.5-water_time*1.4;
+    float shore=exp(-coast.y*.7)*coast.x;
+    float breakup=.5+.5*wave.w;
+    vec2 maintained=(water_surface==1?vec2(0):flow.xy*.8)*water_current_scale;
+    float activity=smoothstep(.12,.7,abs(rotation))*smoothstep(.05,.25,length(wave.yz-maintained));
+    // Thin advected ribbons reveal rotational flow without obscuring quiet shallow water.
+    float ribbon_distance=abs(wave.w-.62)/max(length(gradients.zw),.1);
+    float edge=max(fwidth(ribbon_distance),.015);
+    float ribbon=1.-smoothstep(.025,.025+edge,ribbon_distance);
+    float crest_foam=water_breaking_foam(gradients.xy,crest_curvature,compression,wave.w);
+    float shore_foam=.06*smoothstep(.83,.97,sin(shore_phase))*shore*breakup
+                     *(1.-smoothstep(.4,1.5,fwidth(shore_phase)));
+    // Rotating flow alone stays transparent; only breaking crests add pale advected ribbons.
+    float wake_foam=.04*activity*ribbon*(crest_foam/.18);
+    float foam_weight=min(crest_foam+shore_foam+wake_foam,.2);
+#ifdef OPENRAC_OCEAN_SPECTRUM
+    float crest=smoothstep(.045,.18,ocean_compression)*smoothstep(.015,.09,swell.z);
+    float shoal=scene_valid?smoothstep(.06,.18,water_contact_depth)
+                         *(1.-smoothstep(.38,1.15,water_contact_depth)):0.;
+    float wash=smoothstep(.015,.095,swell.z+.025*ocean_compression);
+    // Offshore foam is sparse. Shallow terrain and rocks can catch the incoming wash.
+    foam_weight=max(foam_weight,max(.24*crest,.32*shoal*wash));
+#endif
+    if(water_debug_view==15) {
+        float crest=smoothstep(.006,.025,h)+smoothstep(.83,.97,sin(shore_phase))*shore*.35
+                    *(1.-smoothstep(.4,1.5,fwidth(shore_phase)));
+        foam_weight=clamp(crest*breakup*.35+activity*ribbon*.3,0.,.55);
+    }
+    if(water_debug_view==13) foam_weight=0.;
+    if(water_debug_view==14) {
+        water_contact_coverage=1.;
+        water_background_weight=vec3(0);
+        water_radiance=vec3(foam_weight);
+        return probe_display(water_radiance);
+    }
+    if(water_debug_view==16) {
+        water_background_weight=vec3(0);
+        water_radiance=vec3(water_contact_coverage);
+        water_contact_coverage=1.;
+        return probe_display(water_radiance);
+    }
+    lit=mix(lit,vec3(.65,.8,.85)*illumination,foam_weight);
+    water_background_weight*=1.-foam_weight;
+    water_radiance=max(lit,vec3(0));
+    if(outside) {
+        water_composite_active=false;
+        return painted;
+    }
+    return probe_display(water_radiance);
+}

@@ -1,0 +1,687 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// The table of the port's environment variables and the reads of them (env.h). A new variable is
+// an enumerator of Var, a row here at the same place, and a row in docs/port/DEBUGGING.md.
+
+#include "common/env.h"
+
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdlib>
+
+namespace openrac::env {
+namespace {
+
+// The number of variables: Write is the last enumerator of Var.
+constexpr std::size_t kVariableCount = static_cast<std::size_t>(Var::Write) + 1;
+
+// The bases read_integer reads a Kind::Integer and a Kind::Hex in.
+constexpr int kDecimalBase = 10;
+constexpr int kHexBase = 16;
+
+// Every variable the port reads, in the order of Var. The descriptions are the short form of
+// DEBUGGING.md's rows, which say more.
+// clang-format off: one variable per row: its names, then how it is read, then what it does.
+constexpr std::array<Variable, kVariableCount> kVariables = {{
+    {Var::AdpfOff, "OPENRAC_ADPF_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "Android: no performance hint session (ADPF), for comparison"},
+    {Var::Anim, "OPENRAC_ANIM",
+     Kind::Flag, Truth::UnlessZero, "on",
+     "moby animation; 0 draws every moby in its bind pose"},
+    {Var::AnimTrace, "OPENRAC_ANIM_TRACE",
+     Kind::Flag, Truth::Set, "off",
+     "each co-op figure's animation as it is posed, on stderr (ATRACE F lines)"},
+    {Var::AudioBufferMs, "OPENRAC_AUDIO_BUFFER_MS",
+     Kind::Integer, Truth::NotAFlag, "20 (desktop), 0 (Android)",
+     "milliseconds of sound mixed ahead of the device on a thread of its own; 0 mixes on the device's request"},
+    {Var::AudioDump, "OPENRAC_AUDIO_DUMP",
+     Kind::Text, Truth::NotAFlag, "off",
+     "FILE: the output's mix, as the device gets it, written to a WAV file (48 kHz, 16 bits, stereo)"},
+    {Var::AudioTicked, "OPENRAC_AUDIO_TICKED",
+     Kind::Flag, Truth::Set, "off",
+     "no sound device: sounds advance by one tick's samples each tick, so runs repeat"},
+    {Var::Camera, "OPENRAC_CAMERA",
+     Kind::Text, Truth::NotAFlag, "the game's",
+     "X,Y,Z,FX,FY,FZ: the camera's eye and forward written over the game's before each view build"},
+    {Var::CameraInstanceCullOff, "OPENRAC_CAMERA_INSTANCE_CULL_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: aggregate-group camera culling"},
+    {Var::CameraLatchLog, "OPENRAC_CAMERA_LATCH_LOG",
+     Kind::Flag, Truth::Set, "off",
+     "each tick's camera turn and the late camera latch's guess for it, in the log"},
+    {Var::CamLog, "OPENRAC_CAM_LOG",
+     Kind::Flag, Truth::Set, "off",
+     "the camera each drawn frame is seen from, in the log"},
+    {Var::Clock, "OPENRAC_CLOCK",
+     Kind::Text, Truth::NotAFlag, "the host's (2000-01-01 00:00:00 with OPENRAC_RECORD or _REPLAY)",
+     "YYYY-MM-DD hh:mm:ss: the time the game's clock (sceCdReadClock) reads, for runs that repeat"},
+    {Var::CollCheck, "OPENRAC_COLL_CHECK",
+     Kind::Integer, Truth::NotAFlag, "off",
+     "N: each collision query also runs the kernel's own instructions and differences go to "
+     "stderr; all memory compared every Nth query (1: never)"},
+    {Var::CollCheckPrint, "OPENRAC_COLL_CHECK_PRINT",
+     Kind::Integer, Truth::NotAFlag, "400",
+     "how many [coll-check] difference lines are printed"},
+    {Var::CollTrace, "OPENRAC_COLL_TRACE",
+     Kind::Flag, Truth::Set, "off",
+     "collision queries and hits by kind, totals on stderr every 2000 queries"},
+    {Var::ControlFrames, "OPENRAC_CONTROL_FRAMES",
+     Kind::Integer, Truth::NotAFlag, "never",
+     "the run ends this many frames after the player gets control"},
+    {Var::CrashTest, "OPENRAC_CRASH_TEST",
+     Kind::Text, Truth::NotAFlag, "none",
+     "KIND:FRAME: stops the program on purpose at that frame, to test the crash report"},
+    {Var::Data, "OPENRAC_DATA",
+     Kind::Path, Truth::NotAFlag, "--data",
+     "the extracted data folder, when --data is not given"},
+    {Var::Debug, "OPENRAC_DEBUG",
+     Kind::Flag, Truth::Set, "off",
+     "the game's state every 100 ticks, in the log"},
+    {Var::DebugDump, "OPENRAC_DEBUG_DUMP",
+     Kind::Path, Truth::NotAFlag, "none",
+     "the frame dump's file, as --debug-dump"},
+    {Var::DebugMenu, "OPENRAC_DEBUG_MENU",
+     Kind::Integer, Truth::NotAFlag, "never",
+     "opens the developer menu by script at this window frame"},
+    {Var::Denormals, "OPENRAC_DENORMALS",
+     Kind::Flag, Truth::Set, "off",
+     "the game's thread keeps the host's denormal floats, to compare"},
+    {Var::DepthReuseOff, "OPENRAC_DEPTH_REUSE_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: the GTAO prepass depth discarded before the world's colour"},
+    {Var::Developer, "OPENRAC_DEVELOPER",
+     Kind::Flag, Truth::NotEmptyOrZero, "off",
+     "the launcher's developer mode: the developer menu and the in-window menus"},
+    {Var::Direct, "OPENRAC_DIRECT",
+     Kind::Flag, Truth::Set, "off",
+     "with --level N, goes straight into level N from the title world"},
+    {Var::Drawer, "OPENRAC_DRAWER",
+     Kind::Flag, Truth::Set, "off (on on Android/iOS)",
+     "the overlay's menus in the drawer, as on mobile, in place of the menu bar"},
+    {Var::DrawCoverage, "OPENRAC_DRAW_COVERAGE",
+     Kind::Path, Truth::NotAFlag, "none",
+     "writes what the game asked to draw and the port did not to that JSON file, per level"},
+    {Var::DumpDraws, "OPENRAC_DUMP_DRAWS",
+     Kind::Text, Truth::NotAFlag, "none",
+     "N or N-M: the 2D path's draws of those ticks, in the log"},
+    {Var::DumpRam, "OPENRAC_DUMP_RAM",
+     Kind::Integer, Truth::NotAFlag, "never",
+     "writes the game's main memory to ram_FRAME.bin at that frame"},
+    {Var::DumpSnapshot, "OPENRAC_DUMP_SNAPSHOT",
+     Kind::Path, Truth::NotAFlag, "none",
+     "writes the frame read back for the game's screen capture to that PNG"},
+    {Var::DumpTexture, "OPENRAC_DUMP_TEXTURE",
+     Kind::Hex, Truth::NotAFlag, "none",
+     "writes each conversion of the texture at that block (TBP0) as a PPM and a PGM"},
+    {Var::DumpTextures, "OPENRAC_DUMP_TEXTURES",
+     Kind::Path, Truth::NotAFlag, "none",
+     "writes every texture once to that folder as <hash>.png, the names a texture pack uses"},
+    {Var::DumpVif, "OPENRAC_DUMP_VIF",
+     Kind::Path, Truth::NotAFlag, "none",
+     "writes the VIF data of the frame's display list to that file"},
+    {Var::EarlyLightingOff, "OPENRAC_EARLY_LIGHTING_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: full-resolution GI and cascades (reload the level)"},
+    {Var::Enhanced, "OPENRAC_ENHANCED",
+     Kind::Flag, Truth::One, "on when OPENRAC_PROBE_GI names a bake",
+     "enhanced rendering: 1 turns it on, any other value off"},
+    {Var::Fps, "OPENRAC_FPS",
+     Kind::Flag, Truth::Set, "off",
+     "the ticks per second over each 300 ticks, in the log"},
+    {Var::FrameCost, "OPENRAC_FRAME_COST",
+     Kind::Integer, Truth::NotAFlag, "off",
+     "every N frames drawn (200 for 1 or less), what a frame cost and where, in the log"},
+    {Var::FrameLog, "OPENRAC_FRAME_LOG",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FROM-TO or N: what each tick in that range drew, in the log"},
+    {Var::FurView, "OPENRAC_FUR_VIEW",
+     Kind::Integer, Truth::NotAFlag, "0",
+     "enhanced Ratchet fur diagnostic at start: 1 coverage mask, 2 groom directions, 3 detail normals"},
+    {Var::FxDump, "OPENRAC_FX_DUMP",
+     Kind::Integer, Truth::NotAFlag, "none",
+     "with OPENRAC_DEBUG, each effect quad of the 100 frames from this one, in the log"},
+    {Var::Give, "OPENRAC_GIVE",
+     Kind::Text, Truth::NotAFlag, "none",
+     "WHAT[@FRAME],...: gives the hero all, weapons, gadgets, bolts:N or an item, FRAME frames after control"},
+    {Var::GlApi, "OPENRAC_GL_API",
+     Kind::Text, Truth::NotAFlag, "desktop (es on Android)",
+     "the graphics API: es, desktop, vulkan or metal"},
+    {Var::GlHideExtensions, "OPENRAC_GL_HIDE_EXTENSIONS",
+     Kind::Text, Truth::NotAFlag, "none",
+     "NAME,...: the renderer acts as if the driver lacked these GL extensions"},
+    {Var::GlProgramCache, "OPENRAC_GL_PROGRAM_CACHE",
+     Kind::Text, Truth::NotAFlag, "the cache folder's gl_programs",
+     "where OpenGL keeps its compiled programs between runs; off (or 0, none) compiles every one"},
+    {Var::Gpu, "OPENRAC_GPU",
+     Kind::Text, Truth::NotAFlag, "the discrete card (Linux)",
+     "integrated: the system chooses the graphics card (Linux)"},
+    {Var::GpuBake, "OPENRAC_GPU_BAKE",
+     Kind::Flag, Truth::Set, "off",
+     "the probe baker traces probe rays on the GPU (Vulkan ray query) instead of Embree"},
+    {Var::GpuBakeCheck, "OPENRAC_GPU_BAKE_CHECK", Kind::Flag, Truth::Set, "off",
+     "with OPENRAC_GPU_BAKE, also trace every 16th probe on the CPU and log how far the GPU differs"},
+    {Var::GpuBreadcrumbs, "OPENRAC_GPU_BREADCRUMBS",
+     Kind::Flag, Truth::UnlessZero, "on (supported Vulkan drivers)",
+     "record Vulkan render graph progress on the GPU for device-loss reports"},
+    {Var::GpuDrivenOff, "OPENRAC_GPU_DRIVEN_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: CPU instance visibility and direct mesh draws (Vulkan)"},
+    {Var::GpuDriverDir, "OPENRAC_GPU_DRIVER_DIR",
+     Kind::Path, Truth::NotAFlag, "the system's driver",
+     "Android: the folder of the chosen GPU driver package"},
+    {Var::GpuDriverLibrary, "OPENRAC_GPU_DRIVER_LIBRARY",
+     Kind::Path, Truth::NotAFlag, "the system's driver",
+     "Android: the driver package's Vulkan library, in OPENRAC_GPU_DRIVER_DIR"},
+    {Var::GpuMarkers, "OPENRAC_GPU_MARKERS",
+     Kind::Flag, Truth::Set, "off",
+     "names timed GPU passes for Vulkan profilers (a build with OPENRAC_GPU_MARKERS=ON)"},
+    {Var::GpuMaterialsOff, "OPENRAC_GPU_MATERIALS_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: individual mesh material uniforms and textures (reload shaders)"},
+    {Var::GpuPassTiming, "OPENRAC_GPU_PASS_TIMING",
+     Kind::Flag, Truth::Set, "off",
+     "Vulkan: each GPU-timed section ends its render pass, so a tile-based GPU times it"},
+    {Var::Guard, "OPENRAC_GUARD",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FRAME:ADDRESS:BYTES[:SKIP]: the first write into those bytes ends the program"},
+    {Var::Hdr, "OPENRAC_HDR",
+     Kind::Text, Truth::NotAFlag, "the settings' hdr",
+     "off or on: HDR output for this run, over the settings file (the launcher's HDR)"},
+    {Var::HdrFrame, "OPENRAC_HDR_FRAME",
+     Kind::Flag, Truth::Set, "off",
+     "Vulkan: the HDR frame (half floats) without an HDR screen, shown clamped as SDR, to compare"},
+    {Var::HeroShadow, "OPENRAC_HERO_SHADOW",
+     Kind::Flag, Truth::Set, "off",
+     "the hero's own shadow map, without the sun's cascades"},
+    {Var::Hidden, "OPENRAC_HIDDEN",
+     Kind::Flag, Truth::Set, "off",
+     "with --window, the window is drawn but never shown"},
+    {Var::HidePasses, "OPENRAC_HIDE_PASSES",
+     Kind::Text, Truth::NotAFlag, "none",
+     "NAME,...: the renderer's passes of those names are not drawn"},
+    {Var::HidePassesEvery, "OPENRAC_HIDE_PASSES_EVERY",
+     Kind::Integer, Truth::NotAFlag, "0",
+     "N: OPENRAC_HIDE_PASSES hides them only in frames N to 2N-1, 3N to 4N-1, ..., one run shows a place with and without them"},
+    {Var::Hitch, "OPENRAC_HITCH",
+     Kind::Flag, Truth::Set, "off",
+     "each tick that took over 1.25 tick times, in the log"},
+    {Var::HitLog, "OPENRAC_HIT_LOG",
+     Kind::Flag, Truth::Set, "off",
+     "each hit sphere with a template, and the mobys it listed, on stderr"},
+    {Var::IdentityKey, "OPENRAC_IDENTITY_KEY",
+     Kind::Text, Truth::NotAFlag, "none",
+     "this installation's key for co-op bans, set by the launcher (openrac_api.identity_key)"},
+    {Var::Invincible, "OPENRAC_INVINCIBLE",
+     Kind::Flag, Truth::One, "off",
+     "the hero is put back at full health each tick"},
+    {Var::ItemsDebug, "OPENRAC_ITEMS_DEBUG",
+     Kind::Flag, Truth::UnlessZero, "off",
+     "what the hero and each co-op figure hold and the shots they fire, on stderr"},
+    {Var::Keys, "OPENRAC_KEYS",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FRAME[+HELD]:ACTION,... or @FILE: scripted keys, held keys, pointer movement and wheel"},
+    {Var::LauncherVersion, "OPENRAC_LAUNCHER_VERSION",
+     Kind::Text, Truth::NotAFlag, "unknown (CLI)",
+     "running launcher's version for enhanced bake diagnostics"},
+    {Var::Log, "OPENRAC_LOG",
+     Kind::Text, Truth::NotAFlag, "info",
+     "the log's level: verbose or debug"},
+    {Var::MeatProxyReview, "OPENRAC_MEAT_PROXY_REVIEW",
+     Kind::Path, Truth::NotAFlag, "meat-proxy-review.json in the system temp folder",
+     "JSON task queue and saved feedback for the developer review panel"},
+    {Var::Menu, "OPENRAC_MENU",
+     Kind::Text, Truth::NotAFlag, "closed",
+     "TAB[@TICK] (graphics, enhanced, game, controls, developer): the menu open on that tab at that tick"},
+    {Var::MobyLog, "OPENRAC_MOBY_LOG",
+     Kind::Text, Truth::NotAFlag, "none",
+     "N[:RADIUS]: every N ticks, the mobys near the hero, in the log"},
+    {Var::MobySphereCullOff, "OPENRAC_MOBY_SPHERE_CULL_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: animated mobys left unbounded in native culling"},
+    {Var::NativeLibraryDir, "OPENRAC_NATIVE_LIBRARY_DIR",
+     Kind::Path, Truth::NotAFlag, "none",
+     "Android: the app's native library folder, where libadrenotools finds its hooks"},
+    {Var::NoBlend, "OPENRAC_NO_BLEND",
+     Kind::Flag, Truth::Set, "off",
+     "one frame per tick: no interpolation between ticks and no vertical sync"},
+    {Var::NoPumpFiber, "OPENRAC_NO_PUMP_FIBER",
+     Kind::Flag, Truth::Set, "off",
+     "Windows: the game and the window pump in one loop, not in fibers"},
+    {Var::OpaqueColourBatchOff, "OPENRAC_OPAQUE_COLOUR_BATCH_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: opaque colour in per-layer order"},
+    {Var::OpaqueSpecialiseOff, "OPENRAC_OPAQUE_SPECIALISE_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: the unspecialised mesh colour shaders"},
+    {Var::Overlay, "OPENRAC_OVERLAY",
+     Kind::Text, Truth::NotAFlag, "off",
+     "1 or a list of sections: the debug overlay from the start (0: not)"},
+    {Var::OverlayShot, "OPENRAC_OVERLAY_SHOT",
+     Kind::Text, Truth::NotAFlag, "none",
+     "N:PREFIX: every N ticks, the window with the overlay to PREFIX<tick>.png"},
+    {Var::Pacing, "OPENRAC_PACING",
+     Kind::Flag, Truth::Set, "off",
+     "each frame shown and when, in the log"},
+    {Var::PauseAt, "OPENRAC_PAUSE_AT",
+     Kind::Text, Truth::NotAFlag, "none",
+     "TICK[:FRAMES]: pauses the game at that window frame"},
+    {Var::PerfCapture, "OPENRAC_PERF_CAPTURE",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FRAME:SECONDS[:FILE]: a performance capture from that window frame, its report to FILE"},
+    {Var::PlayTrace, "OPENRAC_PLAY_TRACE",
+     Kind::Text, Truth::NotAFlag, "off",
+     "WHAT,...: Going Commando's play calls run without a mod, on stderr (PTRACE lines)"},
+    {Var::PlayTraceSave, "OPENRAC_PLAY_TRACE_SAVE",
+     Kind::Path, Truth::NotAFlag, "none",
+     "the file OPENRAC_PLAY_TRACE's capture writes its save to"},
+    {Var::Press, "OPENRAC_PRESS",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FRAME:MASK:FRAMES[:LX:LY[:RX:RY]],...: pad buttons on port 0 by script"},
+    {Var::ProbeBacklight, "OPENRAC_PROBE_BACKLIGHT",
+     Kind::Flag, Truth::One, "off",
+     "the original back-light factors added to the probe GI's direct lighting"},
+    {Var::ProbeComputeOff, "OPENRAC_PROBE_COMPUTE_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "the CPU/frustum probe selector in place of compute coverage"},
+    {Var::ProbeDense, "OPENRAC_PROBE_DENSE",
+     Kind::Path, Truth::NotAFlag, "none",
+     "a finer local probe bake (.orpg) beside the level's (0: none)"},
+    {Var::ProbeFastOff, "OPENRAC_PROBE_FAST_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: the full probe light on blended static passes"},
+    {Var::ProbeGi, "OPENRAC_PROBE_GI",
+     Kind::Path, Truth::NotAFlag, "the level's bake in the --probes folder",
+     "the probe bake (.orpg) for terrain and moby GI (0: off)"},
+    {Var::ProbeRays, "OPENRAC_PROBE_RAYS",
+     Kind::Integer, Truth::NotAFlag, "1024",
+     "the ray budget the probe bake must have been made with (16 or more)"},
+    {Var::ProbeRegions, "OPENRAC_PROBE_REGIONS",
+     Kind::Path, Truth::NotAFlag, "<OPENRAC_PROBE_GI>.regions.json",
+     "a JSON manifest of finer probe regions"},
+    {Var::ProbeSky, "OPENRAC_PROBE_SKY",
+     Kind::Text, Truth::NotAFlag, "the bake profile's",
+     "level or uniform: the sky the probe bake must have been made with"},
+    {Var::ProbeSkyIntensity, "OPENRAC_PROBE_SKY_INTENSITY",
+     Kind::Number, Truth::NotAFlag, "the bake profile's",
+     "the sky intensity the probe bake must have been made with"},
+    {Var::ProbeSpheres, "OPENRAC_PROBE_SPHERES",
+     Kind::Text, Truth::NotAFlag, "off",
+     "1 or xray: selected probe positions; all: resident positions and every volume bound"},
+    {Var::ProbeTiledReference, "OPENRAC_PROBE_TILED_REFERENCE",
+     Kind::Flag, Truth::Set, "off",
+     "reference: every resident probe volume evaluated per fragment, not tile masks"},
+    {Var::ProbeView, "OPENRAC_PROBE_VIEW",
+     Kind::Text, Truth::NotAFlag, "combined",
+     "the probe GI's view: original, combined, indirect, direct or coverage"},
+    {Var::ProbeZeroWeightReference, "OPENRAC_PROBE_ZERO_WEIGHT_REFERENCE",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: probe atlas reads for zero-weight valid corners"},
+    {Var::PvsOff, "OPENRAC_PVS_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: no baked camera visibility (Vulkan)"},
+    {Var::Reach, "OPENRAC_REACH",
+     Kind::Path, Truth::NotAFlag, "none",
+     "the functions without C this run reached, written to that file"},
+    {Var::Record, "OPENRAC_RECORD",
+     Kind::Path, Truth::NotAFlag, "none",
+     "the pad and the hero's path of this run, written to that file"},
+    {Var::RenderGraphDump, "OPENRAC_RENDER_GRAPH_DUMP",
+     Kind::Flag, Truth::LeadingOne, "off",
+     "log one diagnostic frame graph at the first nonempty Vulkan presentation"},
+    {Var::RenderOptOff, "OPENRAC_RENDER_OPT_OFF",
+     Kind::Text, Truth::NotAFlag, "none",
+     "NAME,NAME or all: render optimisations of renderer/render_opt.h switched off, for comparing"},
+    {Var::RenderThread, "OPENRAC_RENDER_THREAD",
+     Kind::Flag, Truth::UnlessZero, "on (Vulkan)",
+     "record the Vulkan world on a bounded render worker; 0 uses synchronous rendering"},
+    {Var::Replay, "OPENRAC_REPLAY",
+     Kind::Path, Truth::NotAFlag, "none",
+     "plays the pad of a file OPENRAC_RECORD wrote"},
+    {Var::RoundNearest, "OPENRAC_ROUND_NEAREST",
+     Kind::Flag, Truth::Set, "off",
+     "the game's thread keeps the host's rounding to nearest, to compare"},
+    {Var::SceneryLog, "OPENRAC_SCENERY_LOG",
+     Kind::Flag, Truth::Set, "off",
+     "the ties, shrubs and terrain the game's culls leave out, every 100 ticks, in the log"},
+    {Var::ScriptBudgetMs, "OPENRAC_SCRIPT_BUDGET_MS",
+     Kind::Number, Truth::NotAFlag, "2",
+     "the milliseconds a script mod may run each time the game calls into it"},
+    {Var::ScrollingShadows, "OPENRAC_SCROLLING_SHADOWS",
+     Kind::Flag, Truth::Set, "off",
+     "experimental toroidal static caches for the sun cascades"},
+    {Var::ShaderDir, "OPENRAC_SHADER_DIR",
+     Kind::Path, Truth::NotAFlag, "the build's source tree",
+     "where a shader reload reads the files"},
+    {Var::ShaderReload, "OPENRAC_SHADER_RELOAD",
+     Kind::Integer, Truth::NotAFlag, "never",
+     "reloads every shader program at that window frame"},
+    {Var::ShadowAtlasOff, "OPENRAC_SHADOW_ATLAS_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: separate shadow targets and per-map submission"},
+    {Var::ShadowBatchOff, "OPENRAC_SHADOW_BATCH_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: shadow casters submitted in model order"},
+    {Var::ShadowFilterReference, "OPENRAC_SHADOW_FILTER_REFERENCE",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: nine bilinear shadow taps instead of unique texels"},
+    {Var::ShadowGatherOff, "OPENRAC_SHADOW_GATHER_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: 16 individual shadow texel fetches (reload the level)"},
+    {Var::ShadowLayerReference, "OPENRAC_SHADOW_LAYER_REFERENCE",
+     Kind::Flag, Truth::Set, "off",
+     "reference: shadow buckets flushed after each layer"},
+    {Var::ShadowSolidOff, "OPENRAC_SHADOW_SOLID_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: the alpha-capable shader for opaque static sun casters"},
+    {Var::Shot, "OPENRAC_SHOT",
+     Kind::Text, Truth::NotAFlag, "none",
+     "EVERY:PATH: a PNG of every EVERY-th window frame, to PATH<frame>.png"},
+    {Var::ShotBetween, "OPENRAC_SHOT_BETWEEN",
+     Kind::Flag, Truth::Set, "off",
+     "OPENRAC_SHOT also writes the frames between ticks"},
+    {Var::ShotFrom, "OPENRAC_SHOT_FROM",
+     Kind::Integer, Truth::NotAFlag, "0",
+     "no shots before this frame"},
+    {Var::ShowMissing, "OPENRAC_SHOW_MISSING",
+     Kind::Flag, Truth::Set, "off",
+     "primitives whose texture is missing are drawn with the magenta placeholder"},
+    {Var::SkipScenes, "OPENRAC_SKIP_SCENES",
+     Kind::Flag, Truth::One, "off",
+     "in-game scenes end as soon as they start, by the game's own skip"},
+    {Var::SlowFrame, "OPENRAC_SLOW_FRAME",
+     Kind::Number, Truth::NotAFlag, "0",
+     "every frame drawn takes that many milliseconds longer"},
+    {Var::SoftwareGl, "OPENRAC_SOFTWARE_GL",
+     Kind::Flag, Truth::Set, "off",
+     "runs on a software rasteriser instead of refusing it"},
+    {Var::SoftFaults, "OPENRAC_SOFT_FAULTS",
+     Kind::Flag, Truth::One, "off",
+     "an access to game memory that is not mapped is counted, not fatal"},
+    {Var::SoundLog, "OPENRAC_SOUND_LOG",
+     Kind::Flag, Truth::Set, "off",
+     "each command the game sends its sound driver, on stderr"},
+    {Var::StateDump, "OPENRAC_STATE_DUMP",
+     Kind::Path, Truth::NotAFlag, "none",
+     "the game's state as JSON, written to that file every 600 frames and at the end"},
+    {Var::Strict, "OPENRAC_STRICT",
+     Kind::Flag, Truth::LeadingOne, "off",
+     "a call to a code address no function has stops the program"},
+    {Var::StripFogOff, "OPENRAC_STRIP_FOG_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: the effect strips drawn without the GS fog"},
+    {Var::Stuck, "OPENRAC_STUCK",
+     Kind::Text, Truth::NotAFlag, "none",
+     "SECONDS[:FRAMES]: a report and the end when no tick comes for SECONDS, or no control or new level for FRAMES"},
+    {Var::SunInstanceCullOff, "OPENRAC_SUN_INSTANCE_CULL_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: every instance kept in a surviving cascade group"},
+    {Var::SunReceiverCullOff, "OPENRAC_SUN_RECEIVER_CULL_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: square shadow-map caster bounds"},
+    {Var::SunShadows, "OPENRAC_SUN_SHADOWS",
+     Kind::Flag, Truth::UnlessZero, "on",
+     "the sun's shadow cascades in gameplay; 0 turns them off"},
+    {Var::SunTimingDetail, "OPENRAC_SUN_TIMING_DETAIL",
+     Kind::Flag, Truth::Set, "off",
+     "detailed cascade and layer GPU timers"},
+    {Var::Teleport, "OPENRAC_TELEPORT",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FRAME:X:Y:Z,...: puts the hero there, held 10 frames, FRAME frames after control"},
+    {Var::TemporalUpscaler, "OPENRAC_TEMPORAL_UPSCALER",
+     Kind::Text, Truth::NotAFlag, "Arm ASR on Adreno, FSR 3.1 elsewhere; on Android ASR or none",
+     "asr or fsr3: the temporal upscaler behind Enhanced temporal reconstruction"},
+    {Var::TileBased, "OPENRAC_TILE_BASED",
+     Kind::Text, Truth::NotAFlag, "the vendor's guess",
+     "1 or 0: whether the Vulkan device is treated as tile-based (vkgl::tile_based)"},
+    {Var::TimeScale, "OPENRAC_TIME_SCALE",
+     Kind::Number, Truth::NotAFlag, "1",
+     "the game's speed from the start, from 1/64 to 1"},
+    {Var::Trace, "OPENRAC_TRACE",
+     Kind::Path, Truth::NotAFlag, "none",
+     "one line of the run's state per tick, written to that file"},
+    {Var::TraceCd, "OPENRAC_TRACE_CD",
+     Kind::Flag, Truth::Set, "off",
+     "each disc read, on stderr"},
+    {Var::TraceInput, "OPENRAC_TRACE_INPUT",
+     Kind::Flag, Truth::Set, "off",
+     "a port's buttons and sticks, at most every 25 frames, in the log"},
+    {Var::TraceMissing, "OPENRAC_TRACE_MISSING",
+     Kind::Flag, Truth::Set, "off",
+     "a host stack trace on the first call to each function without C"},
+    {Var::TraceRelocation, "OPENRAC_TRACE_RELOCATION",
+     Kind::Flag, Truth::Set, "off",
+     "the level code's relocation, in the log and on stderr"},
+    {Var::TraceSif, "OPENRAC_TRACE_SIF",
+     Kind::Flag, Truth::NotEmpty, "off",
+     "the first 32 SIF binds and calls, on stderr"},
+    {Var::TraceWad, "OPENRAC_TRACE_WAD",
+     Kind::Flag, Truth::Set, "off",
+     "each WAD decompression, on stderr"},
+    {Var::UiColors, "OPENRAC_UI_COLORS",
+     Kind::Text, Truth::NotAFlag, "the launcher's own",
+     "NAME=#RRGGBB[AA],...: the launcher's theme for the drawer; set by the launcher"},
+    {Var::UiLog, "OPENRAC_UI_LOG",
+     Kind::Flag, Truth::Set, "off",
+     "the caller of each 2D quad routine call and each quad it made, in the log"},
+    {Var::UiReplay, "OPENRAC_UI_REPLAY",
+     Kind::Flag, Truth::Set, "off",
+     "the game's GS packets replayed for the 2D layer instead of native quads"},
+    {Var::UiResidual, "OPENRAC_UI_RESIDUAL",
+     Kind::Flag, Truth::Set, "off",
+     "each kind of 2D primitive still drawn from the GS packets, once, in the log"},
+    {Var::UiSkip, "OPENRAC_UI_SKIP",
+     Kind::Text, Truth::NotAFlag, "none",
+     "NAME,...: these 2D routines send the game's packets instead of native quads"},
+    {Var::Uncapped, "OPENRAC_UNCAPPED",
+     Kind::Flag, Truth::Set, "off",
+     "the frame loop never waits: the game runs as fast as the machine allows"},
+    {Var::VkBulkTextureUploadOff, "OPENRAC_VK_BULK_TEXTURE_UPLOAD_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: stage baked lighting textures in the frame upload ring"},
+    {Var::VkEffectUploadReuseOff, "OPENRAC_VK_EFFECT_UPLOAD_REUSE_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: every effect texture upload copied and hashed (Vulkan)"},
+    {Var::VkPalettePartialOff, "OPENRAC_VK_PALETTE_PARTIAL_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: upload the whole Vulkan joint palette when any row changes"},
+    {Var::VkParticleTextureReuseOff, "OPENRAC_VK_PARTICLE_TEXTURE_REUSE_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: the texture of every visible particle hashed (Vulkan)"},
+    {Var::VkRingTrimOff, "OPENRAC_VK_RING_TRIM_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: keep Vulkan upload ring chunks for the life of the device"},
+    {Var::VkSurfaceScratchOff, "OPENRAC_VK_SURFACE_SCRATCH_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "reference: use owned depth and refraction targets instead of Vulkan scratch"},
+    {Var::VkSurfaceScratchStats, "OPENRAC_VK_SURFACE_SCRATCH_STATS",
+     Kind::Flag, Truth::Set, "off",
+     "measure Vulkan device-local allocator use and surface scratch leases"},
+    {Var::VkUniformReuseOff, "OPENRAC_VK_UNIFORM_REUSE_OFF",
+     Kind::Flag, Truth::Set, "off",
+     "profiling reference: repeated uniforms uploaded, descriptors made again (Vulkan)"},
+    {Var::VulkanLibrary, "OPENRAC_VULKAN_LIBRARY",
+     Kind::Path, Truth::NotAFlag, "the bundle's MoltenVK",
+     "macOS: the Vulkan library to open in place of the bundle's"},
+    {Var::VulkanPipelineCache, "OPENRAC_VULKAN_PIPELINE_CACHE",
+     Kind::Path, Truth::NotAFlag, "the user's cache folder",
+     "where Vulkan pipelines are cached between runs (0, off or none: not at all)"},
+    {Var::VulkanValidation, "OPENRAC_VULKAN_VALIDATION",
+     Kind::Flag, Truth::LeadingOne, "off",
+     "Khronos' validation layer, with OPENRAC_GL_API=vulkan"},
+    {Var::Walk, "OPENRAC_WALK",
+     Kind::Path, Truth::NotAFlag, "none",
+     "the hero walks through the points of a file OPENRAC_RECORD wrote"},
+    {Var::Watch, "OPENRAC_WATCH",
+     Kind::Text, Truth::NotAFlag, "none",
+     "ADDRESS:COUNT[:i],...: values from game memory each frame, in the log"},
+    {Var::WaterOff, "OPENRAC_WATER_OFF",
+     Kind::Flag, Truth::LeadingOne, "off",
+     "profiling reference: retain original Novalis water"},
+    {Var::WaterView, "OPENRAC_WATER_VIEW",
+     Kind::Integer, Truth::NotAFlag, "live controls",
+     "water view: 0 lit, 1-4 simulation, 5 direct, 6 reflections, 7 lighting, 8 mask, 9 captures, 10 GI fallback, 11 cached GI, 12 reference selection, 13 foam off, 14 foam mask, 15 reference foam, 16 shoreline mask, 17 reference shoreline"},
+    {Var::Write, "OPENRAC_WRITE",
+     Kind::Text, Truth::NotAFlag, "none",
+     "FRAME:ADDRESS:VALUE[:FRAMES],...: words written into game memory by script"},
+}};
+// clang-format on
+
+// Returns the place of `var` in the table.
+constexpr std::size_t index(Var var) {
+    return static_cast<std::size_t>(var);
+}
+
+// Returns whether every row is at the place of its enumerator, which variable() relies on.
+constexpr bool rows_in_order() {
+    for (std::size_t n = 0; n < kVariables.size(); ++n) {
+        // A row added out of place would answer for another variable.
+        if (index(kVariables[n].var) != n) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(rows_in_order(), "each row of kVariables is at the place of its Var");
+
+// The value of each variable as the program found it, in the table's order; nothing when unset.
+using Snapshot = std::array<std::optional<std::string>, kVariableCount>;
+
+// Reads every variable of the table from the environment.
+Snapshot read_environment() {
+    Snapshot values;
+    for (const Variable& row : kVariables) {
+        // std::getenv wants the name ending in a NUL, which a view need not have.
+        const std::string name(row.name);
+        const char* found = std::getenv(name.c_str());
+
+        // An unset variable stays nothing; one set to the empty string is kept as set.
+        if (found != nullptr) {
+            values[index(row.var)] = std::string(found);
+        }
+    }
+    return values;
+}
+
+// Returns the variables' values, read the first time any of them is asked for. They never change
+// afterwards: a constant of the process rather than state (section 11.4), so a static of this
+// function holds them, which C++ makes safe to read first from any thread. They are never
+// destroyed, so value()'s views stay valid in the program's exit handlers too: a handler
+// registered before the first read (program::finish, which writes OPENRAC_STATE_DUMP) runs after
+// the destructors of statics made later, and read their freed strings on the Mac.
+const Snapshot& snapshot() {
+    static const Snapshot* const values = new Snapshot(read_environment());
+    return *values;
+}
+
+}  // namespace
+
+std::span<const Variable> all() {
+    return kVariables;
+}
+
+const Variable& variable(Var var) {
+    return kVariables[index(var)];
+}
+
+std::optional<Var> find(std::string_view name) {
+    for (const Variable& row : kVariables) {
+        if (row.name == name) {
+            return row.var;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string_view> value(Var var) {
+    const std::optional<std::string>& found = snapshot()[index(var)];
+
+    // An unset variable has no value, which differs from the empty string.
+    if (!found) {
+        return std::nullopt;
+    }
+
+    // A view of the kept std::string, so its data() ends in a NUL (env.h promises it to C).
+    return std::string_view(*found);
+}
+
+bool flag(Var var) {
+    const Variable& row = variable(var);
+    assert(row.kind == Kind::Flag);
+    return reads_as_on(row.truth, value(var));
+}
+
+std::int64_t integer(Var var, std::int64_t fallback) {
+    const Variable& row = variable(var);
+    assert(row.kind == Kind::Integer || row.kind == Kind::Hex);
+
+    // A Kind::Hex is the one integer written in hexadecimal.
+    const int base = row.kind == Kind::Hex ? kHexBase : kDecimalBase;
+
+    return read_integer(value(var), base, fallback);
+}
+
+double number(Var var, double fallback) {
+    assert(variable(var).kind == Kind::Number);
+    return read_number(value(var), fallback);
+}
+
+std::optional<std::string> system_variable(const char* name) {
+    const char* found = std::getenv(name);
+
+    // An unset variable has no value, which differs from the empty string.
+    if (found == nullptr) {
+        return std::nullopt;
+    }
+
+    return std::string(found);
+}
+
+bool reads_as_on(Truth truth, std::optional<std::string_view> value) {
+    switch (truth) {
+        case Truth::NotAFlag:  // asked of a variable that is not a flag
+            return false;
+        case Truth::Set:  // OPENRAC_TRACE_MISSING and most flags
+            return value.has_value();
+        case Truth::LeadingOne:  // OPENRAC_STRICT, OPENRAC_VULKAN_VALIDATION
+            return value.has_value() && value->starts_with('1');
+        case Truth::One:  // OPENRAC_ENHANCED, OPENRAC_PROBE_BACKLIGHT
+            return value.has_value() && *value == "1";
+        case Truth::NotEmpty:  // OPENRAC_TRACE_SIF
+            return value.has_value() && !value->empty();
+        case Truth::NotEmptyOrZero:  // OPENRAC_DEVELOPER
+            return value.has_value() && !value->empty() && *value != "0";
+        case Truth::UnlessZero:  // OPENRAC_ANIM, OPENRAC_SUN_SHADOWS
+            return !value.has_value() || *value != "0";
+    }
+    return false;
+}
+
+std::int64_t read_integer(std::optional<std::string_view> value, int base, std::int64_t fallback) {
+    // The caller's fallback stands for an unset variable; an empty one reads as 0, as in strtoll.
+    if (!value) {
+        return fallback;
+    }
+
+    // std::strtoll reads a string that ends in a NUL, which a view need not have.
+    const std::string text(*value);
+
+    return static_cast<std::int64_t>(std::strtoll(text.c_str(), nullptr, base));
+}
+
+double read_number(std::optional<std::string_view> value, double fallback) {
+    // The caller's fallback stands for an unset variable; an empty one reads as 0, as in strtod.
+    if (!value) {
+        return fallback;
+    }
+
+    // std::strtod reads a string that ends in a NUL, which a view need not have.
+    const std::string text(*value);
+
+    return std::strtod(text.c_str(), nullptr);
+}
+
+}  // namespace openrac::env

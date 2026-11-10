@@ -1,0 +1,430 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// Wrapped texture, sky and authored emission sampling for offline transport.
+#include "enhanced/lighting/bake_material.h"
+
+#include <bit>
+#include <cfenv>
+#include <optional>
+
+#include "enhanced/lighting/bake_math.h"
+
+namespace openrac::lighting {
+namespace {
+// Keep colour and cutout queries on identical bilinear footprints and accumulation order.
+struct TextureTap {
+    std::size_t offset;  // RGBA byte offset of the wrapped texel
+    float weight;        // bilinear contribution, accumulated in row order
+};
+
+// Repeat wrapping matches the exported materials, including UVs outside the unit square.
+std::array<TextureTap, 4> texture_taps(
+    const BakeTexture& texture, const BakeTriangle& triangle, float u, float v
+) {
+    const auto& uv = triangle.uv;
+    const float s = uv[0][0] * (1 - u - v) + uv[1][0] * u + uv[2][0] * v;
+    const float t = uv[0][1] * (1 - u - v) + uv[1][1] * u + uv[2][1] * v;
+    const float x = (s - std::floor(s)) * static_cast<float>(texture.width) - 0.5f;
+    const float y = (t - std::floor(t)) * static_cast<float>(texture.height) - 0.5f;
+    const auto ix = static_cast<int>(std::floor(x)), iy = static_cast<int>(std::floor(y));
+    const float tx = x - std::floor(x), ty = y - std::floor(y);
+    std::array<TextureTap, 4> taps{};
+    std::size_t tap_index = 0;
+
+    // Accumulate bilinear rows in the same order for colour and alpha.
+    for (int j = 0; j < 2; ++j) {
+        // Repeat wrapping applies independently to the two horizontal neighbours.
+        for (int i = 0; i < 2; ++i) {
+            const auto px = static_cast<std::uint32_t>(
+                (ix + i + static_cast<int>(texture.width)) % static_cast<int>(texture.width)
+            );
+            const auto py = static_cast<std::uint32_t>(
+                (iy + j + static_cast<int>(texture.height)) % static_cast<int>(texture.height)
+            );
+            taps[tap_index++] =
+                {(std::size_t{py} * texture.width + px) * 4, (i ? tx : 1 - tx) * (j ? ty : 1 - ty)};
+        }
+    }
+
+    return taps;
+}
+
+// Decodes an sRGB component after the material-specific tint stage.
+float linear_colour(float value) {
+    return value <= .04045f ? value / 12.92f : std::pow((value + .055f) / 1.055f, 2.4f);
+}
+
+// Bounded exact lookups: hash collisions only cause recomputation, never colour approximation.
+struct ColourDecodeCache {
+    static constexpr unsigned kTintedBits = 16;  // Approximately 1 MiB per worker.
+
+    struct Entry {
+        std::uint64_t key = 0;
+        float value = 0;
+        bool occupied = false;
+    };
+
+    std::optional<int> rounding;
+    std::array<float, 256> untinted{};
+    std::array<Entry, std::size_t{1} << kTintedBits> tinted{};
+
+    float sample(std::uint8_t byte, float tint) {
+        if (tint == 1) {
+            return untinted[byte];
+        }
+        const auto key = (std::uint64_t{std::bit_cast<std::uint32_t>(tint)} << 8) | byte;
+        const auto index = ((key ^ (key >> 23)) * 0x9e3779b97f4a7c15ull) >> (64 - kTintedBits);
+        auto& entry = tinted[index];
+        if (!entry.occupied || entry.key != key) {
+            entry =
+                {key,
+                 linear_colour(std::clamp(static_cast<float>(byte) / 255 * tint, 0.f, 1.f)),
+                 true};
+        }
+        return entry.value;
+    }
+};
+
+// Refresh on directed-rounding changes; workers never share mutable lookup state.
+ColourDecodeCache& colour_cache() {
+    thread_local ColourDecodeCache cache;
+    const int rounding = std::fegetround();
+
+    if (cache.rounding != rounding) {
+        for (std::size_t i = 0; i < cache.untinted.size(); ++i) {
+            cache.untinted[i] = linear_colour(std::clamp(static_cast<float>(i) / 255, 0.f, 1.f));
+        }
+        cache.tinted.fill({});
+        cache.rounding = rounding;
+    }
+
+    return cache;
+}
+
+// Filters colour and linear coverage without changing the traversal footprint.
+std::array<float, 4> filtered_material(
+    const BakeTexture& texture,
+    const BakeTriangle& triangle,
+    Float2 uv,
+    const BakeMaterialOptions& options,
+    bool authored
+) {
+    const auto [u, v] = uv;
+    std::array<float, 4> filtered{};
+    auto* decoded = authored ? nullptr : &colour_cache();
+
+    // Colour uses the same footprint as traversal coverage.
+    for (const auto& tap : texture_taps(texture, triangle, u, v)) {
+        // Alpha remains linear while RGB follows the material colour path.
+        for (unsigned c = 0; c < 3; ++c) {
+            float f;
+            if (decoded) {
+                f = decoded->sample(texture.rgba[tap.offset + c], options.texture_tint[c]);
+            } else {
+                f = static_cast<float>(texture.rgba[tap.offset + c]) / 255;
+                f = std::clamp(f * options.texture_tint[c], 0.0f, 1.0f);
+                // Authored terrain decodes after filtering and vertex tint instead.
+            }
+
+            filtered[c] += f * tap.weight;
+        }
+
+        const float alpha = static_cast<float>(texture.rgba[tap.offset + 3]) / 255;
+        filtered[3] += alpha * tap.weight;
+    }
+
+    return filtered;
+}
+
+// Applies encoded authored tint to untextured reflectance before its final decode.
+void tint_untextured(
+    std::array<float, 4>& value,
+    Float3 authored_tint,
+    const BakeMaterialOptions& options,
+    bool authored
+) {
+    // Apply encoded tint before linear decoding on authored terrain.
+    for (unsigned c = 0; c < 3; ++c) {
+        const float f = std::clamp(options.texture_tint[c], 0.0f, 1.0f);
+        value[c] = authored ? linear_colour(std::clamp(value[c] * authored_tint[c] * f, 0.f, 1.f))
+                            : value[c] * linear_colour(f);
+    }
+}
+
+// Limits diffuse reflectance while keeping coverage independent of the reflectance scale.
+void scale_material(std::array<float, 4>& value, float diffuse_scale) {
+    // Diffuse reflectance stays within unity after material scaling.
+    for (unsigned c = 0; c < 3; ++c) {
+        value[c] = std::clamp(value[c] * diffuse_scale, 0.f, 1.f);
+    }
+
+    value[3] = std::clamp(value[3], 0.f, 1.f);
+}
+
+}  // namespace
+
+namespace bake_detail {
+// Intersection acceptance needs linear alpha only, never decoded RGB or emission.
+float material_opacity(const BakeScene& scene, const BakeTriangle& triangle, float u, float v) {
+    const float modulation = triangle.multipliers[0][3] * (1 - u - v)
+                             + triangle.multipliers[1][3] * u + triangle.multipliers[2][3] * v;
+    if (triangle.texture < 0) {
+        return std::clamp(modulation, 0.f, 1.f);
+    }
+
+    const auto& texture = scene.textures.at(static_cast<std::size_t>(triangle.texture));
+    float filtered = 0;
+
+    // Coverage stays linear and skips colour decoding inside traversal.
+    for (const auto& tap : texture_taps(texture, triangle, u, v)) {
+        const float alpha = static_cast<float>(texture.rgba[tap.offset + 3]) / 255;
+        filtered += alpha * tap.weight;
+    }
+
+    return std::clamp(modulation * filtered, 0.f, 1.f);
+}
+
+}  // namespace bake_detail
+
+Float3 sample_bake_environment(
+    const BakeScene& scene, Float3 direction, const BakeSettings& settings
+) {
+    // Absent or disabled sky data uses the uniform scene environment.
+    if (!settings.use_level_sky || scene.sky_radiance.empty()) {
+        return scene.environment;
+    }
+
+    direction = bake_detail::unit(direction);
+    float longitude = std::atan2(direction[0], direction[1]) / (2 * bake_detail::kPi);
+    longitude -= std::floor(longitude);
+    const float x = longitude * static_cast<float>(scene.sky_width) - 0.5f;
+    const float y = std::clamp(
+        std::acos(std::clamp(direction[2], -1.0f, 1.0f)) / bake_detail::kPi
+                * static_cast<float>(scene.sky_height)
+            - 0.5f,
+        0.0f,
+        static_cast<float>(scene.sky_height - 1)
+    );
+    const int ix = static_cast<int>(std::floor(x)), iy = static_cast<int>(std::floor(y));
+    const float fx = x - std::floor(x), fy = y - static_cast<float>(iy);
+    Float3 result{};
+
+    // Clamp latitude at the poles while wrapping longitude.
+    for (int j = 0; j < 2; ++j) {
+        // Both longitude neighbours contribute to the sky sample.
+        for (int i = 0; i < 2; ++i) {
+            const auto sx = static_cast<std::uint32_t>(
+                (ix + i + static_cast<int>(scene.sky_width)) % static_cast<int>(scene.sky_width)
+            );
+            const auto sy = std::min(static_cast<std::uint32_t>(iy + j), scene.sky_height - 1);
+            const float weight = (i ? fx : 1 - fx) * (j ? fy : 1 - fy) * settings.sky_intensity;
+            const auto& pixel = scene.sky_radiance[std::size_t{sy} * scene.sky_width + sx];
+
+            // Scale sky radiance before mixing it with the authored light colour.
+            for (unsigned c = 0; c < 3; ++c) {
+                result[c] += pixel[c] * weight;
+            }
+        }
+    }
+
+    // The ambient colour mix is independent of direct-sun correction.
+    for (unsigned c = 0; c < 3; ++c) {
+        result[c] = settings.sky_weight * result[c]
+                    + (1 - settings.sky_weight) * scene.primary_directional_colour[c];
+    }
+
+    return result;
+}
+
+std::array<float, 4> bake_material(
+    const BakeScene& scene,
+    const BakeTriangle& triangle,
+    float u,
+    float v,
+    const BakeMaterialOptions& options
+) {
+    const bool authored = options.terrain_vertex_albedo && triangle.terrain_prelighting
+                          && options.terrain_vertex_albedo_strength > 0;
+    Float3 authored_tint{1, 1, 1};
+
+    // Authored terrain tint follows the runtime albedo path.
+    if (authored) {
+        // Interpolate the artistic tint before colour decoding.
+        for (unsigned c = 0; c < 3; ++c) {
+            const float tint = triangle.authored_colours[0][c] * (1 - u - v)
+                               + triangle.authored_colours[1][c] * u
+                               + triangle.authored_colours[2][c] * v;
+            authored_tint[c] = std::lerp(1.f, tint, options.terrain_vertex_albedo_strength);
+        }
+    }
+
+    std::array<float, 4> value{triangle.diffuse[0], triangle.diffuse[1], triangle.diffuse[2], 1};
+
+    // GS multipliers affect colour and coverage before filtering.
+    for (unsigned c = 0; c < 4; ++c) {
+        value[c] *= triangle.multipliers[0][c] * (1 - u - v) + triangle.multipliers[1][c] * u
+                    + triangle.multipliers[2][c] * v;
+    }
+
+    // Untextured surfaces still retain authored tint and GS modulation.
+    if (triangle.texture < 0) {
+        tint_untextured(value, authored_tint, options, authored);
+        scale_material(value, triangle.diffuse_scale);
+        return value;
+    }
+
+    const auto& texture = scene.textures.at(static_cast<std::size_t>(triangle.texture));
+    const auto filtered = filtered_material(texture, triangle, {u, v}, options, authored);
+
+    // Combine filtered texels with interpolated vertex modulation.
+    for (unsigned c = 0; c < 4; ++c) {
+        const float product = value[c] * filtered[c];
+        value[c] = product;
+
+        // Authored tint is applied before the final decode.
+        if (authored && c < 3) {
+            // Match the original terrain's encoded texture filtering and GS modulation.
+            value[c] = linear_colour(std::clamp(product * authored_tint[c], 0.f, 1.f));
+        }
+    }
+
+    scale_material(value, triangle.diffuse_scale);
+    return value;
+}
+
+Float3 bake_emission(const BakeScene& scene, const BakeTriangle& triangle, float u, float v) {
+    if (triangle.mesh_emission) {
+        return triangle.emission;
+    }
+    BakeTriangle emission_material{};
+    emission_material.diffuse = {1, 1, 1};
+    emission_material.texture = triangle.emission_texture;
+    emission_material.uv = triangle.uv;
+    Float3 tint{1, 1, 1};
+
+    // Authored bright colours can modulate emission independently of albedo.
+    if (triangle.emission_vertex_colour) {
+        // Interpolate emission colour over the same triangle barycentrics.
+        for (unsigned c = 0; c < 3; ++c) {
+            tint[c] = triangle.emission_colours[0][c] * (1 - u - v)
+                      + triangle.emission_colours[1][c] * u + triangle.emission_colours[2][c] * v;
+        }
+    }
+
+    auto radiance = bake_material(scene, emission_material, u, v, {tint});
+    if (triangle.emission_contrast > 1) {
+        const float luminance = radiance[0] * .2126f + radiance[1] * .7152f + radiance[2] * .0722f;
+        const float gain =
+            std::pow(std::max(luminance, 0.f) / .18f, triangle.emission_contrast - 1);
+        for (unsigned c = 0; c < 3; ++c) {
+            radiance[c] *= gain;
+        }
+    }
+    return {
+        triangle.emission[0] * radiance[0],
+        triangle.emission[1] * radiance[1],
+        triangle.emission[2] * radiance[2]
+    };
+}
+
+namespace bake_detail {
+EmissionIntegral integrate_bake_emission(
+    const BakeScene& scene, const BakeTriangle& triangle, bool known_opaque
+) {
+    const bool masked =
+        triangle.emission_uses_cutout && !known_opaque && triangle.alpha_cutoff > 0
+        && (triangle.texture >= 0
+            || std::any_of(
+                triangle.multipliers.begin(), triangle.multipliers.end(), [&](const auto& tint) {
+                    return tint[3] < triangle.alpha_cutoff;
+                }
+            ));
+    const bool constant = triangle.mesh_emission
+                          || (triangle.emission_texture < 0 && !triangle.emission_vertex_colour);
+    const auto constant_rgb = constant ? bake_emission(scene, triangle, 0, 0) : Float3{};
+    if (constant && !masked) {
+        return {constant_rgb, 1};
+    }
+
+    float footprint = 0;
+    for (const int index : {triangle.emission_texture, masked ? triangle.texture : -1}) {
+        if (index < 0) {
+            continue;
+        }
+        const auto& texture = scene.textures.at(static_cast<std::size_t>(index));
+        for (unsigned edge = 0; edge < 3; ++edge) {
+            const auto& a = triangle.uv[edge];
+            const auto& b = triangle.uv[(edge + 1) % 3];
+            footprint = std::max(
+                {footprint,
+                 std::abs(a[0] - b[0]) * static_cast<float>(texture.width),
+                 std::abs(a[1] - b[1]) * static_cast<float>(texture.height)}
+            );
+        }
+    }
+
+    // Equal-area subtriangles with degree-two quadrature integrate a bilinear patch exactly.
+    // Texture seams, alpha and nonlinear colour use the same bounded numerical rule.
+    const auto divisions = static_cast<unsigned>(std::clamp(std::ceil(2 * footprint), 4.f, 64.f));
+    const auto scale = 1.f / static_cast<float>(divisions);
+    constexpr Float2 offsets[] = {{1.f / 6, 1.f / 6}, {2.f / 3, 1.f / 6}, {1.f / 6, 2.f / 3}};
+    std::array<double, 3> sum{};
+    unsigned accepted = 0;
+    const auto sample = [&](float u, float v) {
+        if (masked && material_opacity(scene, triangle, u, v) < triangle.alpha_cutoff) {
+            return;
+        }
+        const auto value = constant ? constant_rgb : bake_emission(scene, triangle, u, v);
+        for (std::size_t c = 0; c < sum.size(); ++c) {
+            sum[c] += value[c];
+        }
+        ++accepted;
+    };
+    for (unsigned y = 0; y < divisions; ++y) {
+        for (unsigned x = 0; x < divisions - y; ++x) {
+            const auto u = static_cast<float>(x), v = static_cast<float>(y);
+            for (const auto offset : offsets) {
+                sample((u + offset[0]) * scale, (v + offset[1]) * scale);
+                if (x + y + 1 < divisions) {
+                    sample((u + 1 - offset[0]) * scale, (v + 1 - offset[1]) * scale);
+                }
+            }
+        }
+    }
+    if (accepted == 0) {
+        return {};
+    }
+    return {
+        {static_cast<float>(sum[0] / accepted),
+         static_cast<float>(sum[1] / accepted),
+         static_cast<float>(sum[2] / accepted)},
+        double(accepted) / (3 * divisions * divisions)
+    };
+}
+
+std::optional<Float3> average_bake_emission(
+    const BakeScene& scene, const BakeTriangle& triangle, bool known_opaque
+) {
+    if (!triangle.average_emission_for_bake) {
+        return std::nullopt;
+    }
+    if (triangle.emission_texture < 0 && !triangle.emission_vertex_colour) {
+        return bake_emission(scene, triangle, 0, 0);
+    }
+    if (triangle.emission_uses_cutout && triangle.texture < 0 && triangle.alpha_cutoff > 0) {
+        const auto accepted = [&](const auto& tint) {
+            return tint[3] >= triangle.alpha_cutoff;
+        };
+        // Untextured ray hits retain their original coverage. Keep point sampling at a partial mask.
+        if (std::any_of(triangle.multipliers.begin(), triangle.multipliers.end(), accepted)
+            && !std::all_of(triangle.multipliers.begin(), triangle.multipliers.end(), accepted)) {
+            return std::nullopt;
+        }
+    }
+    const auto integrated = integrate_bake_emission(scene, triangle, known_opaque);
+    return integrated.coverage > 0 ? std::optional(integrated.average) : std::nullopt;
+}
+}  // namespace bake_detail
+
+}  // namespace openrac::lighting

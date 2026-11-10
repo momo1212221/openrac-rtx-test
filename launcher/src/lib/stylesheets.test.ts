@@ -1,0 +1,118 @@
+import { describe, expect, it } from "vitest";
+
+// Two of docs/STYLE.md's rules, checked over app.css and every component's <style>: hover styles
+// sit inside @media (hover: hover), and colours are written as hex only on :root, where each has a
+// name (and a line in STYLE.md).
+const sources = {
+  ...import.meta.glob<string>("../**/*.svelte", { query: "?raw", import: "default", eager: true }),
+  ...import.meta.glob<string>("../app.css", { query: "?raw", import: "default", eager: true }),
+};
+
+interface Rule {
+  /** Where it is: the file and the line its block opens on. */
+  where: string;
+  /** Its selector or at-rule, and those of the blocks around it, outermost first. */
+  path: string[];
+  /** Its declarations, as written. */
+  declarations: string[];
+}
+
+/** The CSS of a component (its <style>) or of a stylesheet, with comments blanked, and the line
+ *  it starts on. */
+function css(file: string, text: string): { code: string; line: number } {
+  let code = text;
+  let line = 1;
+  if (file.endsWith(".svelte")) {
+    const open = /<style[^>]*>/.exec(text);
+    if (!open) return { code: "", line };
+    const start = open.index + open[0].length;
+    const end = text.indexOf("</style>", start);
+    code = text.slice(start, end < 0 ? undefined : end);
+    line = text.slice(0, start).split("\n").length;
+  }
+  return { code: code.replace(/\/\*[\s\S]*?\*\//g, (c) => c.replace(/[^\n]/g, " ")), line };
+}
+
+/** Every block with declarations in it, with the blocks it sits in. */
+function rules(file: string, text: string): Rule[] {
+  const { code, line: first } = css(file, text);
+  const out: Rule[] = [];
+  const stack: Rule[] = [];
+  let buffer = "";
+  let line = first;
+  for (const ch of code) {
+    if (ch === "{") {
+      const path = [...(stack.at(-1)?.path ?? []), buffer.trim().replace(/\s+/g, " ")];
+      stack.push({ where: `${file}:${line}`, path, declarations: [] });
+      buffer = "";
+    } else if (ch === ";" || ch === "}") {
+      const top = stack.at(-1);
+      if (top && buffer.trim()) top.declarations.push(buffer.trim());
+      if (ch === "}") {
+        const done = stack.pop();
+        if (done?.declarations.length) out.push(done);
+      }
+      buffer = "";
+    } else {
+      buffer += ch;
+    }
+    if (ch === "\n") line++;
+  }
+  return out;
+}
+
+const all = Object.entries(sources).flatMap(([file, text]) => rules(file.replace(/^\.\.\//, "src/"), text));
+
+describe("stylesheets", () => {
+  it("keeps root font sizing independent of rem during animated game accents", () => {
+    const relativeRootFonts = all
+      .filter((rule) =>
+        rule.path
+          .at(-1)
+          ?.split(",")
+          .some((selector) => selector.trim() === "html"),
+      )
+      .flatMap((rule) => rule.declarations)
+      .filter((declaration) => /^font(?:-size)?\s*:/.test(declaration) && /[\d.]rem\b/.test(declaration));
+    expect(relativeRootFonts).toEqual([]);
+  });
+
+  it("keeps the page at its size while navigation fades and slides it", () => {
+    const zooms = all
+      .filter((rule) => rule.path.some((path) => /^@keyframes page-(in|out)$/.test(path)))
+      .flatMap((rule) => rule.declarations)
+      .filter((declaration) => /^scale\s*:|\bscale\(/.test(declaration));
+    expect(zooms).toEqual([]);
+  });
+
+  it("finds the launcher's styles", () => {
+    expect(Object.keys(sources).length).toBeGreaterThan(30);
+    expect(all.length).toBeGreaterThan(500);
+  });
+
+  it("keep hover styles inside @media (hover: hover)", () => {
+    const outside = all
+      .filter((r) => r.path.at(-1)?.includes(":hover"))
+      .filter((r) => !r.path.some((p) => /^@media\b.*\(hover:\s*hover\)/.test(p)))
+      .map((r) => `${r.where} ${r.path.at(-1) ?? ""}`);
+    expect(outside).toEqual([]);
+  });
+
+  it("draw no hover while a controller moves the focus", () => {
+    // pad.ts: html[data-input="pad"]. A mouse resting over a control lit it beside the focus.
+    const loose = all
+      .filter((r) => r.path.at(-1)?.includes(":hover"))
+      .flatMap((r) => (r.path.at(-1) ?? "").split(",").map((s) => `${r.where} ${s.trim()}`))
+      .filter((s) => !s.includes('html:where(:not([data-input="pad"]))'));
+    expect(loose).toEqual([]);
+  });
+
+  it("write hex colours only on :root", () => {
+    // An @property's initial-value is the other place: CSS takes no var() there, so it repeats
+    // :root's value (app.css, the accent's colours).
+    const loose = all
+      .filter((r) => !r.path.includes(":root") && !r.path[0]?.startsWith("@property"))
+      .flatMap((r) => r.declarations.filter((d) => /#[0-9a-f]{3,8}\b/i.test(d)).map((d) => `${r.where} ${d}`));
+    expect(loose).toEqual([]);
+  });
+});

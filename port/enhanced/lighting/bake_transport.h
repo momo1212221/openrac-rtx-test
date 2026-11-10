@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// Deterministic two-sided transport and occupancy for offline probes.
+#pragma once
+#include <limits>
+#include <span>
+
+#include "enhanced/lighting/bake_integration.h"
+#include "enhanced/lighting/bake_scene.h"
+
+namespace openrac::lighting::bake_detail {
+// Per-probe sequence; preserve consumption order across transport changes.
+struct Random {
+    std::uint32_t state;  // Mutable sequence owned by a single probe worker.
+
+    // Advance the original 32-bit LCG and return a 24-bit fraction.
+    float next() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<float>(state >> 8) / 16777216.0f;
+    }
+};
+
+// Paired crossing parity and the nearest exit candidate.
+struct Placement {
+    bool inside = false;  // Paired crossings vote for a closed interior.
+    float nearest = std::numeric_limits<float>::infinity();  // Nearest accepted crossing.
+    Float3 exit_direction{};                                 // Ray toward that crossing.
+};
+
+// A per-probe mixture over the surrounding mesh-light cells and the original global distribution.
+// Analytic lights retain their original selection probabilities.
+class ProbeLightDistribution {
+public:
+    ProbeLightDistribution(const Scene& scene, Float3 origin);
+
+    [[nodiscard]] bool local() const { return m_size != 0; }
+
+    [[nodiscard]] std::size_t pick(double choice) const;
+    [[nodiscard]] double probability(std::size_t emitter) const;
+
+private:
+    struct Cell {
+        std::size_t index;
+        double scale;
+        double cumulative;
+    };
+
+    const Scene& m_scene;
+    std::array<Cell, 27> m_cells;
+    std::size_t m_size = 0;
+};
+
+// Sample a visible emitter without depending on authored shading normals.
+EmissionSample sample_emitter(
+    const Scene& scene,
+    Float3 origin,
+    float bias,
+    Random& random,
+    const BakeSettings& settings = {},
+    const ProbeLightDistribution* distribution = nullptr
+);
+// Returns the power heuristic for equal sample counts, without squaring large densities.
+float emission_mis_weight(double sampled_pdf, double competing_pdf);
+// Weights a finite light sample against primary or cosine-weighted direction sampling.
+void weight_emitter(EmissionSample& sample, double direction_pdf);
+// Collects mesh and transparent rectangle emission before the nearest geometry hit.
+Float3 segment_emission(
+    const Scene& scene,
+    const BakeSettings& settings,
+    const RTCRayHit& hit,
+    double direction_pdf,
+    const ProbeLightDistribution* distribution = nullptr
+);
+// Classify a probe with paired rays so winding cannot decide occupancy.
+Placement classify(
+    const Scene& scene,
+    Float3 position,
+    const BakeSettings& settings,
+    std::span<const std::array<Float3, 2>> directions
+);
+// Continue from the shared primary hit; distance moments keep that hit separately.
+Float3 radiance(
+    const Scene& scene,
+    const BakeSettings& settings,
+    RTCRayHit& hit,
+    Random& random,
+    const ProbeLightDistribution* distribution = nullptr
+);
+}  // namespace openrac::lighting::bake_detail

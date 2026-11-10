@@ -1,0 +1,562 @@
+<script lang="ts">
+  import { supports } from "$lib/capabilities";
+  // A game's saves: the memory card's used slots as rows (planet, bolts, when it was saved), the
+  // empty ones in one line, and the backups folded under a line of their own, each called by its
+  // note. File names, sizes and the card's folder name are a contributor's details: a chip and
+  // tooltips with developer tools on.
+  import Icon from "$components/Icon.svelte";
+  import { api, ask, pickSavesFile, type GameSaveStatus, type SaveBackupInfo, type VersionView } from "$lib/api";
+  import { app, toast } from "$lib/app.svelte";
+  import { grouped, size } from "$lib/format";
+  import { when } from "$lib/reports";
+  import { isPlaying } from "$lib/player.svelte";
+  import { backupLabel, emptySlots, savedWithMods, stampSeconds } from "$lib/saves";
+  import { fold } from "$lib/motion";
+  import { tick } from "svelte";
+  import { slide } from "svelte/transition";
+
+  let { version }: { version: VersionView } = $props();
+
+  const developer = $derived(app.config?.developer ?? false);
+
+  let loading = $state(true);
+  let status = $state<GameSaveStatus | null>(null);
+  let backupNote = $state("");
+  let creatingBackup = $state(false);
+  let restoringBackupName = $state<string | null>(null);
+  let confirming = $state(false);
+  /** The slot open in the save editor. */
+  let editing = $state<number | null>(null);
+  /** The backups are folded until asked for. */
+  let showBackups = $state(false);
+  /** "Back up now" asks for an optional name first, in the backups' own space. */
+  let naming = $state(false);
+  let noteInput = $state<HTMLInputElement | null>(null);
+  /** Export or Import (SaveTransfer.svelte), while its dialog is open. */
+  let transfer = $state<{ mode: "export" | "import"; source: string | null } | null>(null);
+
+  const used = $derived(status?.slots.filter((s) => !s.isEmpty) ?? []);
+  const empty = $derived(emptySlots(status?.slots.filter((s) => s.isEmpty).map((s) => s.slotIndex + 1) ?? []));
+
+  /** A slot's save time in words ("9 October at 17:01"); the core's own text when it cannot be read. */
+  function saved(stamp: string | null): string {
+    const seconds = stampSeconds(stamp);
+    return seconds === null ? (stamp ?? "") : when(seconds);
+  }
+
+  async function loadStatus() {
+    loading = true;
+    try {
+      status = await api.inspectSaves(version.serial);
+    } catch (e) {
+      toast(`Failed to inspect saves: ${String(e)}`, "error");
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function startBackup() {
+    showBackups = true;
+    naming = true;
+    await tick();
+    noteInput?.focus();
+  }
+
+  async function createBackup() {
+    if (!status) return;
+    creatingBackup = true;
+    try {
+      const res = await api.backupSaves(version.serial, backupNote.trim() || undefined);
+      toast(`Backed up: ${backupLabel(res)}.`, "info");
+      backupNote = "";
+      naming = false;
+      await loadStatus();
+    } catch (e) {
+      toast(`Backup failed: ${String(e)}`, "error");
+    } finally {
+      creatingBackup = false;
+    }
+  }
+
+  async function restoreBackup(backup: SaveBackupInfo) {
+    // A second press while the question is open, or while a restore runs, asks nothing again.
+    if (restoringBackupName !== null || confirming) return;
+    const label = `${backupLabel(backup)} (${when(backup.createdMillis / 1000)})`;
+    confirming = true;
+    const sure = await ask(
+      `Restore the backup "${label}"? Your current saves are backed up first, then replaced.`,
+      "Restore",
+    ).finally(() => (confirming = false));
+    if (!sure) return;
+    restoringBackupName = backup.name;
+    try {
+      await api.restoreBackup(version.serial, backup.name);
+      toast(`Restored ${label}.`, "info");
+      await loadStatus();
+    } catch (e) {
+      toast(`Restore failed: ${String(e)}`, "error");
+    } finally {
+      restoringBackupName = null;
+    }
+  }
+
+  /** Import: the file first, then the dialog reads it and shows what is in it. */
+  async function startImport() {
+    const source = await pickSavesFile("Choose an OpenRAC saves file").catch((e: unknown) => {
+      toast(`Could not open the file: ${String(e)}`, "error");
+      return null;
+    });
+    if (source) transfer = { mode: "import", source };
+  }
+
+  async function openFolder() {
+    try {
+      await api.openSavesFolder(version.serial);
+    } catch (e) {
+      toast(`Could not open folder: ${String(e)}`, "error");
+    }
+  }
+
+  $effect(() => {
+    // Again whenever the card changed elsewhere (app.savesChanged: an import, the game ending).
+    if (app.savesChanged >= 0) void loadStatus();
+  });
+</script>
+
+{#if editing !== null}
+  <!-- The save editor loads the first time a slot is edited. -->
+  {#await version.game === "rac2" ? import("$components/SaveEditorRac2.svelte") : import("$components/SaveEditor.svelte") then { default: SaveEditor }}
+    <SaveEditor
+      serial={version.serial}
+      slot={editing}
+      playing={isPlaying(version)}
+      onclose={(changedCard) => {
+        editing = null;
+        if (changedCard) void loadStatus();
+      }}
+    />
+  {/await}
+{/if}
+
+{#if transfer}
+  {#await import("$components/SaveTransfer.svelte") then { default: SaveTransfer }}
+    <SaveTransfer
+      serial={version.serial}
+      mode={transfer.mode}
+      source={transfer.source}
+      {used}
+      onclose={(changedCard) => {
+        transfer = null;
+        if (changedCard) void loadStatus();
+      }}
+    />
+  {/await}
+{/if}
+
+<section class="panel saves" aria-label="Saves">
+  <div class="row top">
+    <h2>Saves</h2>
+    {#if developer && status?.exists}
+      <span class="chip mono folder" title="The memory card's folder">{status.gameFolderName ?? version.serial}</span>
+    {/if}
+    <div class="actions">
+      {#if developer && status?.exists}
+        <button class="small" onclick={loadStatus} disabled={loading} title="Read the memory card again">
+          {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if}Refresh
+        </button>
+      {/if}
+      {#if used.length}
+        <button
+          class="small"
+          disabled={!supports(app.info, "saveTransfer")}
+          onclick={() => (transfer = { mode: "export", source: null })}><Icon name="upload" size={14} />Export</button
+        >
+      {/if}
+      <button class="small" disabled={!supports(app.info, "saveTransfer")} onclick={() => void startImport()}
+        ><Icon name="download" size={14} />Import</button
+      >
+      <button class="small" disabled={!supports(app.info, "openFolders")} onclick={openFolder}
+        ><Icon name="folder" size={14} />Open folder</button
+      >
+    </div>
+  </div>
+
+  {#if loading && !status}
+    <p class="muted row"><span class="spinner"></span>Reading the memory card…</p>
+  {:else if status && !status.exists}
+    <p class="muted">Your saves show here once you have played and saved.</p>
+  {:else if status}
+    {#if used.length}
+      <ul class="slots">
+        {#each used as slot (slot.slotIndex)}
+          <li>
+            <span class="slot" title={developer ? `${slot.filename} · ${size(slot.size)}` : undefined}
+              >Slot {slot.slotIndex + 1}</span
+            >
+            <span class="planet">{slot.planetName ?? "Unknown planet"}</span>
+            <span class="bolts"><Icon name="bolt" size={14} />{grouped(slot.bolts ?? 0)}</span>
+            <span class="when" title={developer ? (slot.timestamp ?? undefined) : undefined}
+              >{saved(slot.timestamp)}</span
+            >
+            {#if slot.mods?.length}
+              <!-- Written while mods were loaded (the mark beside the save: port/game/common/lib/mc.c).
+                   The names are in the tooltip; the row stays one line. -->
+              <span class="modded" title={savedWithMods(slot.mods)}>Mods</span>
+            {:else}
+              <span></span>
+            {/if}
+            {#if slot.editable}
+              <button
+                class="small edit"
+                disabled={!supports(app.info, "saveEditing")}
+                onclick={() => (editing = slot.slotIndex)}><Icon name="edit" size={14} />Edit</button
+              >
+            {:else}
+              <span></span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      {#if empty}<p class="empty">{empty}</p>{/if}
+    {:else}
+      <p class="muted">No saves on this card yet: they show here once you have saved in the game.</p>
+    {/if}
+
+    {#if status.coopSaves.length}
+      <!-- A party's saves: never the player's own slots. They are hosted from the game's Multiplayer page. -->
+      <h4 class="coop-title">Co-op saves</h4>
+      <p class="muted">From your parties. Your own saves above are left as they are.</p>
+      <ul class="slots">
+        {#each status.coopSaves as slot (slot.slotIndex)}
+          <li>
+            <span class="slot">Co-op {slot.slotIndex + 1}</span>
+            <span class="planet">{slot.planetName ?? "Unknown planet"}</span>
+            <span class="bolts"><Icon name="bolt" size={14} />{grouped(slot.bolts ?? 0)}</span>
+            <span class="when">{saved(slot.timestamp)}</span>
+            <span class="modded" title="Whose party this was">{slot.host ?? ""}</span>
+            <span></span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    <div class="backups">
+      <div class="row">
+        <button
+          class="fold grow"
+          class:open={showBackups}
+          aria-expanded={showBackups}
+          aria-controls="backups-list"
+          onclick={() => (showBackups = !showBackups)}
+        >
+          Backups ({status.backups.length})
+        </button>
+        <button class="small" disabled={creatingBackup || naming} onclick={() => void startBackup()}>
+          <Icon name="save" size={14} />Back up now
+        </button>
+      </div>
+      {#if showBackups}
+        <div id="backups-list" class="open-list" transition:slide={fold}>
+          {#if naming}
+            <div class="row take">
+              <input
+                bind:this={noteInput}
+                type="text"
+                aria-label="A name for the backup"
+                placeholder="Name it, if you like: before the last boss"
+                bind:value={backupNote}
+                disabled={creatingBackup}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") void createBackup();
+                  if (e.key === "Escape") naming = false;
+                }}
+              />
+              <button class="primary small" disabled={creatingBackup} onclick={createBackup}>
+                {#if creatingBackup}<span class="spinner"></span>{/if}Back up
+              </button>
+              <button class="ghost small" disabled={creatingBackup} onclick={() => (naming = false)}>Cancel</button>
+            </div>
+          {/if}
+          {#if status.backups.length}
+            <ul class="list">
+              {#each status.backups as backup (backup.name)}
+                <li>
+                  <!-- The date under the name, so a long name does not hide it on a narrow screen. -->
+                  <span class="grow named">
+                    <strong class="clip">{backupLabel(backup)}</strong>
+                    <span class="dim clip">{when(backup.createdMillis / 1000)}</span>
+                  </span>
+                  {#if developer}
+                    <span class="chip mono" title={backup.name}>{size(backup.totalSize)}</span>
+                  {/if}
+                  <button
+                    class="ghost small restore"
+                    disabled={restoringBackupName === backup.name || !supports(app.info, "saveEditing")}
+                    onclick={() => void restoreBackup(backup)}
+                  >
+                    {#if restoringBackupName === backup.name}<span class="spinner"></span>{/if}Restore
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {:else if !naming}
+            <p class="muted small-text">
+              No backups yet. The launcher also takes one by itself before the save editor writes.
+            </p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
+</section>
+
+<style>
+  .saves {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .saves {
+    container-type: inline-size;
+  }
+
+  /* The title keeps its width; the card's folder shortens; the buttons wrap under it when the
+     panel is narrow. */
+  .top {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+  }
+
+  .top h2 {
+    flex: none;
+    margin: 0;
+  }
+
+  .folder {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .actions {
+    display: flex;
+    flex: 1 1 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  /* A narrow panel: a slot's planet and Edit on the first line, its bolts, time and mods under. */
+  @container (max-width: 520px) {
+    .slots li {
+      grid-template-columns: 60px minmax(0, 1fr) auto;
+      grid-template-areas:
+        "slot planet edit"
+        ". bolts bolts"
+        ". when mods";
+      row-gap: 4px;
+    }
+
+    .slots li > :nth-child(1) {
+      grid-area: slot;
+    }
+
+    .slots li > :nth-child(2) {
+      grid-area: planet;
+    }
+
+    .slots li > :nth-child(3) {
+      grid-area: bolts;
+    }
+
+    .slots li > :nth-child(4) {
+      grid-area: when;
+    }
+
+    .slots li > :nth-child(5) {
+      grid-area: mods;
+      justify-self: end;
+    }
+
+    .slots li > :nth-child(6) {
+      grid-area: edit;
+    }
+  }
+
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  /* One used slot per row, the columns aligned down the list. */
+  .coop-title {
+    margin: 16px 0 2px;
+    font-size: inherit;
+  }
+
+  .slots li {
+    display: grid;
+    grid-template-columns: 60px minmax(0, 1fr) auto minmax(0, auto) auto auto;
+    align-items: center;
+    gap: 14px;
+    padding: 9px 2px;
+    border-bottom: 1px solid var(--line);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .slot {
+    font-size: 0.8125rem;
+    color: var(--dim);
+    /* "Co-op 1" on one line. */
+    white-space: nowrap;
+  }
+
+  .planet {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* A save written while mods were loaded; the mods themselves are in the tooltip. */
+  .modded {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--amber);
+    background: color-mix(in srgb, var(--amber) 12%, transparent);
+    border-radius: 6px;
+    padding: 2px 7px;
+    cursor: help;
+  }
+
+  .bolts {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--amber);
+    font-weight: 600;
+  }
+
+  .when {
+    font-size: 0.8125rem;
+    color: var(--soft);
+    white-space: nowrap;
+  }
+
+  .empty {
+    margin: 0;
+    font-size: 0.8125rem;
+    color: var(--dim);
+  }
+
+  /* A contributor's detail: a small mono chip, never glued to a player's words. */
+  .chip {
+    font-size: 0.75rem;
+    color: var(--soft);
+    background: var(--control);
+    border-radius: 7px;
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
+
+  .backups {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  /* The backups' fold: a line that opens, like the logs' in Help. */
+  .fold {
+    justify-content: flex-start;
+    gap: 8px;
+    padding: 4px 0;
+    border: 0;
+    background: none;
+    box-shadow: none;
+    color: var(--lav);
+    font-weight: 600;
+  }
+
+  .fold::before {
+    content: "";
+    border-left: 5px solid currentColor;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    transition: transform 0.15s;
+  }
+
+  .fold.open::before {
+    transform: rotate(90deg);
+  }
+
+  .open-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-left: 14px;
+  }
+
+  .take input {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .list li {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 0;
+  }
+
+  .list strong {
+    font-weight: 600;
+  }
+
+  .named {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.35;
+  }
+
+  .named .dim {
+    font-size: 0.8125rem;
+  }
+
+  .restore {
+    color: var(--amber);
+  }
+
+  .small-text {
+    font-size: 0.8125rem;
+  }
+
+  @media (max-width: 640px) {
+    .slots li {
+      grid-template-columns: 60px minmax(0, 1fr) auto;
+      row-gap: 6px;
+    }
+
+    /* The date on a line of its own under the planet, the mods badge beside it, Edit at its end. */
+    .slots .when {
+      grid-column: 2;
+    }
+
+    .slots .modded {
+      grid-column: 3;
+      justify-self: end;
+    }
+
+    .slots li > :last-child {
+      grid-column: 3;
+      justify-self: end;
+    }
+  }
+</style>

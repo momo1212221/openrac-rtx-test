@@ -1,0 +1,74 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (c) 2026 the OpenRAC contributors */
+#include "../../common/lib/effect_texture.h"
+#include "openrac/game_host.h"
+/* Not rac1.h: the test (port/tests/effect_quad_test.c) builds this file without a translation. */
+#include "rac1_version.h"
+#include <string.h>
+
+/* The id of the next quad, counting up, for a draw whose quads must follow their moby between
+ * ticks (openrac_game_quad::id); 0 for none. */
+uint32_t rac1_effect_quad_id;
+
+static int skip_ocean_quad;
+
+void openrac_skip_ocean_quad(int skip) {
+    skip_ocean_quad = skip;
+}
+
+static uint32_t effect_texture_source(uint64_t tex0, uint32_t* pixels, uint32_t* clut) {
+    return openrac_effect_texture(
+        tex0,
+        GREF(int, OPENRAC_DATA(RAC1_ADDR(0x0015F558u))),
+        OPENRAC_DATA(RAC1_ADDR(0x0018D140u)),
+        pixels,
+        clut
+    );
+}
+
+/*
+ * The draw callbacks' quad routine (ReRAC's FastDrawQuadReal): a0 a quad record, four corners
+ * (+0x00, x y z w each), four RGBA words (+0x40), four ST pairs (+0x50), then CLAMP_1, TEX0_1,
+ * TEX1_1 and ALPHA_1 (+0x70, +0x78, +0x80, +0x88; the GIF packet's register list); a1, when set,
+ * a matrix the corners go through first (rows at +0x00..+0x30: x * row0 + y * row1 + z * row2 +
+ * w * row3). The game projects the quad with its camera and sends it to the GS as a strip; the
+ * window draws it in the world (openrac_game_effect_quad).
+ */
+void func_001F7EF8(gaddr a0, int a1, int a2) {
+    if (skip_ocean_quad) {
+        return;
+    }
+    (void)a2;
+    const uint8_t* r = G(a0);
+    openrac_game_quad q;
+    memcpy(q.corner, r, sizeof(q.corner));
+    if (a1 != 0) {
+        float m[16];
+        memcpy(m, G((gaddr)a1), sizeof(m));
+        for (int k = 0; k < 4; ++k) {
+            const float x = q.corner[k][0], y = q.corner[k][1], z = q.corner[k][2], w = q.corner[k][3];
+            for (int i = 0; i < 4; ++i) {
+                q.corner[k][i] = x * m[i] + y * m[4 + i] + z * m[8 + i] + w * m[12 + i];
+            }
+        }
+    }
+    memcpy(q.rgba, r + 0x40, sizeof(q.rgba));
+    memcpy(q.st, r + 0x50, sizeof(q.st));
+    memcpy(&q.clamp, r + 0x70, 8);
+    memcpy(&q.tex0, r + 0x78, 8);
+    memcpy(&q.tex1, r + 0x80, 8);
+    memcpy(&q.alpha, r + 0x88, 8);
+    q.pixels = 0;
+    q.clut = 0;
+    q.id = rac1_effect_quad_id != 0 ? rac1_effect_quad_id++ : 0;
+    q.parent = 0;
+    q.source = effect_texture_source(q.tex0, &q.pixels, &q.clut);
+    openrac_game_effect_quad(&q);
+}
+
+/* PAL 001FD1D8 and executable 001F7EF8 read the same 0x90-byte
+ * record and optional matrix. Camera projection and clipping are performed
+ * by the native effect renderer for both entry points. */
+void func_L00_001FD1D8(gaddr a0, gaddr a1, int a2) {
+    func_001F7EF8(a0, (int)a1, a2);
+}

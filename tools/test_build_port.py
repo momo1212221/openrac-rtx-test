@@ -1,0 +1,469 @@
+"""tools/build_port.py's plans, without building anything:
+python3 -m unittest discover -s tools"""
+
+import contextlib
+import hashlib
+import os
+import io
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest import mock
+
+import build_port
+
+CACHE = """# This is the CMakeCache file.
+//Path to a program.
+CMAKE_C_COMPILER:STRING=C:/LLVM/bin/clang.exe
+CMAKE_CXX_COMPILER:STRING=C:/LLVM/bin/clang++.exe
+CMAKE_MAKE_PROGRAM:FILEPATH=C:/Ninja/ninja.exe
+OPENRAC_RAC1_PAL_SOURCE:PATH=C:/work/rac1-decomp
+WITH_EQUALS:STRING=a=b
+"""
+BUILD = ["cmake", "--build", "--preset", "release", "--parallel", str(build_port.build_jobs()),
+         "--target", "openrac-rac1-pal", "openrac-extractor"]
+
+# main() lowers its own priority (background.lower_priority); not the test runner's.
+_priority = mock.patch.object(build_port.background, "lower_priority", return_value=True)
+
+
+def setUpModule():
+    _priority.start()
+
+
+def tearDownModule():
+    _priority.stop()
+
+
+class Reading(unittest.TestCase):
+    def test_build_jobs_leave_threads_free_unless_told(self):
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch("os.cpu_count", return_value=8):
+            os.environ.pop("OPENRAC_BUILD_JOBS", None)
+            self.assertEqual(build_port.build_jobs(), 6)
+            for given, jobs in (("all", 8), ("3", 3), ("0", 6), ("many", 6)):
+                os.environ["OPENRAC_BUILD_JOBS"] = given
+                self.assertEqual(build_port.build_jobs(), jobs, given)
+
+    def test_cmake_cache_entries(self):
+        cache = build_port.parse_cache(CACHE)
+        self.assertEqual(cache["CMAKE_C_COMPILER"], "C:/LLVM/bin/clang.exe")
+        self.assertEqual(cache["OPENRAC_RAC1_PAL_SOURCE"], "C:/work/rac1-decomp")
+        self.assertEqual(cache["WITH_EQUALS"], "a=b")
+        self.assertEqual(len(cache), 5)
+
+    def test_what_cmd_set_prints(self):
+        env = build_port.parse_environment("Path=C:\\a;C:\\b\r\nINCLUDE=C:\\inc\r\n=C:=C:\\\r\n")
+        self.assertEqual(env, {"PATH": "C:\\a;C:\\b", "INCLUDE": "C:\\inc"})
+
+    def test_names_follow_the_games(self):
+        self.assertEqual(build_port.source_variable("rac1-pal"), "OPENRAC_RAC1_PAL_SOURCE")
+        self.assertEqual(build_port.targets(["rac1-pal"]), ["openrac-rac1-pal", "openrac-extractor"])
+        self.assertIn("rac1-pal", build_port.games())
+        self.assertEqual(build_port.default_source("rac1-pal"), build_port.ROOT / "games" / "rac1" / "decomp")
+
+    def test_clang_is_looked_for_in_order(self):
+        env = {"OPENRAC_CLANG": "X:/mine/clang.exe", "PROGRAMFILES": "X:/PF", "USERPROFILE": "X:/me", "PATH": ""}
+        found = build_port.clang_candidates(env, Path("X:/VS"))
+        self.assertEqual(found[:4], [
+            Path("X:/mine/clang.exe"),
+            Path("X:/PF/LLVM/bin/clang.exe"),
+            Path("X:/me/scoop/apps/llvm/current/bin/clang.exe"),
+            Path("X:/VS/VC/Tools/Llvm/x64/bin/clang.exe"),
+        ])
+
+
+class Clean(unittest.TestCase):
+    def test_a_read_only_file_is_deleted_too(self):
+        # git's objects are read-only, and Windows will not delete those: --clean stopped at a
+        # dependency CMake had cloned into the build folder.
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / "release"
+            pack = build / "_deps" / "cgltf-src" / ".git" / "objects" / "pack"
+            pack.mkdir(parents=True)
+            index = pack / "pack-0.idx"
+            index.write_bytes(b"x")
+            index.chmod(0o444)
+            build_port.remove_tree(build)
+            self.assertFalse(build.exists())
+
+
+class Commands(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = Path(self.tmp.name) / "release"
+        self.build.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def plan(self, cache, source=None, compilers=None, configured=True):
+        if configured:
+            (self.build / "build.ninja").write_text("")
+        return build_port.commands("cmake", "release", self.build, ["rac1-pal"], source, cache, compilers)
+
+    def test_a_new_folder_is_configured_from_the_preset_with_the_compilers_found(self):
+        steps = self.plan({}, compilers=("C:/LLVM/clang.exe", "C:/LLVM/clang++.exe", "C:/Ninja/ninja.exe"),
+                          configured=False)
+        self.assertEqual(steps, [
+            ["cmake", "--preset", "release", "-DCMAKE_C_COMPILER=C:/LLVM/clang.exe",
+             "-DCMAKE_CXX_COMPILER=C:/LLVM/clang++.exe", "-DCMAKE_MAKE_PROGRAM=C:/Ninja/ninja.exe"],
+            BUILD,
+        ])
+
+    def test_a_new_folder_takes_the_presets_compilers_when_none_are_found(self):
+        self.assertEqual(self.plan({}, configured=False), [["cmake", "--preset", "release"], BUILD])
+
+    def test_a_configured_folder_is_only_built(self):
+        self.assertEqual(self.plan(build_port.parse_cache(CACHE)), [BUILD])
+
+    def test_the_same_source_again_is_only_built(self):
+        cache = build_port.parse_cache(CACHE)
+        self.assertEqual(self.plan(cache, source=Path(cache["OPENRAC_RAC1_PAL_SOURCE"])), [BUILD])
+
+    def test_another_source_is_configured_without_the_preset(self):
+        steps = self.plan(build_port.parse_cache(CACHE), source=Path("/elsewhere/rac1"))
+        self.assertEqual(steps[0][:2], ["cmake", "-S"])
+        self.assertNotIn("--preset", steps[0])
+        self.assertEqual(steps[0][-1], "-DOPENRAC_RAC1_PAL_SOURCE=" + Path("/elsewhere/rac1").as_posix())
+        self.assertEqual(steps[1], BUILD)
+
+    def test_a_new_folder_runs_hostgen_under_this_python(self):
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, {}, None, "/usr/bin/python3")
+        self.assertEqual(steps[0], ["cmake", "--preset", "release", "-DPython3_EXECUTABLE=/usr/bin/python3"])
+
+    def test_python_is_named_without_the_windows_verbatim_prefix(self):
+        self.assertEqual(build_port.plain_path("\\\\?\\D:\\claude code\\python\\python.exe"),
+                         Path("D:\\claude code\\python\\python.exe"))
+        self.assertEqual(build_port.plain_path("\\\\?\\UNC\\nas\\share\\python.exe"),
+                         Path("\\\\nas\\share\\python.exe"))
+        self.assertEqual(build_port.plain_path("/usr/bin/python3"), Path("/usr/bin/python3"))
+
+    def test_a_folder_holding_a_verbatim_python_gets_the_plain_one(self):
+        # What launcher 1.0.1 left behind: hostgen's `cmd /C` could not start this Python.
+        (self.build / "build.ninja").write_text("")
+        cache = build_port.parse_cache(CACHE)
+        cache["Python3_EXECUTABLE"] = "//?/D:/claude code/python/python.exe"
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, cache, None,
+                                    "D:/claude code/python/python.exe")
+        self.assertEqual(steps, [["cmake", "-S", str(build_port.PORT), "-B", str(self.build),
+                                  "-DPython3_EXECUTABLE=D:/claude code/python/python.exe"], BUILD])
+        unconfigured = build_port.commands("cmake", "release", self.build / "new", ["rac1-pal"], None,
+                                           {"Python3_EXECUTABLE": "//?/D:/python.exe"}, None, "D:/python.exe")
+        self.assertIn("-DPython3_EXECUTABLE=D:/python.exe", unconfigured[0])
+
+    def test_more_targets_are_built_with_the_game(self):
+        (self.build / "build.ninja").write_text("")
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None,
+                                    build_port.parse_cache(CACHE), more=["runtime_test"])
+        self.assertEqual(steps, [BUILD + ["runtime_test"]])
+
+    def test_a_disc_is_kept_for_the_games_translation(self):
+        disc = Path("/discs/rac1.iso")
+        new = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, {}, disc=disc)
+        self.assertEqual(new[0], ["cmake", "--preset", "release", "-DOPENRAC_RAC1_PAL_RETAIL_IMAGE=" + disc.as_posix()])
+        (self.build / "build.ninja").write_text("")
+        cache = build_port.parse_cache(CACHE)
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, cache, disc=disc)
+        self.assertEqual(steps[0], ["cmake", "-S", str(build_port.PORT), "-B", str(self.build),
+                                    "-DOPENRAC_RAC1_PAL_RETAIL_IMAGE=" + disc.as_posix()])
+        cache["OPENRAC_RAC1_PAL_RETAIL_IMAGE"] = disc.as_posix()
+        self.assertEqual(build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, cache, disc=disc),
+                         [BUILD])
+
+    def test_an_unfinished_folder_keeps_its_own_compilers(self):
+        steps = self.plan(build_port.parse_cache(CACHE), compilers=("other", "other++", "ninja2"), configured=False)
+        self.assertEqual(steps[0][:3], ["cmake", "--preset", "release"])
+        self.assertIn("-DCMAKE_C_COMPILER=C:/LLVM/bin/clang.exe", steps[0])
+        self.assertNotIn("-DCMAKE_C_COMPILER=other", steps[0])
+
+    def test_a_clean_build_keeps_the_folders_choices(self):
+        cache = build_port.parse_cache(CACHE)
+        cache["OPENRAC_RAC1_PAL_RETAIL_IMAGE"] = "/discs/rac1.iso"
+        kept = build_port.kept_choices(cache)
+        self.assertEqual(kept, {"OPENRAC_RAC1_PAL_SOURCE": "C:/work/rac1-decomp",
+                                "OPENRAC_RAC1_PAL_RETAIL_IMAGE": "/discs/rac1.iso"})
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, {}, kept=kept)
+        self.assertEqual(steps[0], ["cmake", "--preset", "release", "-DOPENRAC_RAC1_PAL_SOURCE=C:/work/rac1-decomp",
+                                    "-DOPENRAC_RAC1_PAL_RETAIL_IMAGE=/discs/rac1.iso"])
+        # A --source given with --clean wins over the kept one.
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], Path("/new/rac1"), {}, kept=kept)
+        self.assertIn("-DOPENRAC_RAC1_PAL_SOURCE=" + Path("/new/rac1").as_posix(), steps[0])
+        self.assertNotIn("-DOPENRAC_RAC1_PAL_SOURCE=C:/work/rac1-decomp", steps[0])
+
+
+    def test_the_probe_baker_is_kept_and_configured_with_its_embree(self):
+        cache = build_port.parse_cache(CACHE)
+        cache["OPENRAC_PROBE_BAKER"] = "ON"
+        self.assertEqual(build_port.kept_choices(cache)["OPENRAC_PROBE_BAKER"], "ON")
+        defines = {"OPENRAC_PROBE_BAKER": "ON", "embree_DIR": "/b/embree/install/lib/cmake/embree-4.4.1"}
+        steps = build_port.commands("cmake", "release", self.build, ["rac1-pal"], None, {}, defines=defines,
+                                    more=[build_port.BAKER])
+        self.assertIn("-DOPENRAC_PROBE_BAKER=ON", steps[0])
+        self.assertIn("-Dembree_DIR=/b/embree/install/lib/cmake/embree-4.4.1", steps[0])
+        self.assertEqual(steps[-1][-1], "openrac-enhanced-baker")
+
+    def test_embree_is_pinned_and_built_static_without_tbb(self):
+        self.assertEqual(len(build_port.EMBREE_SHA256), 64)
+        self.assertIn(build_port.EMBREE_VERSION, build_port.EMBREE_URL)
+        self.assertEqual(build_port.EMBREE_OPTIONS["EMBREE_STATIC_LIB"], "ON")
+        self.assertEqual(build_port.EMBREE_OPTIONS["EMBREE_TASKING_SYSTEM"], "INTERNAL")
+
+    def test_embree_is_given_the_x86_isas_on_x86_only(self):
+        # On ARM a value for an x86-64 ISA still counts as one more ISA, and AppleClang's static
+        # Embree takes only one: the macOS launcher's baker was left out that way.
+        for machine in ("x86_64", "AMD64"):
+            self.assertEqual(build_port.embree_options(machine)["EMBREE_ISA_AVX"], "ON")
+        for machine in ("arm64", "aarch64", "ARM64"):
+            options = build_port.embree_options(machine)
+            self.assertFalse([key for key in options if key.startswith("EMBREE_ISA_")], machine)
+            self.assertEqual(options["EMBREE_STATIC_LIB"], "ON")
+
+    def test_embree_is_compiled_with_the_builds_cxxflags(self):
+        # The launcher's Linux builds put -stdlib=libc++ in CXXFLAGS; Embree must not drop it, and
+        # an Embree built with other flags is built again.
+        self.assertEqual(build_port.EMBREE_OPTIONS["EMBREE_IGNORE_CMAKE_CXX_FLAGS"], "OFF")
+        self.assertNotEqual(build_port.embree_stamp({"CXXFLAGS": "-stdlib=libc++"}), build_port.embree_stamp({}))
+
+
+class ProbeBaker(unittest.TestCase):
+    """--probe-baker: the baker with its Embree, except on an Intel Mac, which ships without it."""
+
+    def test_only_an_intel_mac_ships_without_the_baker(self):
+        self.assertFalse(build_port.ships_baker("Darwin", "x86_64"))
+        self.assertTrue(build_port.ships_baker("Darwin", "arm64"))
+        for system in ("Linux", "Windows"):
+            for machine in ("x86_64", "AMD64", "aarch64"):
+                self.assertTrue(build_port.ships_baker(system, machine), (system, machine))
+
+    def test_this_computer_is_read_when_none_is_given(self):
+        with mock.patch.object(build_port.platform, "system", return_value="Darwin"), \
+                mock.patch.object(build_port.platform, "machine", return_value="x86_64"):
+            self.assertFalse(build_port.ships_baker())
+        with mock.patch.object(build_port.platform, "system", return_value="Darwin"), \
+                mock.patch.object(build_port.platform, "machine", return_value="arm64"):
+            self.assertTrue(build_port.ships_baker())
+
+    def baker_on(self, system, machine, embree=None):
+        """probe_baker on SYSTEM and MACHINE, with build_embree mocked: its result, what it said,
+        and the mock."""
+        out = io.StringIO()
+        build = mock.Mock(return_value=Path("/b/embree/install/lib/cmake/embree-4.4.1"), side_effect=embree)
+        with mock.patch.object(build_port.platform, "system", return_value=system), \
+                mock.patch.object(build_port.platform, "machine", return_value=machine), \
+                mock.patch.object(build_port, "build_embree", build), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            result = build_port.probe_baker("cmake", {}, None, {})
+        return result, out.getvalue(), build
+
+    def test_an_intel_mac_neither_downloads_nor_builds_embree_and_says_why(self):
+        (defines, more), said, build = self.baker_on("Darwin", "x86_64")
+        build.assert_not_called()
+        self.assertEqual((defines, more), ({"OPENRAC_PROBE_BAKER": "OFF"}, []))
+        self.assertEqual(said.strip(), build_port.NO_BAKER_HERE)
+
+    def test_elsewhere_the_baker_is_built_with_its_embree(self):
+        (defines, more), said, build = self.baker_on("Darwin", "arm64")
+        build.assert_called_once()
+        self.assertEqual(defines, {"OPENRAC_PROBE_BAKER": "ON", "embree_DIR": "/b/embree/install/lib/cmake/embree-4.4.1"})
+        self.assertEqual(more, [build_port.BAKER])
+        self.assertNotIn(build_port.NO_BAKER_HERE, said)
+
+    def test_an_embree_that_fails_leaves_the_baker_out(self):
+        (defines, more), _, _ = self.baker_on("Linux", "x86_64", embree=build_port.BuildError("no network"))
+        self.assertEqual((defines, more), ({"OPENRAC_PROBE_BAKER": "OFF"}, []))
+
+    def test_a_required_baker_whose_embree_fails_stops_with_the_reason(self):
+        build = mock.Mock(side_effect=build_port.BuildError("no network"))
+        with mock.patch.object(build_port.platform, "system", return_value="Linux"), \
+                mock.patch.object(build_port.platform, "machine", return_value="aarch64"), \
+                mock.patch.object(build_port, "build_embree", build), \
+                self.assertRaisesRegex(build_port.BuildError, "no network"):
+            build_port.probe_baker("cmake", {}, None, {}, required=True)
+
+    def test_require_baker_fails_the_build_before_compiling(self):
+        run = mock.Mock(return_value=mock.Mock(returncode=0))
+        err = io.StringIO()
+        with mock.patch.object(build_port.platform, "system", return_value="Linux"), \
+                mock.patch.object(build_port.platform, "machine", return_value="aarch64"), \
+                mock.patch.object(build_port, "read_cache", return_value={}), \
+                mock.patch.object(build_port, "prepare", return_value=({}, Path("cmake"), None)), \
+                mock.patch.object(build_port, "build_embree", side_effect=build_port.BuildError("no network")), \
+                mock.patch.object(build_port.subprocess, "run", run), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            status = build_port.main(["rac1-pal", "--require-baker"])
+        self.assertEqual(status, 1)
+        run.assert_not_called()
+        self.assertIn("the probe baker cannot be built: no network", err.getvalue())
+
+    def test_embree_download_is_tried_again_after_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+
+            def urlopen(url, timeout):
+                calls.append(url)
+                raise urllib.error.HTTPError(url, 504, "Gateway Timeout", {}, None)
+
+            with mock.patch.object(build_port.urllib.request, "urlopen", urlopen), \
+                    mock.patch.object(build_port.time, "sleep") as sleep, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(build_port.BuildError, "did not download"):
+                build_port.fetch_embree(Path(tmp))
+        self.assertEqual(len(calls), build_port.EMBREE_TRIES)
+        self.assertEqual(sleep.call_count, build_port.EMBREE_TRIES - 1)
+
+    def test_require_baker_fails_without_embrees_license(self):
+        run = mock.Mock(return_value=mock.Mock(returncode=0))
+        err = io.StringIO()
+        with mock.patch.object(build_port.platform, "system", return_value="Linux"), \
+                mock.patch.object(build_port.platform, "machine", return_value="aarch64"), \
+                mock.patch.object(build_port, "read_cache", return_value={}), \
+                mock.patch.object(build_port, "prepare", return_value=({}, Path("cmake"), None)), \
+                mock.patch.object(build_port, "build_embree", return_value=Path("/b/embree")), \
+                mock.patch.object(build_port, "copy_licenses", side_effect=build_port.BuildError("no LICENSE.txt")), \
+                mock.patch.object(build_port, "write_stamp"), \
+                mock.patch.object(build_port.subprocess, "run", run), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(build_port.main(["rac1-pal", "--require-baker"]), 1)
+            self.assertEqual(build_port.main(["rac1-pal", "--probe-baker"]), 0)
+        self.assertIn("error: no LICENSE.txt", err.getvalue())
+        self.assertIn("warning: no LICENSE.txt", err.getvalue())
+
+    def fetch(self, answers):
+        """fetch_embree into a temporary folder, urlopen answering ANSWERS in turn (an exception
+        to raise, or the bytes of the body); the result or the BuildError, and the sleeps."""
+        answers = list(answers)
+
+        def urlopen(url, timeout):
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return contextlib.nullcontext(io.BytesIO(answer))
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(build_port.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(build_port.time, "sleep") as sleep, \
+                mock.patch.object(build_port, "EMBREE_SHA256", hashlib.sha256(b"good").hexdigest()), \
+                mock.patch.object(build_port.tarfile, "open", side_effect=build_port.BuildError("unpacked")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                build_port.fetch_embree(Path(tmp))
+                result = None
+            except build_port.BuildError as e:
+                result = e
+            leftover = sorted(p.name for p in Path(tmp).iterdir())
+        return result, sleep.call_count, answers, leftover
+
+    def test_a_cut_transfer_and_a_wrong_body_are_tried_again(self):
+        cut = build_port.http.client.IncompleteRead(b"go")
+        result, sleeps, left, files = self.fetch([cut, b"html error page", b"good"])
+        # The good archive is kept and then unpacked (mocked to stop there).
+        self.assertEqual(str(result), "unpacked")
+        self.assertEqual((sleeps, left), (2, []))
+        self.assertIn(f"embree-{build_port.EMBREE_VERSION}.tar.gz", files)
+        self.assertNotIn(f"embree-{build_port.EMBREE_VERSION}.part", files)
+
+    def test_a_download_that_never_works_says_why_and_leaves_no_part(self):
+        result, sleeps, _, files = self.fetch([b"bad"] * build_port.EMBREE_TRIES)
+        self.assertIn("did not download (SHA-256", str(result))
+        self.assertEqual(sleeps, build_port.EMBREE_TRIES - 1)
+        self.assertEqual(files, [])
+
+    def test_an_intel_mac_builds_the_rest_and_succeeds(self):
+        # The whole command line, its tools mocked: the game and the extractor are configured and
+        # built without the baker, and the build exits 0.
+        run = mock.Mock(return_value=mock.Mock(returncode=0))
+        build = mock.Mock()
+        out = io.StringIO()
+        with mock.patch.object(build_port.platform, "system", return_value="Darwin"), \
+                mock.patch.object(build_port.platform, "machine", return_value="x86_64"), \
+                mock.patch.object(build_port, "read_cache", return_value={}), \
+                mock.patch.object(build_port, "prepare", return_value=({}, Path("cmake"), None)), \
+                mock.patch.object(build_port, "build_embree", build), \
+                mock.patch.object(build_port, "write_stamp"), \
+                mock.patch.object(build_port.subprocess, "run", run), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            status = build_port.main(["rac1-pal", "--probe-baker"])
+        self.assertEqual(status, 0)
+        build.assert_not_called()
+        self.assertIn(build_port.NO_BAKER_HERE, out.getvalue())
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("-DOPENRAC_PROBE_BAKER=OFF", commands[0])
+        built = commands[-1]
+        self.assertIn("openrac-rac1-pal", built)
+        self.assertIn("openrac-extractor", built)
+        self.assertNotIn(build_port.BAKER, built)
+
+
+class Stamp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self):
+        import json
+        return json.loads((self.build / "openrac-build.json").read_text(encoding="utf-8"))
+
+    def test_a_build_records_its_version_commit_and_games(self):
+        build_port.write_stamp(self.build, ["rac1-pal"])
+        stamp = self.read()
+        self.assertEqual(stamp["version"], build_port.checkout_version())
+        self.assertEqual(stamp["commit"], build_port.checkout_commit())
+        self.assertEqual(stamp["games"], ["rac1-pal"])
+        # Another game built from the same checkout joins it.
+        build_port.write_stamp(self.build, ["rac1-ntsc"])
+        self.assertEqual(self.read()["games"], ["rac1-ntsc", "rac1-pal"])
+
+    def test_a_ci_build_records_its_repository(self):
+        with mock.patch.dict(build_port.os.environ, {"GITHUB_REPOSITORY": "someone/OpenRAC"}):
+            build_port.write_stamp(self.build, ["rac2-ntsc"])
+        self.assertEqual(self.read()["repository"], "someone/OpenRAC")
+        with mock.patch.dict(build_port.os.environ, {"GITHUB_REPOSITORY": "not a repository"}):
+            build_port.write_stamp(self.build, ["rac2-ntsc"])
+        self.assertNotIn("repository", self.read())
+
+    def test_a_build_from_another_checkout_starts_the_list_again(self):
+        (self.build / "openrac-build.json").write_text('{"version": "0.0.1", "commit": null, "games": ["rac1-pal"]}')
+        build_port.write_stamp(self.build, ["rac1-ntsc"])
+        self.assertEqual(self.read()["games"], ["rac1-ntsc"])
+
+
+class CommandLine(unittest.TestCase):
+    def test_tracy_modes_override_cached_profiling_options(self):
+        for flags, expected in (([], ("OFF", "OFF", "OFF")),
+                                (["--tracy"], ("ON", "OFF", "OFF")),
+                                (["--tracy-system"], ("ON", "ON", "OFF")),
+                                (["--tracy-sampling"], ("ON", "ON", "ON"))):
+            with self.subTest(flags=flags), \
+                    mock.patch.object(build_port, "read_cache", return_value={"OPENRAC_TRACY": "ON"}), \
+                    mock.patch.object(build_port, "prepare", return_value=({}, Path("cmake"), None)), \
+                    mock.patch.object(build_port, "write_stamp"), \
+                    mock.patch.object(build_port.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(build_port.main(["rac1-pal", *flags]), 0)
+                configure = run.call_args_list[0].args[0]
+                resolved = {"OPENRAC_TRACY": "ON"}
+                resolved.update(part[2:].split("=", 1) for part in configure if part.startswith("-D"))
+                for key, value in zip(("OPENRAC_TRACY", "OPENRAC_TRACY_SYSTEM", "OPENRAC_TRACY_SAMPLING"), expected):
+                    self.assertEqual(resolved[key], value)
+
+    def refused(self, argv):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            build_port.main(argv)
+
+    def test_an_unknown_game_is_refused(self):
+        self.refused(["rac9-pal"])
+
+    def test_a_source_for_two_games_is_refused(self):
+        self.refused(["rac1-pal", "rac1-ntsc", "--source", "."])
+
+    def test_a_disc_for_two_games_or_none_is_refused(self):
+        self.refused(["rac1-pal", "rac1-ntsc", "--disc", __file__])
+        self.refused(["rac1-pal", "--disc", "/no/such/disc.iso"])
+
+
+if __name__ == "__main__":
+    unittest.main()

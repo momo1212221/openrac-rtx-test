@@ -1,0 +1,1022 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// The debug overlay's settings controls (debug/overlay.h), which the drawer and the menu bar share:
+// a setting moved on, and the enhanced graphics' switches and sliders with GTAO's.
+
+#include <algorithm>
+#include <array>
+#include <imgui.h>
+#include <string_view>
+
+#include "debug/overlay.h"
+#include "enhanced/fsr3/fsr3.h"
+#include "enhanced/renderer/atmosphere.h"
+#include "enhanced/renderer/foliage.h"
+#include "enhanced/renderer/fur.h"
+#include "enhanced/renderer/reflection_material.h"
+#include "enhanced/renderer/rtx.h"
+#include "enhanced/renderer/water.h"
+#include "enhanced/renderer/wetness.h"
+#include "frontend.h"
+#include "options_menu.h"
+#include "settings.h"
+
+namespace openrac::frontend::debug_overlay {
+
+namespace {
+
+void control_tip(const char* text) {
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", text);
+    }
+}
+
+// Each row owns its table so feature trees and reset buttons can remain full width.
+template <class Draw>
+bool setting_row(const char* label, Draw draw) {
+    ImGui::PushID(label);
+    bool changed = false;
+    if (ImGui::BeginTable("row", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 1.15f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.f);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        const std::string_view visible(label);
+        const auto count = visible.find("##");
+        ImGui::TextUnformatted(
+            label, label + (count == std::string_view::npos ? visible.size() : count)
+        );
+        ImGui::TableSetColumnIndex(1);
+        ImGui::SetNextItemWidth(-1);
+        changed = draw();
+        ImGui::EndTable();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+bool checkbox(const char* label, bool* value) {
+    return setting_row(label, [&] { return ImGui::Checkbox("##value", value); });
+}
+
+bool slider_float(
+    const char* label,
+    float* value,
+    float lo,
+    float hi,
+    const char* format = "%.3f",
+    ImGuiSliderFlags flags = 0
+) {
+    return setting_row(label, [&] {
+        return ImGui::SliderFloat("##value", value, lo, hi, format, flags);
+    });
+}
+
+bool slider_int(
+    const char* label,
+    int* value,
+    int lo,
+    int hi,
+    const char* format = "%d",
+    ImGuiSliderFlags flags = 0
+) {
+    return setting_row(label, [&] {
+        return ImGui::SliderInt("##value", value, lo, hi, format, flags);
+    });
+}
+
+bool combo(const char* label, int* value, const char* items) {
+    return setting_row(label, [&] { return ImGui::Combo("##value", value, items); });
+}
+
+bool combo(const char* label, int* value, const char* const items[], int count) {
+    return setting_row(label, [&] { return ImGui::Combo("##value", value, items, count); });
+}
+
+bool colour_edit(const char* label, float* value) {
+    return setting_row(label, [&] { return ImGui::ColorEdit3("##value", value); });
+}
+
+bool input_float3(const char* label, float* value) {
+    return setting_row(label, [&] { return ImGui::InputFloat3("##value", value); });
+}
+
+// Persistent blur tuning lives in its own section, separate from lighting diagnostics.
+bool motion_blur_controls(settings::Settings& graphics) {
+    ImGui::SeparatorText("Motion blur");
+    ImGui::BeginDisabled(!enhanced::Fsr3::available());
+    bool changed = checkbox("Enabled##motion_blur", &graphics.motion_blur);
+    control_tip("Camera-target-relative during play; normal camera blur in cutscenes.");
+    ImGui::BeginDisabled(!graphics.motion_blur);
+    ImGui::PushItemWidth(dp(190.f));
+    auto& blur = graphics.motion_blur_settings;
+    changed |= slider_float(
+        "Strength", &graphics.motion_blur_strength, 0, 1, "%.2f", ImGuiSliderFlags_AlwaysClamp
+    );
+    control_tip("Exposure strength. 0.5 is a 1/120-second exposure; 1 is 1/60 second.");
+    if (ImGui::TreeNode("Advanced##motion_blur")) {
+        changed |= slider_float(
+            "Cutscene multiplier",
+            &blur.cutscene_multiplier,
+            0,
+            2,
+            "%.2fx",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        control_tip("Scales strength only in real-time cutscenes. Zero disables cutscene blur.");
+        changed |= slider_int(
+            "Max trail length", &blur.max_radius, 1, 128, "%d px", ImGuiSliderFlags_AlwaysClamp
+        );
+        control_tip("Caps trails in display pixels. Longer trails can cost more GPU time.");
+        changed |= slider_int("Samples", &blur.samples, 8, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+        control_tip("Higher counts make trails smoother, at a higher GPU cost.");
+        changed |= slider_float(
+            "Minimum motion", &blur.min_motion, .1f, 4, "%.2f px", ImGuiSliderFlags_AlwaysClamp
+        );
+        control_tip(
+            "Ignores tiny movements after exposure scaling. Raise it to suppress subtle smearing."
+        );
+        changed |=
+            slider_float("Trail spread", &blur.spread, 0, 1, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        control_tip(
+            "Higher values include more nearby motion but "
+            "may "
+            "introduce halos."
+        );
+        changed |= slider_float(
+            "Depth tolerance",
+            &blur.depth_tolerance,
+            .001f,
+            .05f,
+            "%.3f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        control_tip(
+            "Allowed relative depth difference when gathering colour. Lower values protect "
+            "occlusion "
+            "edges; higher values blend more freely."
+        );
+        ImGui::TreePop();
+    }
+    ImGui::PopItemWidth();
+    ImGui::EndDisabled();
+    if (ImGui::Button("Reset blur tuning")) {
+        graphics.motion_blur_strength = .5f;
+        blur = renderer::MotionBlurSettings{};
+        changed = true;
+    }
+    control_tip("Restores tuning defaults and keeps the Enabled switch unchanged.");
+    ImGui::EndDisabled();
+    return changed;
+}
+
+// Preview this level's ocean optics and restore its authored values.
+void ocean_material_controls() {
+    auto material = enhanced::ocean_material();
+    bool changed = colour_edit("Body colour (linear RGB)", material.colour.data());
+    changed |= slider_float(
+        "Red absorption", &material.absorption[0], 0, 4, "%.3f", ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Green absorption", &material.absorption[1], 0, 4, "%.3f", ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Blue absorption", &material.absorption[2], 0, 4, "%.3f", ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Roughness", &material.roughness, .04f, 1, "%.2f", ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Reflectivity (F0)", &material.reflectivity, 0, 1, "%.3f", ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Reflection strength",
+        &material.reflection_strength,
+        0,
+        4,
+        "%.2fx",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    // Reset takes precedence if the user edited another control on the same frame.
+    if (ImGui::Button("Reset ocean material to level profile")) {
+        enhanced::reset_ocean_material();
+        return;
+    }
+    // Avoid writing the live settings when the panel is only being read.
+    if (changed) {
+        enhanced::set_ocean_material(material);
+    }
+}
+
+// Shell geometry is a session option independent of authored fur shading.
+void fur_shell_controls() {
+    auto fur = enhanced::fur_material_settings();
+    bool changed = checkbox("Fluffy shell coat", &fur.shells_enabled);
+    changed |= slider_float("Coat length (body fraction)", &fur.shell_length, 0, .08f, "%.3f");
+    changed |= slider_int("Coat layers", &fur.shell_layers, 4, 16);
+    changed |= slider_float("Strand density", &fur.shell_density, 32, 256, "%.0f");
+    changed |= slider_float("Coat fade distance", &fur.shell_distance, 4, 64, "%.0f units");
+    // Keep the current material settings when the shell controls are only being read.
+    if (changed) {
+        enhanced::set_fur_material_settings(fur);
+    }
+}
+
+// Live, session-only water controls; the render worker consumes a locked copy.
+void water_controls() {
+    auto options = enhanced::water_debug_settings();
+    ImGui::TextDisabled("Session only; changes are not saved.");
+    ImGui::BeginDisabled(!enhanced::water_available());
+    bool changed = checkbox("Pause simulation", &options.paused);
+    if (!enhanced::ocean_replaces_horizon()) {
+        changed |= checkbox("Pokitaru coastal correction", &options.coastal_correction);
+    }
+    ImGui::PushItemWidth(dp(170.f));
+    changed |= slider_float(
+        "Current speed", &options.current_scale, 0, 2.5f, "%.2fx", ImGuiSliderFlags_AlwaysClamp
+    );
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Changing current speed resets the water. The pond has no base current.");
+    }
+    changed |=
+        slider_float("Friction", &options.friction, 0, 4, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    changed |= slider_float(
+        "Outlet damping", &options.outlet_damping, 0, 30, "%.1f", ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Ratchet strength",
+        &options.interaction_strength,
+        0,
+        4,
+        "%.2fx",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    changed |= slider_float(
+        "Ratchet radius",
+        &options.interaction_radius,
+        .1f,
+        2,
+        "%.2f units",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    ImGui::SeparatorText("Projectiles");
+    changed |= slider_float(
+        "Projectile strength",
+        &options.projectile_strength,
+        0,
+        4,
+        "%.2fx",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    control_tip(
+        "Scales ripples from new shots and thrown bombs. Zero disables their response; "
+        "existing waves continue to settle."
+    );
+    changed |= slider_float(
+        "Projectile radius",
+        &options.projectile_radius,
+        .1f,
+        4,
+        "%.2fx",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    control_tip(
+        "Scales each projectile's water-contact radius. 1x keeps its normal size. "
+        "The resulting radius is limited to 4 world units."
+    );
+    ImGui::SeparatorText("Explosions");
+    changed |= slider_float(
+        "Explosion strength",
+        &options.explosion_strength,
+        0,
+        4,
+        "%.2fx",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    control_tip(
+        "Scales waves from new explosions. Zero disables their response; "
+        "existing waves continue to settle."
+    );
+    changed |= slider_float(
+        "Explosion radius", &options.explosion_radius, .1f, 4, "%.2fx", ImGuiSliderFlags_AlwaysClamp
+    );
+    control_tip(
+        "Scales each explosion's reach across and above the water. 1x keeps its normal size. "
+        "The resulting radius is limited to 4 world units."
+    );
+    ImGui::SeparatorText("Surface");
+    changed |= slider_float(
+        "Displacement limit",
+        &options.displacement_limit,
+        0,
+        .5f,
+        "%.2f units",
+        ImGuiSliderFlags_AlwaysClamp
+    );
+    if (!enhanced::ocean_replaces_horizon()) {
+        changed |= slider_float(
+            "Fine ripples",
+            &options.fine_normal_strength,
+            0,
+            2,
+            "%.2fx",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+    }
+    changed |= combo(
+        "Water view",
+        &options.view,
+        "Lit\0Height\0Velocity\0Banks\0Flow detail\0Direct highlights\0Environment "
+        "reflections\0Illumination\0Surface mask\0Captured reflections\0GI fallback\0Cached "
+        "GI\0Reference reflection selection\0Foam off\0Foam mask\0Reference foam\0Shoreline blend "
+        "mask\0Reference shoreline blend\0"
+    );
+    ImGui::PopItemWidth();
+    if (options.view == 1) {
+        ImGui::TextDisabled("Red: raised  Blue: lowered  Gray: rest");
+    }
+    if (options.view == 2) {
+        ImGui::TextDisabled("Red/green encode X/Y velocity.");
+    }
+    if (options.view == 3) {
+        ImGui::TextDisabled("Red: active water  Green: shore influence");
+    }
+    if (options.view == 4) {
+        ImGui::TextDisabled("Surface pattern carried by the simulated flow.");
+    }
+    if (ImGui::Button("Reset simulation")) {
+        enhanced::reset_water_simulation();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Restore water defaults")) {
+        options = enhanced::WaterDebugSettings{};
+        changed = true;
+        enhanced::reset_water_simulation();
+    }
+    if (changed) {
+        enhanced::set_water_debug_settings(options);
+    }
+    ImGui::EndDisabled();
+    if (!enhanced::water_available()) {
+        ImGui::TextDisabled("A valid water bake is required.");
+    }
+}
+
+// Draws GTAO's controls: its quality, its resolution, its directions and steps, its radius and
+// strength, and a button that resets them. A change is saved and marked for the window to apply.
+void gtao_controls() {
+    auto& options = settings::get().gtao_settings;
+    bool changed = false;
+    ImGui::PushItemWidth(dp(170.0f));
+    changed |= checkbox("Half resolution", &options.half_resolution);
+    changed |= checkbox("Hierarchical depth (Hi-Z)", &options.hi_z);
+    changed |= slider_int("Directions", &options.slices, 1, 12, "%d", ImGuiSliderFlags_AlwaysClamp);
+    changed |=
+        slider_int("Steps per side", &options.steps, 4, 24, "%d", ImGuiSliderFlags_AlwaysClamp);
+    changed |=
+        slider_float("Radius", &options.radius, 0.05f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    changed |= slider_float(
+        "Strength multiplier", &options.strength, 0.0f, 3.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp
+    );
+    ImGui::PopItemWidth();
+    if (ImGui::Button("Reset GTAO settings")) {
+        options = renderer::GtaoSettings{};
+        changed = true;
+    }
+    if (changed) {
+        settings::save();
+        s.settings_changed = true;
+    }
+}
+
+void rtx_controls(settings::Settings& graphics, bool& changed) {
+    auto& rtx = graphics.rtx_settings;
+    const auto status = enhanced::rtx_status();
+    changed |= checkbox("Hardware RTX ray tracing", &graphics.rtx);
+    control_tip(
+        "Traces hardware rays using Apple Metal RT on macOS, NVIDIA CUDA/RTX on GeForce/RTX, "
+        "or Vulkan Ray Query / Compute BVH."
+    );
+    if (!status.device_name.empty()) {
+        ImGui::TextDisabled(
+            "Backend: %s (%zu tris, %zu BVH nodes, %zu dynamic mobys)",
+            status.device_name.c_str(),
+            status.triangle_count,
+            status.node_count,
+            status.dynamic_instance_count
+        );
+        ImGui::TextDisabled(
+            "Hardware support: Metal RT [%s]  CUDA RTX [%s]  Vulkan RQ [%s]",
+            status.metal_supported ? "yes" : "no",
+            status.cuda_supported ? "yes" : "no",
+            status.vulkan_ray_query_supported ? "yes" : "no"
+        );
+    }
+    ImGui::BeginDisabled(!graphics.rtx);
+    int backend = static_cast<int>(rtx.backend);
+    if (combo(
+            "Hardware backend",
+            &backend,
+            renderer::kRtxBackendNames,
+            static_cast<int>(renderer::RtxBackend::Count)
+        )) {
+        rtx.backend = static_cast<renderer::RtxBackend>(backend);
+        changed = true;
+    }
+    int quality = static_cast<int>(rtx.quality);
+    if (combo(
+            "Ray tracing quality",
+            &quality,
+            renderer::kRtxQualityNames,
+            static_cast<int>(renderer::RtxQuality::Count)
+        )) {
+        rtx.quality = static_cast<renderer::RtxQuality>(quality);
+        changed = true;
+    }
+    changed |= checkbox("Ray-traced sun shadows", &rtx.shadows);
+    changed |= checkbox("Ray-traced ambient occlusion", &rtx.ambient_occlusion);
+    changed |= checkbox("Ray-traced specular reflections", &rtx.reflections);
+    changed |= checkbox("Ray-traced bounce GI", &rtx.global_illumination);
+    changed |= checkbox("Bilateral spatial denoiser", &rtx.denoise);
+    int rtx_view = static_cast<int>(enhanced::rtx_debug_view());
+    if (combo(
+            "RTX debug view##rtx",
+            &rtx_view,
+            "Off\0Shadows\0Ambient occlusion\0Reflections\0Bounce GI\0BVH heatmap\0"
+        )) {
+        enhanced::set_rtx_debug_view(static_cast<enhanced::RtxDebugView>(rtx_view));
+    }
+    if (ImGui::TreeNode("Advanced##rtx")) {
+        changed |= slider_int(
+            "Samples per pixel", &rtx.samples_per_pixel, 1, 8, "%d spp", ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= slider_float(
+            "Max ray distance",
+            &rtx.ray_distance,
+            10.0f,
+            500.0f,
+            "%.0f units",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= slider_float(
+            "AO radius", &rtx.ao_radius, 0.25f, 16.0f, "%.2f units", ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= slider_float(
+            "Sun shadow softness",
+            &rtx.shadow_softness,
+            0.0f,
+            0.25f,
+            "%.3f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= slider_float(
+            "Reflection roughness cutoff",
+            &rtx.reflection_roughness_cutoff,
+            0.05f,
+            1.0f,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= slider_float(
+            "Bounce GI strength", &rtx.gi_strength, 0.0f, 4.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::TreePop();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::Button("Reset RTX settings")) {
+        graphics.rtx = false;
+        rtx = renderer::RtxSettings{};
+        enhanced::set_rtx_debug_view(enhanced::RtxDebugView::Off);
+        changed = true;
+    }
+}
+
+}  // namespace
+
+// A setting moved in the drawer or the menus: saved, and applied by the window
+// (take_settings_changed). A picture shape of the player's own is the settings file's.
+void change_setting(int row, int by) {
+    options_menu::step(row, by);
+    if (row == options_menu::kAspect && settings::get().aspect == settings::Aspect::Custom) {
+        options_menu::step(row, by);
+    }
+    settings::save();
+    s.settings_changed = true;
+}
+
+// The saved Enhanced choices and this session's tuning back to their defaults; the caller saves.
+void reset_enhanced() {
+    settings::get().reset_enhanced();
+    enhanced::set_wetness_material_settings({});
+    frontend::reset_foliage_controls();
+    frontend::reset_materials();
+    enhanced::set_wetness_debug_view(false);
+    enhanced::set_fur_debug_view(enhanced::FurDebug::Off);
+    enhanced::set_fur_material_settings({});
+    enhanced::set_water_debug_settings({});
+    enhanced::set_atmosphere_settings({});
+    enhanced::set_rtx_debug_view(enhanced::RtxDebugView::Off);
+    enhanced::reset_water_simulation();
+}
+
+void enhanced_settings_window() {
+    if (!s.enhanced_settings) {
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(dp(490), dp(660)), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Enhanced Settings", &s.enhanced_settings)) {
+        ImGui::End();
+        return;
+    }
+    auto& graphics = settings::get();
+    const bool available = enhanced_graphics_available();
+    if (!available) {
+        const auto error = enhanced_graphics_error();
+        if (!error.empty()) {
+            ImGui::TextColored(ImVec4(1.f, .4f, .3f, 1.f), "Probe data could not be loaded");
+            ImGui::TextWrapped("%s", error.c_str());
+            ImGui::TextWrapped(
+                "If the probe data is out of date, rebake this level with the current version of "
+                "the game, then reload the level."
+            );
+        } else {
+            ImGui::TextWrapped(
+                "Compatible probe data is required for this level. Prepare its lighting in the "
+                "launcher's Enhanced graphics page."
+            );
+        }
+    }
+    ImGui::BeginDisabled(!available);
+    bool changed = checkbox("Enhanced graphics (F4)", &graphics.enhanced_graphics);
+    if (ImGui::Button("Reset to Defaults##enhanced")) {
+        reset_enhanced();
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Restore enhanced graphics, post processing and session tuning defaults."
+        );
+    }
+    ImGui::BeginDisabled(!graphics.enhanced_graphics);
+    ImGui::PushItemWidth(dp(190));
+
+    if (ImGui::CollapsingHeader("Image quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* texture_filters[] =
+            {settings::name(renderer::TextureFilter::Normal),
+             settings::name(renderer::TextureFilter::EdgeAware)};
+        int texture_filter = static_cast<int>(graphics.texture_filter);
+        if (combo(
+                "Texture upscaling",
+                &texture_filter,
+                texture_filters,
+                static_cast<int>(renderer::TextureFilter::Count)
+            )) {
+            graphics.texture_filter = static_cast<renderer::TextureFilter>(texture_filter);
+            changed = true;
+        }
+        ImGui::BeginDisabled(!enhanced::Fsr3::available());
+        int temporal_quality = static_cast<int>(graphics.temporal_quality);
+        if (combo(
+                "Temporal upscaling",
+                &temporal_quality,
+                renderer::kTemporalNames,
+                static_cast<int>(renderer::TemporalQuality::Count)
+            )) {
+            graphics.temporal_quality = static_cast<renderer::TemporalQuality>(temporal_quality);
+            changed = true;
+        }
+        ImGui::EndDisabled();
+
+        ImGui::BeginDisabled(!enhanced::Fsr3::available());
+        changed |= slider_float(
+            "Upscaling sharpening",
+            &graphics.temporal_sharpness,
+            0,
+            1,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::EndDisabled();
+        if (ImGui::Button("Reset image quality")) {
+            const settings::Settings defaults;
+            graphics.texture_filter = defaults.texture_filter;
+            graphics.temporal_quality = defaults.temporal_quality;
+            graphics.temporal_sharpness = defaults.temporal_sharpness;
+            changed = true;
+        }
+    }
+    if (ImGui::CollapsingHeader("Lighting & shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= checkbox("Modern shadows", &graphics.enhanced_shadows);
+        ImGui::BeginDisabled(!graphics.enhanced_shadows);
+        int shadow_quality = static_cast<int>(graphics.shadow_quality);
+        if (combo(
+                "Shadow quality",
+                &shadow_quality,
+                renderer::kShadowQualityNames,
+                static_cast<int>(renderer::ShadowQuality::Count)
+            )) {
+            graphics.shadow_quality = static_cast<renderer::ShadowQuality>(shadow_quality);
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        changed |= checkbox("Ambient occlusion", &graphics.gtao);
+        ImGui::BeginDisabled(!graphics.gtao);
+        int quality = static_cast<int>(graphics.gtao_settings.quality);
+        if (combo("Occlusion quality", &quality, "Performance\0Quality\0")) {
+            graphics.gtao_settings.quality = static_cast<renderer::GtaoQuality>(quality);
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        if (ImGui::TreeNode("Advanced##occlusion")) {
+            ImGui::BeginDisabled(!graphics.gtao);
+            gtao_controls();
+            ImGui::EndDisabled();
+            ImGui::TreePop();
+        }
+        changed |= slider_float(
+            "Bounce light",
+            &graphics.probe_gi_multiplier,
+            0,
+            5,
+            "%.2fx",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= checkbox("Gameplay rim light", &graphics.rim_light);
+        if (ImGui::TreeNode("Advanced##rim")) {
+            ImGui::BeginDisabled(!graphics.rim_light);
+            changed |= slider_float(
+                "Rim strength",
+                &graphics.rim_light_strength,
+                0,
+                1,
+                "%.2f",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Rim falloff",
+                &graphics.rim_light_falloff,
+                1,
+                8,
+                "%.2f",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= checkbox("Rim shadow lift", &graphics.rim_shadow_lift);
+            ImGui::BeginDisabled(!graphics.rim_shadow_lift);
+            changed |= slider_float(
+                "Lift exponent",
+                &graphics.rim_lift_exponent,
+                0.01f,
+                1,
+                "%.2f",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Maximum lift gain",
+                &graphics.rim_lift_max_gain,
+                1,
+                16,
+                "%.2fx",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            ImGui::EndDisabled();
+            control_tip(
+                "Higher falloff narrows the edge. Lower lift exponents brighten dim surroundings, "
+                "preserving the local bounced-light colour. Exponent 1 leaves brightness unchanged."
+            );
+            ImGui::EndDisabled();
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Main light direction")) {
+            changed |= checkbox("Override light direction", &graphics.sun_direction_override);
+            ImGui::BeginDisabled(!graphics.sun_direction_override);
+            changed |= slider_float(
+                "Azimuth",
+                &graphics.sun_azimuth,
+                -180,
+                180,
+                "%.1f degrees",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Elevation",
+                &graphics.sun_elevation,
+                -90,
+                90,
+                "%.1f degrees",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            ImGui::EndDisabled();
+            if (ImGui::Button("Restore level light direction")) {
+                graphics.sun_direction_override = false;
+                graphics.sun_azimuth = 0;
+                graphics.sun_elevation = 45;
+                changed = true;
+            }
+            control_tip(
+                "Updates direct lighting and shadows. Baked bounce lighting keeps its baked "
+                "direction."
+            );
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Nanotech orb lights (Ratchet & Clank 1)")) {
+            auto& light = graphics.nanotech_light;
+            changed |= checkbox("Nanotech orb lights", &light.enabled);
+            ImGui::BeginDisabled(!light.enabled);
+            changed |= colour_edit("Colour (linear RGB)", light.colour.data());
+            changed |= slider_float(
+                "Brightness", &light.brightness, 0.0f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Range", &light.range, 0.1f, 12.0f, "%.2f units", ImGuiSliderFlags_AlwaysClamp
+            );
+            ImGui::EndDisabled();
+            ImGui::TreePop();
+        }
+        if (ImGui::Button("Reset lighting and shadows")) {
+            const settings::Settings defaults;
+            graphics.enhanced_shadows = defaults.enhanced_shadows;
+            graphics.shadow_quality = defaults.shadow_quality;
+            graphics.gtao = defaults.gtao;
+            graphics.gtao_settings = defaults.gtao_settings;
+            graphics.probe_gi_multiplier = defaults.probe_gi_multiplier;
+            graphics.nanotech_light = defaults.nanotech_light;
+            graphics.rim_light = defaults.rim_light;
+            graphics.rim_light_strength = defaults.rim_light_strength;
+            graphics.rim_light_falloff = defaults.rim_light_falloff;
+            graphics.rim_shadow_lift = defaults.rim_shadow_lift;
+            graphics.rim_lift_exponent = defaults.rim_lift_exponent;
+            graphics.rim_lift_max_gain = defaults.rim_lift_max_gain;
+            graphics.sun_direction_override = defaults.sun_direction_override;
+            graphics.sun_azimuth = defaults.sun_azimuth;
+            graphics.sun_elevation = defaults.sun_elevation;
+            changed = true;
+        }
+    }
+    if (ImGui::CollapsingHeader("RTX ray tracing (CUDA / Apple Metal)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        rtx_controls(graphics, changed);
+    }
+    if (ImGui::CollapsingHeader("Post processing")) {
+        ImGui::SeparatorText("AgX");
+        changed |= checkbox("AgX", &graphics.agx_preview);
+        control_tip(
+            "Adjusts scene colour and contrast. "
+            "HUD colours are unchanged."
+        );
+        ImGui::BeginDisabled(!graphics.agx_preview);
+        changed |= slider_float(
+            "Exposure (EV)", &graphics.agx_exposure, -4, 4, "%.2f", ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= slider_float(
+            "Brightness", &graphics.agx_brightness, 0, 1, "%.2f", ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::EndDisabled();
+        if (ImGui::Button("Reset colour treatment")) {
+            const settings::Settings defaults;
+            graphics.agx_preview = defaults.agx_preview;
+            graphics.agx_exposure = defaults.agx_exposure;
+            graphics.agx_brightness = defaults.agx_brightness;
+            changed = true;
+        }
+        changed |= motion_blur_controls(graphics);
+    }
+    if (ImGui::CollapsingHeader("Materials & water")) {
+        if (ImGui::Button("Material inspector")) {
+            s.material_settings = true;
+        }
+        ImGui::TextDisabled(
+            "Shared JSON materials: foliage, emission, reflections, fur and wetness."
+        );
+        if (ImGui::TreeNode("Ratchet fur geometry")) {
+            fur_shell_controls();
+            ImGui::TreePop();
+        }
+        if (enhanced::ocean_replaces_horizon() && ImGui::TreeNode("Ocean")) {
+            auto options = enhanced::water_debug_settings();
+            ImGui::TextDisabled("Live session overrides of the level profile.");
+            ImGui::PushItemWidth(dp(170.f));
+            bool changed = checkbox("Baked coastal response", &options.coastal_correction);
+            changed |= slider_float(
+                "Chop strength", &options.ocean_chop, 0, 4, "%.2fx", ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Fine ripple strength",
+                &options.ocean_ripples,
+                0,
+                4,
+                "%.2fx",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Wind direction offset",
+                &options.ocean_wind_offset,
+                -180,
+                180,
+                "%.0f deg",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Near mesh radius",
+                &options.ocean_near_scale,
+                .5f,
+                2,
+                "%.2fx",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Horizon radius",
+                &options.ocean_horizon_scale,
+                .5f,
+                2,
+                "%.2fx",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            if (ImGui::Button("Reset ocean tuning")) {
+                const enhanced::WaterDebugSettings defaults;
+                options.coastal_correction = defaults.coastal_correction;
+                options.ocean_chop = defaults.ocean_chop;
+                options.ocean_ripples = defaults.ocean_ripples;
+                options.ocean_wind_offset = defaults.ocean_wind_offset;
+                options.ocean_near_scale = defaults.ocean_near_scale;
+                options.ocean_horizon_scale = defaults.ocean_horizon_scale;
+                changed = true;
+            }
+            if (changed) {
+                enhanced::set_water_debug_settings(options);
+            }
+            ImGui::SeparatorText("Ocean material");
+            ocean_material_controls();
+            ImGui::PopItemWidth();
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Water simulation")) {
+            water_controls();
+            ImGui::TreePop();
+        }
+    }
+    if (ImGui::CollapsingHeader("Diagnostics")) {
+        int rtx_view = static_cast<int>(enhanced::rtx_debug_view());
+        if (combo(
+                "RTX debug view",
+                &rtx_view,
+                "Off\0Shadows\0Ambient occlusion\0Reflections\0Bounce GI\0BVH heatmap\0"
+            )) {
+            enhanced::set_rtx_debug_view(static_cast<enhanced::RtxDebugView>(rtx_view));
+        }
+        if (rtx_view != 0) {
+            ImGui::TextDisabled(
+                "Isolates RTX channels or shows BVH traversal cost (blue = fast, red = dense)."
+            );
+        }
+        int fur_view = int(enhanced::fur_debug_view());
+        if (combo("Ratchet fur view", &fur_view, "Off\0Mask\0Direction\0Detail normals\0")) {
+            enhanced::set_fur_debug_view(static_cast<enhanced::FurDebug>(fur_view));
+        }
+        if (fur_view != 0) {
+            ImGui::TextDisabled(
+                "Green: fur. Direction: UV growth arrows. Normals: strand surface detail."
+            );
+            ImGui::TextDisabled("Original Ratchet atlas only. Material controls apply live.");
+        }
+        bool wetness_view = enhanced::wetness_debug_view();
+        if (checkbox("Ratchet wetness view (GPU)", &wetness_view)) {
+            enhanced::set_wetness_debug_view(wetness_view);
+        }
+        if (wetness_view) {
+            ImGui::TextDisabled("Blue: wet. Grey: dry. Session only; dries in 20 seconds.");
+        }
+        changed |= checkbox("Probe spheres", &graphics.probe_spheres);
+        changed |= checkbox("Ceiling area lights", &graphics.ceiling_area_lights);
+        changed |= checkbox("Medial axis", &graphics.medial_axis_debug);
+        if (graphics.medial_axis_debug) {
+            control_tip("Green: centre paths. Pink: junctions. White: component centres.");
+        }
+        changed |= checkbox("Environment probes", &graphics.environment_probe_debug);
+        if (graphics.environment_probe_debug) {
+            ImGui::TextDisabled("Mirror spheres: captured reflections. Cyan boxes: bounds.");
+            ImGui::TextDisabled("All loaded probes; hidden edges remain faintly visible.");
+        }
+        if (graphics.ceiling_area_lights) {
+            ImGui::TextDisabled("Source-coloured frames; cyan arrows point outward.");
+            ImGui::TextDisabled("Hidden edges are faintly visible through geometry.");
+        }
+        if (graphics.probe_spheres) {
+            ImGui::TextDisabled("Cyan: sparse   Green: dense");
+            ImGui::TextDisabled("Gold: relocated   Magenta: invalid");
+            ImGui::TextDisabled("Boxes at player: yellow dense, cyan sparse");
+        }
+        if (ImGui::TreeNode("Advanced##probe_bias")) {
+            changed |= slider_float(
+                "Probe normal bias",
+                &graphics.probe_normal_bias,
+                0,
+                2,
+                "%.2f units",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            changed |= slider_float(
+                "Probe view bias",
+                &graphics.probe_view_bias,
+                0,
+                2,
+                "%.2f units",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            ImGui::TreePop();
+        }
+        if (ImGui::Button("Reset diagnostics")) {
+            const settings::Settings defaults;
+            graphics.probe_spheres = defaults.probe_spheres;
+            graphics.ceiling_area_lights = defaults.ceiling_area_lights;
+            graphics.medial_axis_debug = defaults.medial_axis_debug;
+            graphics.environment_probe_debug = defaults.environment_probe_debug;
+            graphics.probe_normal_bias = defaults.probe_normal_bias;
+            graphics.probe_view_bias = defaults.probe_view_bias;
+            enhanced::set_wetness_debug_view(false);
+            enhanced::set_fur_debug_view(enhanced::FurDebug::Off);
+            enhanced::set_rtx_debug_view(enhanced::RtxDebugView::Off);
+            changed = true;
+        }
+    }
+    if (ImGui::CollapsingHeader("Experimental")) {
+        ImGui::TextDisabled("Work in progress. Disabled by default.");
+        if (ImGui::TreeNode("Atmosphere and fog")) {
+            ImGui::TextDisabled("Quality is saved; other controls are session only.");
+            auto atmosphere = enhanced::atmosphere_settings();
+            int quality = static_cast<int>(graphics.volumetric_quality);
+            if (combo("Volumetrics", &quality, "Off\0Low\0Medium\0High\0")) {
+                graphics.volumetric_quality = static_cast<renderer::VolumetricQuality>(quality);
+                changed = true;
+            }
+            control_tip(
+                "Higher quality uses a denser volume grid. Fog thickness stays the same. "
+                "Shared haze and fog affect surfaces, water and particles; authored skies stay "
+                "intact."
+            );
+            ImGui::BeginDisabled(graphics.volumetric_quality == renderer::VolumetricQuality::Off);
+            bool edited = false;
+            edited |= slider_float("Authored haze", &atmosphere.haze, 0, 4);
+            edited |= slider_float("Fog range", &atmosphere.distance, 10, 2000, "%.0f units");
+            edited |=
+                slider_float("Height fog density", &atmosphere.height_density, 0, .1f, "%.4f");
+            edited |=
+                slider_float("Fog base height", &atmosphere.base_height, -100, 200, "%.1f units");
+            edited |= slider_float("Height falloff", &atmosphere.height_falloff, 0, 1, "%.3f");
+            edited |= slider_float("Scattered sunlight", &atmosphere.sun_strength, 0, 1);
+            edited |= slider_float("Jitter size", &atmosphere.jitter_size, 0, 1);
+            control_tip("0 centres sun-shadow samples. 1 spreads them across the full froxel.");
+            edited |= slider_float("Scattering directionality", &atmosphere.anisotropy, -.8f, .8f);
+            if (ImGui::TreeNode("Local fog volumes")) {
+                for (std::size_t i = 0; i < atmosphere.volumes.size(); ++i) {
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::TreeNode("volume", "Volume %d", static_cast<int>(i + 1))) {
+                        auto& volume = atmosphere.volumes[i];
+                        edited |= input_float3("Centre", volume.centre_radius.data());
+                        edited |= slider_float("Radius", &volume.centre_radius[3], .1f, 100);
+                        edited |= colour_edit("Fog colour", volume.colour_density.data());
+                        edited |=
+                            slider_float("Density", &volume.colour_density[3], 0, .1f, "%.4f");
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
+            }
+            ImGui::EndDisabled();
+            if (ImGui::Button("Reset atmosphere")) {
+                atmosphere = enhanced::AtmosphereSettings{};
+                graphics.volumetric_quality = settings::Settings{}.volumetric_quality;
+                changed = true;
+                edited = true;
+            }
+            if (edited) {
+                enhanced::set_atmosphere_settings(atmosphere);
+            }
+            ImGui::TreePop();
+        }
+    }
+    if (ImGui::CollapsingHeader("Misc")) {
+        changed |= slider_float(
+            "Lily momentum", &graphics.lily_momentum, 0, 1, "%.2f s", ImGuiSliderFlags_AlwaysClamp
+        );
+        control_tip(
+            "Higher values make lilies ease more slowly toward the waves. Zero follows waves "
+            "immediately. Requires enhanced water."
+        );
+        if (ImGui::Button("Reset lily momentum")) {
+            graphics.lily_momentum = settings::Settings{}.lily_momentum;
+            changed = true;
+        }
+    }
+    ImGui::PopItemWidth();
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (changed) {
+        settings::save();
+        s.settings_changed = true;
+    }
+    ImGui::End();
+}
+
+}  // namespace openrac::frontend::debug_overlay

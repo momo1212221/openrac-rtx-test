@@ -1,0 +1,147 @@
+//! The TypeScript types of everything the Tauri commands send to or take from the page, generated
+//! from the Rust types with ts-rs (docs: launcher/docs/ARCHITECTURE.md, "The page's types").
+//!
+//! The generated files are committed, in `launcher/src/lib/generated/`, because the page is
+//! checked and built (`yarn verify`, `yarn build`) without a Rust toolchain. This test is the
+//! check that they are fresh: it generates the types into a temporary folder and fails when
+//! the committed files differ, extra or missing files included. After changing a type that is
+//! sent to the page, regenerate with
+//!
+//! ```text
+//! OPENRAC_UPDATE_TYPES=1 cargo test -p openrac-launcher-core --test generated_types
+//! ```
+//!
+//! and commit the result. Never edit a generated file by hand.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use openrac_launcher_core::{
+    actions, config, controls, deeplink, detect, differences, disc_choice, discs, editor_state, enhanced, index,
+    index_apply, jobs, library, mod_error, mod_tools, mod_updates, modset, overrides, pcsx2_card, plugins, profile,
+    remote, reports, reset, resolver, save_edit, save_edit_rac2, save_edit_rac2_extra, save_transfer, saves, steam,
+    texture_packs, update,
+};
+use ts_rs::{Config, TS};
+
+/// Every type a command returns or takes, or an event carries; the types they contain are
+/// generated with them. Add a type here when a command starts sending it to the page.
+fn export_all(cfg: &Config) {
+    macro_rules! roots {
+        ($($ty:ty),* $(,)?) => { $( <$ty as TS>::export_all(cfg).unwrap(); )* };
+    }
+    roots!(
+        actions::Scope,
+        config::Config,
+        controls::ControlsView,
+        controls::Scope,
+        deeplink::Install,
+        deeplink::WantedMod,
+        steam::State,
+        detect::Tool,
+        detect::Detected,
+        detect::Check,
+        differences::Differences,
+        disc_choice::DiscChoice,
+        discs::FoundDisc,
+        enhanced::EnhancedView,
+        index::IndexView,
+        index::RevokedOff,
+        index_apply::ApplyProgress,
+        index_apply::ApplyResult,
+        jobs::Event,
+        jobs::Started,
+        library::Library,
+        mod_error::ModError,
+        mod_tools::ToolFile,
+        mod_tools::ToolRoot,
+        mod_updates::LastUpdate,
+        mod_updates::Orphan,
+        mod_updates::UpdatePlan,
+        mod_updates::UpdateRun,
+        modset::Applied,
+        modset::Choices,
+        modset::Review,
+        modset::SharePreview,
+        modset::Shared,
+        overrides::PackView,
+        openrac_launcher_core::mod_summary::ModLoadSummary,
+        pcsx2_card::ImportedSaves,
+        save_transfer::ExportedSaves,
+        save_transfer::SaveImportChoice,
+        save_transfer::SaveImportPreview,
+        save_transfer::SaveArchiveManifest,
+        plugins::Installed,
+        plugins::PluginView,
+        plugins::Status,
+        profile::View,
+        remote::Preview,
+        remote::RemoteInstalled,
+        remote::Sources,
+        remote::Update,
+        reports::ReportEntry,
+        reset::Reset,
+        resolver::InstallPlan,
+        resolver::InstalledMod,
+        editor_state::EditorState,
+        reset::ResetDone,
+        reset::ResetPreview,
+        save_edit::SaveChange,
+        save_edit::WriteResult,
+        save_edit_rac2::Rac2SaveFields,
+        save_edit_rac2::Rac2WriteResult,
+        save_edit_rac2_extra::Rac2ExtraFields,
+        save_edit_rac2_extra::Rac2ExtraWriteResult,
+        saves::GameSaveStatus,
+        texture_packs::Exported,
+        texture_packs::ImportMode,
+        texture_packs::Imported,
+        texture_packs::Preview,
+        texture_packs::View,
+        update::Channel,
+        update::Release,
+        update::UpdateSource,
+    );
+}
+
+fn committed_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/generated")
+}
+
+/// The `.ts` files under `dir` by file name, with line endings as git may have checked them out.
+fn read_all(dir: &Path) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return files };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "ts") {
+            let text = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+            files.insert(path.file_name().unwrap().to_string_lossy().into_owned(), text);
+        }
+    }
+    files
+}
+
+#[test]
+fn generated_types_are_fresh() {
+    // The page reads whole numbers as numbers: no id, size or time here goes past 2^53.
+    let base = Config::new().with_large_int("number");
+    let committed = committed_dir();
+    if std::env::var_os("OPENRAC_UPDATE_TYPES").is_some() {
+        let _ = std::fs::remove_dir_all(&committed);
+        std::fs::create_dir_all(&committed).unwrap();
+        export_all(&base.with_out_dir(&committed));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    export_all(&base.with_out_dir(temp.path()));
+    let fresh = read_all(temp.path());
+    let have = read_all(&committed);
+    let stale: Vec<&String> = fresh.keys().filter(|name| have.get(*name) != fresh.get(*name)).collect();
+    let extra: Vec<&String> = have.keys().filter(|name| !fresh.contains_key(*name)).collect();
+    assert!(
+        stale.is_empty() && extra.is_empty(),
+        "launcher/src/lib/generated is out of date (changed or missing: {stale:?}; no longer generated: {extra:?}). \
+         Regenerate: OPENRAC_UPDATE_TYPES=1 cargo test -p openrac-launcher-core --test generated_types"
+    );
+}

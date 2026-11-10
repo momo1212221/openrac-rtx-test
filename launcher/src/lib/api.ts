@@ -1,0 +1,898 @@
+// Typed wrappers around the Rust commands (src-tauri/src/lib.rs, whose data
+// types live in ../core). In a plain browser (`yarn dev` without Tauri)
+// every call goes to mock.ts instead, so the UI can be worked on and
+// screenshotted without the desktop app, a disc or a toolchain.
+//
+// Adding a command: the Rust function, its name in generate_handler!, a
+// wrapper and its types here, and a case in mock.ts (docs/ARCHITECTURE.md).
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
+import { confirm as tauriConfirm, open as tauriOpen } from "@tauri-apps/plugin-dialog";
+import { onIOS, iosInvoke, iosListen, iosOpen, iosConfirm } from "./ios";
+const invoke: typeof tauriInvoke = onIOS ? iosInvoke : tauriInvoke;
+const listen: typeof tauriListen = onIOS ? (iosListen as typeof tauriListen) : tauriListen;
+const open: typeof tauriOpen = onIOS ? (iosOpen as typeof tauriOpen) : tauriOpen;
+const confirm: typeof tauriConfirm = onIOS ? iosConfirm : tauriConfirm;
+import { REPO_URL } from "./links";
+import type { BackgroundStatus } from "./progress";
+import type { ActionArea } from "./generated/ActionArea";
+import type { ActionKind } from "./generated/ActionKind";
+import type { ActionState } from "./generated/ActionState";
+import type { ActionView } from "./generated/ActionView";
+import type { AndroidRelease } from "./generated/AndroidRelease";
+import type { BakeStatus } from "./generated/BakeStatus";
+import type { Candidate } from "./generated/Candidate";
+import type { Check } from "./generated/Check";
+import type { Config } from "./generated/Config";
+import type { ControlsScope } from "./generated/ControlsScope";
+import type { ControlsView } from "./generated/ControlsView";
+import type { Detected } from "./generated/Detected";
+import type { DifferenceKind } from "./generated/DifferenceKind";
+import type { DifferenceView } from "./generated/DifferenceView";
+import type { Differences } from "./generated/Differences";
+import type { DiscChoice } from "./generated/DiscChoice";
+import type { DiscState } from "./generated/DiscState";
+import type { EnhancedView } from "./generated/EnhancedView";
+import type { ToolRoot } from "./generated/ToolRoot";
+import type { ToolFile } from "./generated/ToolFile";
+import type { FoundDisc } from "./generated/FoundDisc";
+import type { Applied } from "./generated/Applied";
+import type { Choices } from "./generated/Choices";
+import type { ModProfile } from "./generated/ModProfile";
+import type { Review } from "./generated/Review";
+import type { ReviewMod } from "./generated/ReviewMod";
+import type { ShareMod } from "./generated/ShareMod";
+import type { SharePreview } from "./generated/SharePreview";
+import type { Shared } from "./generated/Shared";
+import type { GameSaveStatus } from "./generated/GameSaveStatus";
+import type { GameView } from "./generated/GameView";
+import type { ImportedSaves } from "./generated/ImportedSaves";
+import type { JobEvent } from "./generated/JobEvent";
+import type { Library } from "./generated/Library";
+import type { ModSources } from "./generated/ModSources";
+import type { ModLoadSummary } from "./generated/ModLoadSummary";
+import type { ModUpdate } from "./generated/ModUpdate";
+import type { Nanotech } from "./generated/Nanotech";
+import type { PackView } from "./generated/PackView";
+import type { Platform } from "./generated/Platform";
+import type { PluginInstalled } from "./generated/PluginInstalled";
+import type { PluginPreset } from "./generated/PluginPreset";
+import type { PluginSetting } from "./generated/PluginSetting";
+import type { PluginStatus } from "./generated/PluginStatus";
+import type { PluginView } from "./generated/PluginView";
+import type { RawPatch } from "./generated/RawPatch";
+import type { RemoteInstalled } from "./generated/RemoteInstalled";
+import type { RemoteMod } from "./generated/RemoteMod";
+import type { RemotePreview } from "./generated/RemotePreview";
+import type { ReportEntry } from "./generated/ReportEntry";
+import type { EditorState } from "./generated/EditorState";
+import type { ExportedSaves } from "./generated/ExportedSaves";
+import type { Carried } from "./generated/Carried";
+import type { OutdatedReason } from "./generated/OutdatedReason";
+import type { ResetDone } from "./generated/ResetDone";
+import type { ResetKind } from "./generated/ResetKind";
+import type { ResetPart } from "./generated/ResetPart";
+import type { ResetPartView } from "./generated/ResetPartView";
+import type { ResetPreview } from "./generated/ResetPreview";
+import type { SaveBackupInfo } from "./generated/SaveBackupInfo";
+import type { SaveMod } from "./generated/SaveMod";
+import type { SaveChange } from "./generated/SaveChange";
+import type { SaveFields } from "./generated/SaveFields";
+import type { SaveArchiveSlot } from "./generated/SaveArchiveSlot";
+import type { SaveImportChoice } from "./generated/SaveImportChoice";
+import type { SaveImportPreview } from "./generated/SaveImportPreview";
+import type { SaveImportSlot } from "./generated/SaveImportSlot";
+import type { SaveSlotInfo } from "./generated/SaveSlotInfo";
+import type { SaveView } from "./generated/SaveView";
+import type { Rac2SaveFields } from "./generated/Rac2SaveFields";
+import type { Rac2SaveView } from "./generated/Rac2SaveView";
+import type { Rac2WriteResult } from "./generated/Rac2WriteResult";
+import type { Rac2ExtraFields } from "./generated/Rac2ExtraFields";
+import type { Rac2ExtraView } from "./generated/Rac2ExtraView";
+import type { Rac2ExtraWriteResult } from "./generated/Rac2ExtraWriteResult";
+import type { Scope } from "./generated/Scope";
+import type { Started } from "./generated/Started";
+import type { TextureFolder } from "./generated/TextureFolder";
+import type { TexturePackImportMode } from "./generated/TexturePackImportMode";
+import type { TexturePackPreview } from "./generated/TexturePackPreview";
+import type { TexturePackView } from "./generated/TexturePackView";
+import type { ExportedTexturePack } from "./generated/ExportedTexturePack";
+import type { ImportedTexturePack } from "./generated/ImportedTexturePack";
+import type { Tool } from "./generated/Tool";
+import type { UpdateChannel } from "./generated/UpdateChannel";
+import type { UpdateSource } from "./generated/UpdateSource";
+import type { VersionView } from "./generated/VersionView";
+import type { WriteResult } from "./generated/WriteResult";
+import type { ApplyProgress } from "./generated/ApplyProgress";
+import type { ApplyResult } from "./generated/ApplyResult";
+import type { DeepLinkInstall } from "./generated/DeepLinkInstall";
+import type { SteamState } from "./generated/SteamState";
+import type { IndexImage } from "./generated/IndexImage";
+import type { IndexMod } from "./generated/IndexMod";
+import type { IndexVersion } from "./generated/IndexVersion";
+import type { IndexView } from "./generated/IndexView";
+import type { InstallPlan } from "./generated/InstallPlan";
+import type { ModAction } from "./generated/ModAction";
+import type { ModError } from "./generated/ModError";
+import type { ModIndex } from "./generated/ModIndex";
+import type { PlanNote } from "./generated/PlanNote";
+import type { PlannedMod } from "./generated/PlannedMod";
+import type { WantedMod } from "./generated/WantedMod";
+import type { Why } from "./generated/Why";
+import type { Hold } from "./generated/Hold";
+import type { LastUpdate } from "./generated/LastUpdate";
+import type { Orphan } from "./generated/Orphan";
+import type { UpdateItem } from "./generated/UpdateItem";
+import type { UpdatePlan } from "./generated/UpdatePlan";
+import type { UpdateRun } from "./generated/UpdateRun";
+
+export const inTauri = onIOS || (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window);
+
+/** Whether a user agent is Android's WebView. WebKitGTK on a Linux tablet or handheld (a mobile
+ *  chassis) says "Linux; like Android 4.4" to get websites' mobile pages: that is a desktop. */
+export function androidUserAgent(ua: string): boolean {
+  return /\bandroid\b/i.test(ua) && !/\blike android\b/i.test(ua);
+}
+
+/** The Android launcher (docs/port/ANDROID.md): files come from the system's picker, which gives
+ *  no folders and no paths, and the GPU driver packages are its own. `?android` in the browser
+ *  preview shows its pages. */
+export const onAndroid =
+  typeof navigator !== "undefined" &&
+  (inTauri
+    ? androidUserAgent(navigator.userAgent)
+    : typeof location !== "undefined" && new URLSearchParams(location.search).has("android"));
+
+export type { TextureFolder, TexturePackImportMode, TexturePackPreview, TexturePackView };
+export type { ExportedTexturePack, ImportedTexturePack };
+export type { ToolFile, ToolRoot };
+export type { ActionArea };
+export type { ActionKind };
+export type { ActionState };
+export type { ActionView };
+export type { AndroidRelease };
+export type { BakeStatus };
+export type { Candidate };
+export type { Check };
+export type { Config };
+export type { ControlsScope };
+export type { ControlsView };
+export type { Detected };
+export type { DifferenceKind };
+export type { DifferenceView };
+export type { Differences };
+export type { DiscChoice };
+export type { DiscState };
+export type { EnhancedView };
+export type { FoundDisc };
+export type { Applied, Choices, ModProfile, Review, ReviewMod, ShareMod, SharePreview, Shared };
+export type { GameSaveStatus };
+export type { GameView };
+export type { JobEvent };
+export type { Library };
+export type { ModSources };
+export type { ModUpdate };
+export type { Nanotech };
+export type { PackView };
+export type { ResetDone, ResetKind, ResetPart, ResetPartView, ResetPreview };
+export type { Carried, EditorState, OutdatedReason };
+export type { PluginPreset };
+export type { PluginSetting };
+export type { PluginView };
+export type { RawPatch };
+export type { RemoteMod };
+export type { RemotePreview };
+export type { ReportEntry };
+export type { SaveBackupInfo };
+export type { SaveMod };
+export type { SaveChange };
+export type { SaveFields };
+export type { SaveView };
+export type {
+  ExportedSaves,
+  ImportedSaves,
+  SaveArchiveSlot,
+  SaveImportChoice,
+  SaveImportPreview,
+  SaveImportSlot,
+  SaveSlotInfo,
+};
+export type { Rac2SaveFields, Rac2SaveView, Rac2WriteResult };
+export type { Rac2ExtraFields, Rac2ExtraView, Rac2ExtraWriteResult };
+export type { Scope };
+export type { Started };
+export type { UpdateChannel };
+export type { UpdateSource };
+export type { VersionView };
+export type { ApplyProgress, ApplyResult, DeepLinkInstall, IndexImage, IndexMod, IndexVersion, IndexView };
+export type { SteamState };
+export type { InstallPlan, ModAction, ModError, ModIndex, PlanNote, PlannedMod, WantedMod, Why };
+export type { Hold, LastUpdate, Orphan, UpdateItem, UpdatePlan, UpdateRun };
+
+// ---- types ------------------------------------------------------------------------
+//
+// The types of what the Tauri commands send and take are generated from the Rust types in core/src
+// (ts-rs, `cargo test -p openrac-launcher-core --test generated_types`; docs/ARCHITECTURE.md, "The
+// page's types") and live in ./generated/, never edited by hand. They are re-exported from here
+// so the rest of the page imports every type from "./api". What is written out below is what the
+// generator does not reach: the types of src-tauri's own commands, and what the page sends.
+
+/** What the app says about itself (src-tauri/src/lib.rs, AppInfo). */
+export interface AppInfo {
+  capabilities?: Partial<Record<import("./capabilities").Capability, boolean>>;
+  version: string;
+  platform: Platform;
+  /** Where launcher.json lives. */
+  configFile: string | null;
+  /** The launcher works on the copy of OpenRAC it carries: only what a player does is offered. */
+  standalone: boolean;
+  /** Where its updates come from: the repository that built it, set by the build. */
+  updates: UpdateSource;
+  /** That repository's two channels, which the player chooses between (Config.updateChannel). */
+  updateChannels: Record<UpdateChannel, UpdateSource>;
+  /** WebKitGTK draws without its accelerated compositing mode (a Steam Deck): no page slides. */
+  noCompositing: boolean;
+  /** The last start's window crashed before it drew a click, and Safe rendering was turned on. */
+  safeRenderingAfterCrash: boolean;
+}
+
+/** The games folder looked through (scan_discs, src-tauri/src/lib.rs). */
+export interface DiscScan {
+  found: FoundDisc[];
+  /** Only with developer tools on: the games whose disc can be switched. */
+  choices: DiscChoice[];
+}
+
+/** What the page tells Discord it is doing (core/src/discord.rs, DiscordStatus, whose fields
+ *  are read in this camelCase since `rename_all_fields`; its test holds the two together).
+ *  Written by hand, not generated yet: generating it is a follow-up in PROGRESS.md. */
+export type DiscordStatus =
+  | { kind: "idle" }
+  | {
+      kind: "viewingGame";
+      title: string;
+      region: string;
+      progressPct: number | null;
+      gameId: string;
+    }
+  | {
+      kind: "playingGame";
+      title: string;
+      region: string;
+      gameId: string;
+      startTime?: number | null;
+    }
+  | {
+      /** A long job for a game: set-up, build, the editor's preparation. */
+      kind: "working";
+      task: string;
+      title: string;
+      gameId: string;
+      startTime?: number | null;
+    };
+
+/** What a run gives an action besides its name: `{level}`, `{path}`, `{option}`. */
+export interface RunInputs {
+  level?: number;
+  path?: string;
+  option?: string;
+}
+
+/** What a gameplay mod is: code the game loads (a library), Luau scripts the game runs sandboxed,
+ *  or data only (docs/port/MODS.md, section 11). */
+export type ModKind = PluginView["kind"];
+
+// ---- calls ------------------------------------------------------------------------
+
+async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (inTauri) return invoke<T>(command, args);
+  // Loaded only in a browser, so the desktop build never carries the mock.
+  const { mockCall } = await import("./mock");
+  return mockCall(command, args) as Promise<T>;
+}
+
+/** A command whose body is raw bytes (a file a mod's page saves), with what describes them in headers. */
+async function callRaw<T>(command: string, body: Uint8Array, headers: Record<string, string>): Promise<T> {
+  if (inTauri) return invoke<T>(command, body, { headers });
+  const { mockCall } = await import("./mock");
+  return mockCall(command, { headers, size: body.byteLength }) as Promise<T>;
+}
+
+export const api = {
+  appInfo: () => call<AppInfo>("app_info"),
+  getConfig: () => call<Config>("get_config"),
+  saveConfig: (config: Config) => call<Config>("save_config", { config }),
+  detect: () => call<Detected>("detect"),
+  checkRoot: (path: string) => call<Check>("check_root", { path }),
+  checkTool: (tool: Tool, path: string) => call<Check>("check_tool", { tool, path }),
+  /** Takes a Godot that works when none is set or the one set is gone; the config as it is then. */
+  adoptGodot: () => call<Config>("adopt_godot"),
+  library: () => call<Library>("library"),
+  /** `inputs`: which level a per-level action is for (the level editor's projects, one each), a
+   *  file or folder the player chose (`{path}`), one of the action's options (`{option}`). */
+  runAction: (scope: Scope, id: string, inputs: RunInputs = {}) =>
+    call<Started>("run_action", {
+      scope,
+      id,
+      level: inputs.level ?? null,
+      path: inputs.path ?? null,
+      option: inputs.option ?? null,
+    }),
+  cancelJob: (id: number) => call<null>("cancel_job", { id }),
+  /** A file or folder in the checkout, relative to it (`games/rac1/decomp/README.md`). Android opens no
+   *  app's own files: a document there is read on GitHub, and a folder cannot be shown. */
+  openPath: (path: string) =>
+    onAndroid
+      ? /^[\w./-]+\.\w+$/.test(path) && !path.startsWith("/") && !path.includes("..")
+        ? call<null>("open_url", { url: `${REPO_URL}/blob/master/${path}` })
+        : Promise.reject(new Error("Android cannot show the launcher's own folders."))
+      : call<null>("open_path", { path }),
+  openUrl: (url: string) => call<null>("open_url", { url }),
+  /** Sets a game up from the image of the player's disc: the extractor, as a job. */
+  installGame: (game: string, image: string) => call<Started>("install_game", { game, image }),
+  /** The plain image a set-up reads: an .iso as it is, a .chd unpacked once (`disc-copy` events). */
+  prepareDisc: (image: string) => call<string>("prepare_disc", { image }),
+  /** Removes what setting a game up made (not the disc image, not the saves). */
+  uninstallGame: (game: string) => call<null>("uninstall_game", { game }),
+  /** The games OpenRAC knows among the images in the games folder, and a developer's disc choices. */
+  scanDiscs: () => call<DiscScan>("scan_discs"),
+  /** Developers only: plays this version's disc of its game; the other's set-up is kept aside. */
+  chooseDisc: (version: string) => call<Config>("choose_disc", { version }),
+  syncProgressFromWeb: () => call<Library>("sync_progress_from_web"),
+  applyProgressJson: (json: string) => call<Library>("apply_progress_json", { json }),
+  setDiscordStatus: (status: DiscordStatus) => call<null>("set_discord_status", { status }),
+  inspectSaves: (serial: string) => call<GameSaveStatus>("inspect_saves", { serial }),
+  backupSaves: (serial: string, note?: string) => call<SaveBackupInfo>("backup_saves", { serial, note }),
+  restoreBackup: (serial: string, backupName: string) => call<null>("restore_backup", { serial, backupName }),
+  /** The game's saves copied in from a PCSX2 memory card (a card file, or a folder card's
+   *  _pcsx2_superblock), after a backup of the card. */
+  importPcsx2Saves: (serial: string, source: string) => call<ImportedSaves>("import_pcsx2_saves", { serial, source }),
+  /** Where PCSX2 keeps its memory cards, when found. */
+  pcsx2MemcardsDir: () => call<string | null>("pcsx2_memcards_dir"),
+  /** The game's saves (all, or one slot) exported to an OpenRAC saves file (.zip) where the player
+   *  chooses, in the system's save dialog; `saved` is empty when they backed out. */
+  exportSaves: (serial: string, slot: number | null) => call<ExportedSaves>("export_saves", { serial, slot }),
+  /** What an OpenRAC saves file holds; refused for another game's file or a damaged one. */
+  previewSaveImport: (serial: string, source: string) =>
+    call<SaveImportPreview>("preview_save_import", { serial, source }),
+  /** The saves file onto the game's card, after a backup: all of it, or the chosen slots merged. */
+  importSaves: (serial: string, source: string, choice: SaveImportChoice) =>
+    call<ImportedSaves>("import_saves", { serial, source, choice }),
+  openSavesFolder: (serial: string) => call<null>("open_saves_folder", { serial }),
+  /** Android: OpenRAC's place in the system's Files app (the saves, settings, games, discs). */
+  showFiles: () => call<null>("show_files"),
+  /** A game's session logs and crash reports, the newest first. */
+  reportsList: (game: string) => call<ReportEntry[]>("reports_list", { game }),
+  /** The newest crash report written since `since` (seconds since 1970). */
+  latestCrash: (game: string, since: number) => call<ReportEntry | null>("latest_crash", { game, since }),
+  /** The short text to paste in an issue or on Discord (home folder as ~). */
+  reportText: (game: string, file: string) => call<string>("report_text", { game, file }),
+  /** Saves the report's .zip in Downloads and shows it; returns where (home folder as ~). */
+  reportSave: (game: string, file: string) => call<string>("report_save", { game, file }),
+  /** Deletes one log or crash report from the game's data folder (core refuses any other file). */
+  reportDelete: (game: string, file: string) => call<null>("report_delete", { game, file }),
+  /** What the port does otherwise than the PS2 game, for one version (`rac1`, `pal`). */
+  differences: (game: string, version: string) => call<Differences>("differences", { game, version }),
+  // The controls files (core/src/controls.rs); no page shows them yet.
+  controlsView: (game: string | null, player: number | null = null) =>
+    call<ControlsView>("controls_view", { game, player }),
+  controlsSet: (scope: ControlsScope, key: string, value: string | null) =>
+    call<ControlsView>("controls_set", { scope, key, value }),
+  controlsReset: (scope: ControlsScope) => call<ControlsView>("controls_reset", { scope }),
+  controlsResetPlayers: () => call<ControlsView>("controls_reset_players"),
+  controlsResetPlayer: (scope: ControlsScope, player: number) =>
+    call<ControlsView>("controls_reset_player", { scope, player }),
+  controlsExport: (scope: ControlsScope, path: string) => call<null>("controls_export", { scope, path }),
+  controlsImport: (scope: ControlsScope, path: string) => call<ControlsView>("controls_import", { scope, path }),
+  controlsCopy: (from: string, to: string) => call<ControlsView>("controls_copy", { from, to }),
+  /** Switches a game fix on (the port's) or off (as the original plays) in the version's settings. */
+  setGameFix: (game: string, version: string, id: string, on: boolean) =>
+    call<Differences>("set_game_fix", { game, version, id, on }),
+  /** Deletes every log and crash report of the game; returns how many files went. */
+  reportsDeleteAll: (game: string) => call<number>("reports_delete_all", { game }),
+  /** Opens the folder of a game's logs, or of its crash reports. */
+  openReportsFolder: (game: string, crashes: boolean) => call<null>("open_reports_folder", { game, crashes }),
+  /** One slot for the save editor. */
+  readSave: (serial: string, slot: number) => call<SaveView>("read_save", { serial, slot }),
+  /** Writes the editor's change: refused while the game runs with the card; backs the card up first. */
+  writeSave: (serial: string, slot: number, fingerprint: string, change: SaveChange) =>
+    call<WriteResult>("write_save", { serial, slot, fingerprint, change }),
+  /** One Going Commando slot for its save editor (core/src/save_edit_rac2.rs). */
+  readSaveRac2: (serial: string, slot: number) => call<Rac2SaveView>("read_save_rac2", { serial, slot }),
+  /** Writes the Going Commando editor's fields, with write_save's guards and backup. */
+  writeSaveRac2: (serial: string, slot: number, fingerprint: string, fields: Rac2SaveFields) =>
+    call<Rac2WriteResult>("write_save_rac2", { serial, slot, fingerprint, fields }),
+  /** A Going Commando slot's advanced fields (core/src/save_edit_rac2_extra.rs). */
+  readSaveRac2Extra: (serial: string, slot: number) => call<Rac2ExtraView>("read_save_rac2_extra", { serial, slot }),
+  /** Writes them: refused while the game runs with the card or if the file changed; backed up first. */
+  writeSaveRac2Extra: (serial: string, slot: number, fingerprint: string, fields: Rac2ExtraFields) =>
+    call<Rac2ExtraWriteResult>("write_save_rac2_extra", { serial, slot, fingerprint, fields }),
+  /** A game's overrides packs (core/src/overrides.rs), in the order they apply. */
+  overridesList: (game: string) => call<PackView[]>("overrides_list", { game }),
+  overridesSummary: (version: string) => call<ModLoadSummary>("overrides_summary", { version }),
+  overridesSetEnabled: (game: string, id: string, enabled: boolean) =>
+    call<PackView[]>("overrides_set_enabled", { game, id, enabled }),
+  overridesMove: (game: string, id: string, up: boolean) => call<PackView[]>("overrides_move", { game, id, up }),
+  overridesRemove: (game: string, id: string) => call<PackView[]>("overrides_remove", { game, id }),
+  /** What starting the level editor over would delete for `version` ("rac1/pal"), with sizes (core reset.rs). */
+  resetPreview: (version: string, reset: ResetKind) => call<ResetPreview>("reset_preview", { version, reset }),
+  /** Where the player is with `version`'s level editor (core editor_state.rs): outdated projects,
+   *  edits not packed, the last update's notes, the backups. */
+  editorState: (version: string) => call<EditorState>("editor_state", { version }),
+  /** Deletes it; the player's own edits and packs only `withEdits`. Refused while a job runs. */
+  resetApply: (version: string, reset: ResetKind, withEdits: boolean) =>
+    call<ResetDone>("reset_apply", { version, reset, withEdits }),
+  /** A game's native mods (core/src/plugins.rs) for its disc `version` ("pal"), in load order. */
+  pluginsList: (game: string, version: string) => call<PluginView[]>("plugins_list", { game, version }),
+  /** Whether a mod that is on in one of `games` uses the Multiplayer name (core plugins.rs). */
+  playerNameUsed: (games: string[]) => call<boolean>("player_name_used", { games }),
+  pluginsSetEnabled: (game: string, version: string, id: string, enabled: boolean) =>
+    call<PluginView[]>("plugins_set_enabled", { game, version, id, enabled }),
+  pluginsMove: (game: string, version: string, id: string, up: boolean) =>
+    call<PluginView[]>("plugins_move", { game, version, id, up }),
+  pluginsSetSetting: (game: string, version: string, id: string, key: string, value: unknown) =>
+    call<PluginView[]>("plugins_set_setting", { game, version, id, key, value }),
+  /** The built-in Enhanced graphics entry of a version (core/src/enhanced.rs); null where it has none. */
+  /** A version's texture pack and the textures the game saved (core texture_packs.rs). */
+  texturePacks: (game: string, version: string) => call<TexturePackView>("texture_packs_view", { game, version }),
+  /** Switches the pack on or off, or saving the textures at the next Play. */
+  texturePacksSet: (game: string, version: string, change: { enabled?: boolean; dumping?: boolean }) =>
+    call<TexturePackView>("texture_packs_set", {
+      game,
+      version,
+      enabled: change.enabled ?? null,
+      dumping: change.dumping ?? null,
+    }),
+  /** Opens a folder of the pack, or of the saved textures (`dump`); `folder` "" is the whole one. */
+  texturePacksOpen: (game: string, version: string, dump: boolean, folder = "") =>
+    call<null>("texture_packs_open", { game, version, dump, folder }),
+  texturePacksPreview: (game: string, version: string, source: string) =>
+    call<TexturePackPreview>("texture_packs_preview", { game, version, source }),
+  texturePacksImport: (game: string, version: string, source: string, mode: TexturePackImportMode) =>
+    call<ImportedTexturePack>("texture_packs_import", { game, version, source, mode }),
+  /** Saves the pack as a .zip where the player chooses; `saved` is empty when they backed out. */
+  texturePacksExport: (game: string, version: string) =>
+    call<ExportedTexturePack>("texture_packs_export", { game, version }),
+  // A mod's own page (core/src/mod_tools.rs, src-tauri/src/mod_tool.rs, lib/modTool.ts).
+  modToolList: (game: string, version: string, root: ToolRoot) =>
+    call<ToolFile[]>("mod_tool_list", { game, version, root }),
+  modToolRead: (game: string, version: string, root: ToolRoot, path: string, start?: number, length?: number) =>
+    call<ArrayBuffer>("mod_tool_read", { game, version, root, path, start: start ?? null, length: length ?? null }),
+  modToolStoreGet: (id: string, key: string) => call<unknown>("mod_tool_store_get", { id, key }),
+  modToolStoreSet: (id: string, key: string, value: unknown) => call<null>("mod_tool_store_set", { id, key, value }),
+  /** Saves a file the page made where the player chooses: the name it was saved under, or "" (backed out). */
+  modToolSave: (id: string, name: string, extension: string, bytes: Uint8Array) =>
+    callRaw<string>("mod_tool_save", bytes, {
+      "x-mod": encodeURIComponent(id),
+      "x-name": encodeURIComponent(name),
+      "x-extension": encodeURIComponent(extension),
+    }),
+  /** Starts saving a large file in parts: its number, 0 when the player backed out. */
+  modToolSaveStart: (id: string, name: string, extension: string) =>
+    call<number>("mod_tool_save_start", { id, name, extension }),
+  modToolSaveWrite: (token: number, bytes: Uint8Array) =>
+    callRaw<null>("mod_tool_save_write", bytes, { "x-token": String(token) }),
+  /** Ends it: kept (the name it was saved under) or dropped (""). */
+  modToolSaveEnd: (token: number, keep: boolean) => call<string>("mod_tool_save_end", { token, keep }),
+  /** A small file the player picks: its bytes, empty when they backed out. */
+  modToolOpen: (extension: string) => call<ArrayBuffer>("mod_tool_open", { extension }),
+  enhancedView: (game: string, version: string) => call<EnhancedView | null>("enhanced_view", { game, version }),
+  enhancedSetEnabled: (game: string, version: string, enabled: boolean) =>
+    call<EnhancedView | null>("enhanced_set_enabled", { game, version, enabled }),
+  enhancedSetSetting: (game: string, version: string, key: string, value: unknown) =>
+    call<EnhancedView | null>("enhanced_set_setting", { game, version, key, value }),
+  /** Deletes every lighting bake of a version; the entry as it is after. */
+  enhancedDeleteBakes: (game: string, version: string) =>
+    call<EnhancedView | null>("enhanced_delete_bakes", { game, version }),
+  pluginsRemove: (game: string, version: string, id: string) =>
+    call<PluginView[]>("plugins_remove", { game, version, id }),
+  pluginsInstall: (game: string, version: string, path: string) =>
+    call<PluginInstalled>("plugins_install", { game, version, path }),
+  /** The mods a chosen folder holds: itself, or each mod of a repository's checkout (its build first). */
+  pluginsModFolders: (path: string) => call<string[]>("plugins_mod_folders", { path }),
+  pluginsStatus: (game: string) => call<PluginStatus | null>("plugins_status", { game }),
+  /** Mods from a repository's address (core/src/remote.rs): what it holds, before anything is installed. */
+  pluginsPreview: (game: string, version: string, url: string) =>
+    call<RemotePreview>("plugins_preview", { game, version, url }),
+  pluginsInstallRemote: (game: string, version: string, url: string, id: string) =>
+    call<RemoteInstalled>("plugins_install_remote", { game, version, url, id }),
+  pluginsCheckUpdates: (game: string, version: string) =>
+    call<{ updates: ModUpdate[]; errors: string[] }>("plugins_check_updates", { game, version }),
+  pluginsUpdate: (game: string, version: string, id: string) =>
+    call<RemoteInstalled>("plugins_update", { game, version, id }),
+  pluginsSources: (game: string) => call<ModSources>("plugins_sources", { game }),
+  pluginsSetPin: (game: string, id: string, pin: boolean) => call<ModSources>("plugins_set_pin", { game, id, pin }),
+  /** Mod codes (core/src/modset.rs): what a code of this game's mods would hold, and making one. */
+  modsetSharePreview: (game: string) => call<SharePreview>("modset_share_preview", { game }),
+  modsetShare: (game: string, version: string, extras: string[]) =>
+    call<Shared>("modset_share", { game, version, extras }),
+  /** Names the party the game joins on starting (a mod code's link, after Apply). */
+  modsetJoin: (game: string, party: string) => call<null>("modset_join", { game, party }),
+  /** What a code would change, with nothing changed. `text`: a code, short or long, or its link. */
+  modsetReview: (game: string, version: string, text: string) => call<Review>("modset_review", { game, version, text }),
+  modsetApply: (game: string, version: string, set: string, code: string | null, choices: Choices) =>
+    call<Applied>("modset_apply", { game, version, set, code, choices }),
+  modsetProfiles: (game: string) => call<ModProfile[]>("modset_profiles", { game }),
+  modsetRestore: (game: string, id: string) => call<null>("modset_restore", { game, id }),
+  /** The link that opened the launcher, once. */
+  modsetTakeLink: () => call<string | null>("modset_take_link"),
+  /** The mod hub (core/src/index.rs, resolver.rs, index_apply.rs, deeplink.rs): their errors are
+   *  ModError (modErrorOf), with the fix the page offers. */
+  deeplinkParse: (url: string) => call<DeepLinkInstall>("deeplink_parse", { url }),
+  /** Where the launcher stands in the player's Steam library. */
+  steamState: (version: string | null = null) => call<SteamState>("steam_state", { version }),
+  /** Adds the launcher to Steam's library, or with a version that game (it starts the launcher
+   *  with --play), or updates it. Steam may be open. */
+  steamAdd: (version: string | null = null) => call<SteamState>("steam_add", { version }),
+  /** A desktop shortcut that starts a game (Linux): the path it wrote. */
+  shortcutCreate: (version: string) => call<string>("shortcut_create", { version }),
+  /** The game a `--play` start could not start, once; the page shows it. */
+  startupGame: () => call<string | null>("startup_game"),
+  /** Every mod index, checked (or its cached copy); with a game, its revoked mods are turned off. */
+  indexFetch: (game: string | null = null, version: string | null = null) =>
+    call<IndexView>("index_fetch", { game, version }),
+  /** The change set for `wanted` on that disc, with `turnOff` counted as off. */
+  indexResolve: (game: string, version: string, wanted: WantedMod[], turnOff: string[] = []) =>
+    call<InstallPlan>("index_resolve", { game, version, wanted, turnOff }),
+  /** Resolves again in Rust and installs; `index-apply` events say how far (onIndexApply). */
+  indexApply: (
+    game: string,
+    version: string,
+    wanted: WantedMod[],
+    turnOff: string[],
+    serial: string | null,
+    shared = false,
+  ) => call<ApplyResult>("index_apply", { game, version, wanted, turnOff, serial, shared }),
+  /** The index's updates for a game's mods: silent, waiting for a click, held back (mod_updates.rs). */
+  modsUpdates: (game: string, version: string, fresh = false) =>
+    call<UpdatePlan>("mods_updates", { game, version, fresh }),
+  /** Updates from a fresh fetch: the silent ones, or `ids` the player clicked. Refused while it runs. */
+  modsAutoUpdate: (game: string, version: string, ids: string[] | null, running: boolean) =>
+    call<UpdateRun>("mods_auto_update", { game, version, ids, running }),
+  modsLastUpdate: (game: string) => call<LastUpdate | null>("mods_last_update", { game }),
+  /** After a crash: the mod back at the version its update replaced, kept there. */
+  modsCrashRollback: (game: string, version: string, id: string) =>
+    call<PluginView[]>("mods_crash_rollback", { game, version, id }),
+  /** On, with the dependencies it needs (`alsoOn`: their names). */
+  pluginsTurnOn: (game: string, version: string, id: string) =>
+    call<{ views: PluginView[]; alsoOn: string[] }>("plugins_turn_on", { game, version, id }),
+  /** The mods that are on and need this one: [id, name]. */
+  pluginsDependents: (game: string, id: string) => call<[string, string][]>("plugins_dependents", { game, id }),
+  pluginsOrphans: (game: string, id: string) => call<Orphan[]>("plugins_orphans", { game, id }),
+  pluginsRemoveWith: (game: string, version: string, id: string, also: string[]) =>
+    call<PluginView[]>("plugins_remove_with", { game, version, id, also }),
+  /** A folder inside the game's set-up folder (an export), opened with the system. */
+  openGameFolder: (game: string, path: string) => call<null>("open_game_folder", { game, path }),
+  /** A folder a job wrote (a job exit's `outputs`), opened with the system; a file opens its folder. */
+  openOutput: (path: string) => call<null>("open_output", { path }),
+  openBakeLog: (version: string, path: string) => call<null>("open_bake_log", { version, path }),
+  /** One level's Godot project in the Godot editor (the version's editor-open action). */
+  openLevelInGodot: (version: string, level: number) => call<Started>("open_level_in_godot", { version, level }),
+  /** Android: the player's GPU driver packages (src-tauri/src/android.rs). */
+  gpuDrivers: () => call<GpuDrivers>("gpu_drivers"),
+  /** Android: the player picks a package's zip; null when they cancelled. */
+  gpuDriverImport: () => call<{ driver?: GpuDriver }>("gpu_driver_import").then((r) => r.driver ?? null),
+  gpuDriverSelect: (id: string | null) => call<null>("gpu_driver_select", { id }),
+  gpuDriverRemove: (id: string) => call<null>("gpu_driver_remove", { id }),
+  /** Android: what the game draws with from its next start. */
+  gpuRendererSelect: (renderer: Renderer) => call<null>("gpu_renderer_select", { renderer }),
+  /** Android: what the set-up's notification shows while the launcher is in the background; null:
+   *  the set-up is over (SetupService.kt). */
+  backgroundStatus: (status: BackgroundStatus | null) => call<null>("background_status", { ...status }),
+  toolsReady: () => call<null>("tools_ready"),
+  gameStatus: () => call<GameStatus>("game_status"),
+  /** Back to the running game, or (`stop`) end it. */
+  gameWindow: (stop: boolean) => call<null>("game_window", { stop }),
+  /** Android: a newer launcher on the releases, or null (desktops use Tauri's updater). */
+  updateCheck: (channel: UpdateChannel, branch: string | null) =>
+    call<AndroidRelease | null>("update_check", { channel, branch }),
+  /** A desktop: Tauri's updater asked at the channel's manifest; its update, or null. */
+  launcherUpdateCheck: (channel: UpdateChannel, branch: string | null) =>
+    call<LauncherUpdate | null>("launcher_update_check", { channel, branch }),
+  /** Android: downloads the release's APK, checks its signature, opens Android's installer. */
+  updateInstall: (url: string, signature: string) => call<null>("update_install", { url, signature }),
+};
+
+/** A desktop's update as Tauri's updater holds it: plugin-updater's `Update` is made from it. */
+export interface LauncherUpdate {
+  rid: number;
+  currentVersion: string;
+  version: string;
+  date?: string;
+  body?: string;
+  rawJson: Record<string, unknown>;
+}
+
+/** The channel a launcher updates on: the player's choice, or the one it was built from. */
+export function updateChannelOf(info: AppInfo, config: Config | null): UpdateChannel {
+  return config?.updateChannel ?? (info.updates.channel ? "dev" : "stable");
+}
+
+/** The tag of BRANCH's rolling development release (core/src/update.rs, dev_tag). */
+export function devTag(branch: string): string {
+  return `launcher-dev-${branch.replace(/[^A-Za-z0-9._-]/g, "-")}`;
+}
+
+/** The branch a fork's player named for its development builds (Settings), or null for none. */
+export function updateBranchOf(config: Config | null): string | null {
+  const branch = config?.updateBranch?.trim() ?? "";
+  return branch === "" ? null : branch;
+}
+
+/** Where a launcher looks for its updates (core/src/update.rs, UpdateSource::chosen): its channel,
+ *  and on a fork's development channel the builds of the branch the player named. */
+export function updateSourceOf(info: AppInfo, config: Config | null): UpdateSource {
+  const channel = updateChannelOf(info, config);
+  const source = info.updateChannels[channel];
+  const branch = updateBranchOf(config);
+  if (channel !== "dev" || !source.fork || branch === null) return source;
+  const tag = devTag(branch);
+  return {
+    ...source,
+    channel: tag,
+    manifest: `https://github.com/${source.repository}/releases/download/${tag}/latest.json`,
+    page: `https://github.com/${source.repository}/releases/tag/${tag}`,
+  };
+}
+
+/** A GPU driver package the Android launcher keeps (OpenracPlugin.kt): its meta.json. */
+export interface GpuDriver {
+  id: string;
+  name: string;
+  description: string;
+  author: string;
+  version: string;
+  vendor: string;
+  driverVersion: string;
+  minApi: number;
+  /** The driver library in the package (meta.json's libraryName). */
+  library: string;
+}
+
+/** Android: the game's activity, while it runs beside the launcher. */
+export interface GameStatus {
+  running: boolean;
+  /** Its library ("openrac-rac1-pal"); absent when the launcher restarted while it ran. */
+  library?: string | null;
+}
+
+export type Renderer = "gles" | "vulkan";
+
+export interface GpuDrivers {
+  drivers: GpuDriver[];
+  /** The package the game loads; absent or null: the system's driver (Android's JSON drops a
+   *  null value). */
+  selected?: string | null;
+  /** What the game draws with: its Vulkan renderer (the default) or OpenGL ES. */
+  renderer: Renderer;
+  device: {
+    model: string;
+    api: number;
+    soc: string;
+    /** Which kernel GPU driver the device has: packages load on Adreno's only. */
+    gpu: "adreno" | "mali" | "other";
+  };
+}
+
+/** How far a disc image's copy into the Android app's storage, or a CHD's unpacking, is (`disc-copy`). */
+export interface DiscCopy {
+  name: string;
+  copied: number;
+  total: number;
+}
+
+/** Asks before something that cannot be undone, with `yes` on the button that goes ahead. The
+ *  system's dialog: in the desktop app the page's own confirm() says yes on Linux (WebKitGTK)
+ *  without asking anything. The browser preview asks with the page's. */
+export async function ask(message: string, yes: string): Promise<boolean> {
+  if (!inTauri) return window.confirm(message);
+  return confirm(message, { title: "OpenRAC", kind: "warning", okLabel: yes, cancelLabel: "Cancel" });
+}
+
+/** A folder picker; null when cancelled (or in the browser preview). */
+export async function pickFolder(title: string): Promise<string | null> {
+  if (!inTauri) return null;
+  const picked = await open({ directory: true, title });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Linux: tells the launcher when its window has drawn the player's first click, so a start that
+ *  crashes there turns Safe rendering on at the next (core/src/webkit.rs, DrawCheck). */
+export function watchFirstDraw(): void {
+  if (!inTauri) return;
+  window.addEventListener(
+    "pointerdown",
+    () => {
+      void invoke("webview_clicked");
+      // Two frames for the click's own draw, then time for the page slide it starts.
+      requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => void invoke("webview_drew"), 1500)));
+    },
+    { once: true, capture: true },
+  );
+}
+
+/** Restart the launcher application (e.g. after installing an update). */
+export async function relaunchApp(): Promise<void> {
+  if (inTauri) {
+    await invoke("relaunch_app");
+  } else {
+    window.location.reload();
+  }
+}
+
+/** A file picker (a program); null when cancelled (or in the browser preview). */
+export async function pickFile(title: string): Promise<string | null> {
+  if (!inTauri) return null;
+  const picked = await open({ directory: false, multiple: false, title });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** A picker for a PCSX2 memory card: a card file (.ps2), or a folder card's _pcsx2_superblock,
+ *  opening in `dir`; null when cancelled (or in the browser preview). */
+export async function pickMemoryCard(title: string, dir: string | null): Promise<string | null> {
+  if (!inTauri) return null;
+  const picked = await open({
+    directory: false,
+    multiple: false,
+    title,
+    defaultPath: dir ?? undefined,
+    filters: [
+      { name: "PS2 memory card", extensions: ["ps2", "mcd", "mc2", "bin"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** A picker for an OpenRAC saves file (a .zip from Export saves); null when cancelled (in the
+ *  browser preview, a made-up one). On Android the system's picker hands over a file, copied into
+ *  the app's cache first (pick_zip). */
+export async function pickSavesFile(title: string): Promise<string | null> {
+  if (!inTauri) return "/home/you/Downloads/OpenRAC saves SCES_509.16 2026-11-02.zip";
+  if (onIOS) return iosInvoke<string | null>("pick_saves_file");
+  if (onAndroid) return call<string | null>("pick_zip");
+  const picked = await open({
+    directory: false,
+    multiple: false,
+    title,
+    filters: [{ name: "OpenRAC saves", extensions: ["zip", "ZIP"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** A picker for a mod's .zip; null when cancelled (in the browser preview, a made-up one). On
+ *  Android `copying` hears the file's copy into the app's cache, from the moment the picker closes. */
+export async function pickZip(title: string, copying?: (progress: DiscCopy) => void): Promise<string | null> {
+  if (!inTauri) return "/home/you/Downloads/HD Ratchet.zip";
+  // Android's picker hands over a file, not a path: it is copied into the app's cache first.
+  if (onAndroid) {
+    // Its own event, so a disc's copy elsewhere is never read as this file's.
+    const off = copying
+      ? await listen<DiscCopy>("mod-copy", (e) => {
+          copying(e.payload);
+        })
+      : null;
+    try {
+      return await call<string | null>("pick_zip");
+    } finally {
+      off?.();
+    }
+  }
+  const picked = await open({
+    directory: false,
+    multiple: false,
+    title,
+    filters: [{ name: "Zip", extensions: ["zip"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Files and folders dropped on the window, while `handler` is listening (the desktop app only). */
+export async function onDrop(
+  handler: (paths: string[]) => void,
+  hovering: (over: boolean) => void = () => undefined,
+): Promise<() => void> {
+  if (!inTauri || onIOS) return () => undefined;
+  const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+  return getCurrentWebview().onDragDropEvent((event) => {
+    if (event.payload.type === "drop") handler(event.payload.paths);
+    else hovering(event.payload.type !== "leave");
+  });
+}
+
+/** The player's disc image for setting a game up: an .iso, as OpenGOAL asks for, or a .chd. */
+export async function pickIso(title: string, copying?: (progress: DiscCopy) => void): Promise<string | null> {
+  if (!inTauri) return "/home/you/Discs/game.iso";
+  if (onAndroid) {
+    // The system's picker; the image is copied into the app's storage as it is picked.
+    const off = copying ? await onDiscCopy(copying) : null;
+    try {
+      return await call<string | null>("pick_disc");
+    } finally {
+      off?.();
+    }
+  }
+  const picked = await open({
+    directory: false,
+    multiple: false,
+    title,
+    filters: [{ name: "Disc image", extensions: ["iso", "ISO", "chd", "CHD"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** A mod code's link came in (modsetTakeLink has it). */
+export async function onModsetLink(handler: () => void): Promise<UnlistenFn> {
+  if (!inTauri) return () => undefined;
+  return listen("modset-link", handler);
+}
+
+/** `disc-copy` events: a picked image's copy (Android) or a .chd's unpacking. */
+export async function onDiscCopy(handler: (progress: DiscCopy) => void): Promise<UnlistenFn> {
+  if (!inTauri) return () => undefined;
+  return listen<DiscCopy>("disc-copy", (e) => {
+    handler(e.payload);
+  });
+}
+
+/** `update-progress` events: the Android update's download. */
+export async function onUpdateProgress(
+  handler: (progress: { downloaded: number; total: number }) => void,
+): Promise<UnlistenFn> {
+  if (!inTauri) return () => undefined;
+  return listen<{ downloaded: number; total: number }>("update-progress", (e) => {
+    handler(e.payload);
+  });
+}
+
+/** Job output and exits, from `job-output` and `job-exit` events. */
+export async function onJobEvent(handler: (event: JobEvent) => void): Promise<UnlistenFn> {
+  if (!inTauri) {
+    const { mockListen } = await import("./mock");
+    return mockListen(handler);
+  }
+  const offOutput = await listen<JobEvent>("job-output", (e) => {
+    handler(e.payload);
+  });
+  const offExit = await listen<JobEvent>("job-exit", (e) => {
+    handler(e.payload);
+  });
+  return () => {
+    offOutput();
+    offExit();
+  };
+}
+
+/** The game a `--play` start of an open launcher could not start (`open-game`): its version key. */
+export async function onOpenGame(handler: (key: string) => void): Promise<UnlistenFn> {
+  if (!inTauri) return () => undefined;
+  return listen<string>("open-game", (e) => {
+    handler(e.payload);
+  });
+}
+
+/** Each mod applied (index_apply's `index-apply` events). */
+export async function onIndexApply(handler: (p: ApplyProgress) => void): Promise<UnlistenFn> {
+  if (!inTauri) {
+    const { mockIndexListen } = await import("./mockIndex");
+    return mockIndexListen(handler);
+  }
+  return listen<ApplyProgress>("index-apply", (e) => {
+    handler(e.payload);
+  });
+}
+
+/** The mod hub's error, when a command rejected with one (its kind decides the fix offered). */
+export function modErrorOf(e: unknown): ModError | null {
+  if (typeof e === "object" && e !== null && "kind" in e && "detail" in e) return e as ModError;
+  return null;
+}
+
+/** A command's error as text: Tauri rejects with the Rust side's String. */
+export function errorText(e: unknown): string {
+  if (typeof e === "string") return e;
+  const mod = modErrorOf(e);
+  if (mod) return mod.detail;
+  if (e instanceof Error) return e.message;
+  return JSON.stringify(e);
+}

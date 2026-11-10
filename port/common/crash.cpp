@@ -1,0 +1,757 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// The crash report (crash.h). Everything report() touches is set up by configure(): the folder's
+// name, the program's, the version line, the time zone and the program's load address; it then
+// formats with its own digits into fixed buffers and writes with write(). This file includes no
+// header of the port's but its own, log.h and build_info.h (windows.h's macros clash with the
+// port's names).
+
+#include "common/crash.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <string>
+
+#include "common/breadcrumbs.h"
+#include "common/build_info.h"
+#include "common/crash_symbols.h"
+#include "common/log.h"
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <direct.h>
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+
+#include <sys/stat.h>
+#else
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace openrac::crash {
+namespace {
+
+// ---- The system's calls, the same on each ----
+
+#if defined(_WIN32)
+void put_fd(int fd, const char* s, std::size_t n) {
+    while (n > 0) {
+        const int done = _write(fd, s, static_cast<unsigned>(n > 0x10000 ? 0x10000 : n));
+        if (done <= 0) {
+            return;
+        }
+        s += done;
+        n -= static_cast<std::size_t>(done);
+    }
+}
+int open_new(const char* path) {
+    return _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+}
+void make_dir(const char* path) {
+    _mkdir(path);
+}
+void close_fd(int fd) {
+    _close(fd);
+}
+constexpr int kStderr = 2;
+#else
+void put_fd(int fd, const char* s, std::size_t n) {
+    while (n > 0) {
+        const ssize_t done = ::write(fd, s, n);
+        if (done <= 0) {
+            return;
+        }
+        s += done;
+        n -= static_cast<std::size_t>(done);
+    }
+}
+int open_new(const char* path) {
+    return ::open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+}
+void make_dir(const char* path) {
+    ::mkdir(path, 0755);
+}
+void close_fd(int fd) {
+    ::close(fd);
+}
+constexpr int kStderr = STDERR_FILENO;
+#endif
+
+// ---- What configure() prepared ----
+
+char g_folder[1024] = {};       // where reports go, as the system names it
+char g_folder_shown[1024] = {};  // the same with the home folder as ~
+char g_program[128] = "openrac";
+char g_version[160] = {};  // "OpenRAC 0.7.0, commit f3df7852"
+char g_session[64] = {};
+long g_offset = 0;
+std::uintptr_t g_base = 0;  // where the program is loaded (to turn backtrace addresses into its own)
+GameState g_state;
+std::atomic<MobySource> g_moby_source{nullptr};
+std::atomic<int> g_reporting{0};
+char g_written[1100] = {};
+const ModImage* g_mods = nullptr;
+int g_mod_count = 0;
+const char* const* g_running_script = nullptr;
+
+void copy(char* to, std::size_t size, const std::string& from) {
+    const std::size_t n = from.size() < size - 1 ? from.size() : size - 1;
+    std::memcpy(to, from.data(), n);
+    to[n] = '\0';
+}
+
+// ---- Writing to several files at once, through a small buffer ----
+
+class Out {
+public:
+    Out(const int* fds, int count) : m_count(count) {
+        for (int i = 0; i < count && i < 3; ++i) {
+            m_fds[i] = fds[i];
+        }
+    }
+    ~Out() { flush(); }
+
+    Out& put(const char* s, std::size_t n) {
+        while (n > 0) {
+            if (m_len == sizeof(m_buf)) {
+                flush();
+            }
+            const std::size_t room = sizeof(m_buf) - m_len;
+            const std::size_t k = n < room ? n : room;
+            std::memcpy(m_buf + m_len, s, k);
+            m_len += k;
+            s += k;
+            n -= k;
+        }
+        return *this;
+    }
+    Out& str(const char* s) { return put(s, std::strlen(s)); }
+    Out& text(const Text& t) { return put(t.c_str(), t.size()); }
+    void flush() {
+        for (int i = 0; i < m_count; ++i) {
+            if (m_fds[i] >= 0) {
+                put_fd(m_fds[i], m_buf, m_len);
+            }
+        }
+        m_len = 0;
+    }
+    const int* fds() const { return m_fds; }
+    int count() const { return m_count; }
+
+private:
+    int m_fds[3] = {-1, -1, -1};
+    int m_count = 0;
+    char m_buf[2048];
+    std::size_t m_len = 0;
+};
+
+// Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm): no library call, so it can
+// run in a signal handler.
+void civil(long long days, int& y, int& m, int& d) {
+    days += 719468;
+    const long long era = (days >= 0 ? days : days - 146096) / 146097;
+    const long long doe = days - era * 146097;
+    const long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const long long mp = (5 * doy + 2) / 153;
+    d = static_cast<int>(doy - (153 * mp + 2) / 5 + 1);
+    m = static_cast<int>(mp < 10 ? mp + 3 : mp - 9);
+    y = static_cast<int>(yoe + era * 400 + (m <= 2 ? 1 : 0));
+}
+
+void two(char* at, int v) {
+    at[0] = static_cast<char>('0' + (v / 10) % 10);
+    at[1] = static_cast<char>('0' + v % 10);
+}
+
+struct Clock {
+    int year, month, day, hour, minute, second;
+};
+
+Clock clock_at(long long utc, long offset) {
+    const long long local = utc + offset;
+    long long days = local / 86400;
+    long long rest = local % 86400;
+    if (rest < 0) {
+        rest += 86400;
+        --days;
+    }
+    Clock c{};
+    civil(days, c.year, c.month, c.day);
+    c.hour = static_cast<int>(rest / 3600);
+    c.minute = static_cast<int>(rest / 60 % 60);
+    c.second = static_cast<int>(rest % 60);
+    return c;
+}
+
+// One float as "-123.45" (two decimals), without printf.
+void decimal(Text& t, float f) {
+    if (std::isnan(f)) {
+        t.str("nan");
+        return;
+    }
+    if (std::isinf(f)) {
+        t.str(f < 0 ? "-inf" : "inf");
+        return;
+    }
+    if (f < 0) {
+        t.str("-");
+        f = -f;
+    }
+    if (f >= 1e15f) {
+        t.str("huge");
+        return;
+    }
+    const long long hundredths = static_cast<long long>(static_cast<double>(f) * 100.0 + 0.5);
+    t.dec(hundredths / 100).str(".");
+    const int frac = static_cast<int>(hundredths % 100);
+    char d[3] = {};
+    two(d, frac);
+    t.str(d);
+}
+
+void write_state(Out& out) {
+    const GameState& s = g_state;
+    Text t;
+    t.str("Game:     ");
+    if (s.frame < 0) {
+        t.str("not started");
+    } else {
+        if (s.level >= 0) {
+            t.str("level ").dec(s.level);
+        } else {
+            t.str("no level (title or menus)");
+        }
+        if (s.has_mode) {
+            t.str(", game mode ").dec(static_cast<long long>(s.mode));
+        }
+        t.str(", frame ").dec(s.frame);
+        if (s.has_hero) {
+            t.str(", hero at ");
+            decimal(t, s.hero[0]);
+            t.str(" ");
+            decimal(t, s.hero[1]);
+            t.str(" ");
+            decimal(t, s.hero[2]);
+        }
+        Moby m;
+        const MobySource source = g_moby_source.load(std::memory_order_relaxed);
+        if (source != nullptr && source(m)) {
+            t.str(", updating moby class ").dec(m.oclass);
+            if (m.has_uid) {
+                t.str(" uid ").dec(m.uid);
+            }
+            t.str(" at ");
+            decimal(t, m.position[0]);
+            t.str(" ");
+            decimal(t, m.position[1]);
+            t.str(" ");
+            decimal(t, m.position[2]);
+            t.str(" (").hex(m.address, 8).str(")");
+        }
+        if (s.has_camera) {
+            t.str(", camera at ");
+            decimal(t, s.camera[0]);
+            t.str(" ");
+            decimal(t, s.camera[1]);
+            t.str(" ");
+            decimal(t, s.camera[2]);
+        }
+    }
+    t.str("\n");
+    out.text(t);
+}
+
+// The frames, taken once by capture() and written to each file from there.
+void* g_frames[64];
+int g_frame_count = 0;
+// Captured once into process storage, keeping crash-stack use and every report copy bounded.
+Breadcrumbs::Snapshot g_breadcrumbs;
+std::size_t g_breadcrumb_count = 0;
+
+void capture() {
+    g_breadcrumb_count = breadcrumbs().snapshot(g_breadcrumbs);
+#if defined(_WIN32)
+    g_frame_count = CaptureStackBackTrace(0, 62, g_frames, nullptr);
+#else
+    g_frame_count = backtrace(g_frames, 64);
+#endif
+}
+
+// The library holding a code address: where the system loaded it, or null.
+const void* module_base(const void* address) {
+#if defined(_WIN32)
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(address), &module) != 0) {
+        return module;
+    }
+    return nullptr;
+#else
+    Dl_info info{};
+    return dladdr(address, &info) != 0 ? info.dli_fbase : nullptr;
+#endif
+}
+
+// The mods loaded, and the frames of the backtrace that are in one of them (docs/port/MODS.md,
+// section 7).
+void write_mods(Out& out) {
+    if (g_mod_count <= 0) {
+        return;
+    }
+    if (g_running_script != nullptr && *g_running_script != nullptr) {
+        out.str("\nA script of mod ").str(*g_running_script).str(" was running (its log lines say more).\n");
+    }
+    out.str("\nMods loaded (docs/port/MODS.md; Purist mode starts the game without them):\n");
+    for (int m = 0; m < g_mod_count; ++m) {
+        out.str("  ").str(g_mods[m].id).str(" ").str(g_mods[m].version).str(" (").str(g_mods[m].file).str(")\n");
+    }
+    for (int i = 0; i < g_frame_count; ++i) {
+        const void* base = module_base(g_frames[i]);
+        for (int m = 0; base != nullptr && m < g_mod_count; ++m) {
+            if (base == g_mods[m].base) {
+                Text t;
+                t.str("Frame ").dec(i).str(" is in mod ").str(g_mods[m].id).str(" (").str(g_mods[m].file).str("+");
+                t.hex(reinterpret_cast<std::uintptr_t>(g_frames[i]) - reinterpret_cast<std::uintptr_t>(base)).str(")\n");
+                out.text(t);
+            }
+        }
+    }
+}
+
+void write_backtrace(Out& out) {
+    out.str("\nBacktrace (the newest call first):\n");
+    out.flush();
+    void** frames = g_frames;
+#if defined(_WIN32)
+    const USHORT count = static_cast<USHORT>(g_frame_count);
+    for (USHORT i = 0; i < count; ++i) {
+        Text t;
+        t.dec(i).str("  ");
+        const auto address = reinterpret_cast<DWORD64>(frames[i]);
+        HMODULE module = nullptr;
+        char path[MAX_PATH];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCSTR>(frames[i]), &module) != 0 &&
+            GetModuleFileNameA(module, path, static_cast<DWORD>(sizeof(path))) != 0) {
+            const char* file = std::strrchr(path, '\\');
+            t.str(file != nullptr ? file + 1 : path).str("+");
+            t.hex(address - reinterpret_cast<DWORD64>(module));
+        } else {
+            t.hex(address);
+        }
+        symbols::Location location;
+        if (symbols::locate(static_cast<std::uintptr_t>(address), location)) {
+            if (location.function[0]) {
+                t.str(" ")
+                    .str(location.function)
+                    .str(" + ")
+                    .dec(static_cast<long long>(location.displacement));
+            }
+            if (location.line) {
+                t.str(" (").str(location.file).str(":").dec(location.line).str(")");
+            }
+        }
+        t.str("\n");
+        out.text(t);
+    }
+    out.flush();
+#else
+    const int count = g_frame_count;
+    for (int i = 0; i < out.count(); ++i) {
+        if (out.fds()[i] >= 0) {
+            backtrace_symbols_fd(frames, count, out.fds()[i]);
+        }
+    }
+#endif
+    if (g_base != 0) {
+        Text t;
+        t.str("(the program is loaded at ").hex(g_base).str("; less that, an address is the one in its symbols)\n");
+        out.text(t);
+    }
+    write_mods(out);
+}
+
+void write_head(Out& out, const char* reason, Kind kind, long long now) {
+    char when[40];
+    format_time(now, g_offset, when, sizeof(when));
+    out.str("Reason:   ").str(reason).str("\n");
+    out.str("Kind:     ").str(kind_name(kind)).str("\n");
+    out.str("When:     ").str(when);
+    if (g_session[0] != '\0') {
+        out.str(" (the session began ").str(g_session).str(")");
+    }
+    out.str("\n");
+    out.str("Program:  ").str(g_program).str(", ").str(g_version).str("\n");
+#if defined(_WIN32)
+    out.str("Symbols:  ").str(symbols::status()).str("\n");
+#endif
+    write_state(out);
+}
+
+void emit_line(const char* text, std::size_t length, void* context) {
+    auto* out = static_cast<Out*>(context);
+    out->put("  ", 2).put(text, length).put("\n", 1);
+}
+
+struct VulkanDiagnostic {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    std::uint64_t sequence = 0;
+    std::array<char, 1024> text{};
+    std::size_t length = 0;
+};
+
+constinit std::array<VulkanDiagnostic, 32> g_vulkan_diagnostics{};
+constinit std::atomic<std::uint64_t> g_vulkan_sequence{0};
+
+void write_vulkan_diagnostics(Out& out) {
+    const auto end = g_vulkan_sequence.load(std::memory_order_relaxed);
+    if (end == 0) {
+        return;
+    }
+    out.str("\nVulkan diagnostics (oldest first):\n");
+    const auto count = std::min<std::uint64_t>(end, g_vulkan_diagnostics.size());
+    for (auto sequence = end - count; sequence < end; ++sequence) {
+        auto& entry = g_vulkan_diagnostics[sequence % g_vulkan_diagnostics.size()];
+        if (!entry.busy.test_and_set(std::memory_order_acquire)) {
+            if (entry.sequence == sequence + 1) {
+                emit_line(entry.text.data(), entry.length, &out);
+            }
+            entry.busy.clear(std::memory_order_release);
+        }
+    }
+}
+
+void write_tail(Out& out) {
+    write_vulkan_diagnostics(out);
+    out.str("\nThe log's last lines (the oldest first):\n");
+    log::recent_lines(emit_line, &out);
+    out.str("\nThe session:\n");
+    const std::string_view header = log::header_for_crash();
+    out.put(header.data(), header.size());
+    out.str("==== end of the report ====\n");
+}
+
+// Names the counter behind an event; game ticks need not match the frontend's snapshot index.
+const char* breadcrumb_value_label(BreadcrumbValue kind) {
+    switch (kind) {
+        case BreadcrumbValue::Frame:
+            return " frame=";
+        case BreadcrumbValue::Level:
+            return " level=";
+        case BreadcrumbValue::Tick:
+            return " tick=";
+    }
+    return " value=";
+}
+
+// Emits the same captured timeline to the crash file, session log and stderr without allocating.
+void write_breadcrumbs(Out& out) {
+    // An early crash may precede the first instrumented game or render operation.
+    if (g_breadcrumb_count == 0) {
+        return;
+    }
+    out.str("\nRecent activity (oldest first; us since first retained event):\n");
+    const auto first = g_breadcrumbs[0].tick;
+    for (std::size_t i = 0; i < g_breadcrumb_count; ++i) {
+        const auto& entry = g_breadcrumbs[i];
+        Text text;
+        text.str("  +")
+            .dec(static_cast<long long>(entry.tick - first))
+            .str(entry.thread == BreadcrumbThread::Render ? " us [render] " : " us [main] ")
+            .str(entry.message);
+        // A loading level ID must not be mistaken for a captured render frame.
+        if (entry.value >= 0) {
+            text.str(breadcrumb_value_label(entry.kind)).dec(entry.value);
+        }
+        text.str("\n");
+        out.text(text);
+    }
+}
+
+}  // namespace
+
+// ---- Text ----
+
+Text& Text::str(const char* s) {
+    while (s != nullptr && *s != '\0' && m_len + 1 < sizeof(m_buf)) {
+        m_buf[m_len++] = *s++;
+    }
+    m_buf[m_len] = '\0';
+    return *this;
+}
+
+Text& Text::dec(long long v) {
+    char digits[24];
+    int n = 0;
+    const bool negative = v < 0;
+    unsigned long long u = negative ? 0ull - static_cast<unsigned long long>(v) : static_cast<unsigned long long>(v);
+    do {
+        digits[n++] = static_cast<char>('0' + u % 10);
+        u /= 10;
+    } while (u != 0);
+    if (negative) {
+        digits[n++] = '-';
+    }
+    char text[24];
+    for (int i = 0; i < n; ++i) {
+        text[i] = digits[n - 1 - i];
+    }
+    text[n] = '\0';
+    return str(text);
+}
+
+Text& Text::hex(std::uint64_t v, int digits) {
+    char text[24] = "0x";
+    char rev[17];
+    int n = 0;
+    do {
+        rev[n++] = "0123456789ABCDEF"[v & 15];
+        v >>= 4;
+    } while (v != 0 && n < 16);
+    while (n < digits && n < 16) {
+        rev[n++] = '0';
+    }
+    for (int i = 0; i < n; ++i) {
+        text[2 + i] = rev[n - 1 - i];
+    }
+    text[2 + n] = '\0';
+    return str(text);
+}
+
+const char* kind_name(Kind kind) {
+    switch (kind) {
+        case Kind::Signal:
+            return "fault";
+        case Kind::Exception:
+            return "exception";
+        case Kind::Fatal:
+            return "fatal error";
+        case Kind::Trap:
+            return "game trap";
+    }
+    return "?";
+}
+
+// ---- Times ----
+
+void file_name(long long utc, long offset, char* out, std::size_t size) {
+    const Clock c = clock_at(utc, offset);
+    char name[] = "crash-0000-00-00_00-00-00.txt";
+    two(name + 6, c.year / 100);
+    two(name + 8, c.year % 100);
+    two(name + 11, c.month);
+    two(name + 14, c.day);
+    two(name + 17, c.hour);
+    two(name + 20, c.minute);
+    two(name + 23, c.second);
+    if (size > 0) {
+        const std::size_t n = sizeof(name) - 1 < size - 1 ? sizeof(name) - 1 : size - 1;
+        std::memcpy(out, name, n);
+        out[n] = '\0';
+    }
+}
+
+void format_time(long long utc, long offset, char* out, std::size_t size) {
+    const Clock c = clock_at(utc, offset);
+    char text[] = "0000-00-00 00:00:00 +0000";
+    two(text, c.year / 100);
+    two(text + 2, c.year % 100);
+    two(text + 5, c.month);
+    two(text + 8, c.day);
+    two(text + 11, c.hour);
+    two(text + 14, c.minute);
+    two(text + 17, c.second);
+    const long a = offset < 0 ? -offset : offset;
+    text[20] = offset < 0 ? '-' : '+';
+    two(text + 21, static_cast<int>(a / 3600));
+    two(text + 23, static_cast<int>(a / 60 % 60));
+    if (size > 0) {
+        const std::size_t n = sizeof(text) - 1 < size - 1 ? sizeof(text) - 1 : size - 1;
+        std::memcpy(out, text, n);
+        out[n] = '\0';
+    }
+}
+
+long local_offset() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    utc.tm_isdst = -1;  // mktime reads it as local time, its summer time found
+    return static_cast<long>(now - std::mktime(&utc));
+}
+
+// ---- Set-up ----
+
+void configure(const std::filesystem::path& folder, const std::string& program, const std::string& session) {
+    copy(g_folder, sizeof(g_folder), folder.string());
+    copy(g_folder_shown, sizeof(g_folder_shown), log::tidy(folder.string()));
+    copy(g_program, sizeof(g_program), program);
+    copy(g_version, sizeof(g_version),
+         std::string("OpenRAC ") + build_info::version() + ", commit " + build_info::commit());
+    copy(g_session, sizeof(g_session), session);
+    g_offset = local_offset();
+#if defined(_WIN32)
+    symbols::initialize();
+    g_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
+#else
+    // The first backtrace() loads what it unwinds with (glibc: libgcc_s), which allocates: here,
+    // not in the handler.
+    void* frames[4];
+    backtrace(frames, 4);
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&configure), &info) != 0) {
+        g_base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+    }
+#endif
+}
+
+void prepare_thread() {
+#if !defined(_WIN32)
+    thread_local bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    constexpr std::size_t kSize = 256 * 1024;  // backtrace_symbols_fd and the report's buffers fit
+    stack_t stack{};
+    stack.ss_sp = std::malloc(kSize);  // kept for the thread's life
+    stack.ss_size = kSize;
+    stack.ss_flags = 0;
+    if (stack.ss_sp != nullptr) {
+        sigaltstack(&stack, nullptr);
+    }
+#endif
+}
+
+void set_state(const GameState& s) {
+    g_state = s;
+}
+
+const GameState& state() {
+    return g_state;
+}
+
+void set_mods(const ModImage* mods, int count) {
+    g_mods = mods;
+    g_mod_count = mods != nullptr ? count : 0;
+}
+
+void set_running_script(const char* const* current) {
+    g_running_script = current;
+}
+
+void set_moby_source(MobySource source) {
+    g_moby_source.store(source, std::memory_order_relaxed);
+}
+
+// ---- The report ----
+
+void note_vulkan(std::string_view message) noexcept {
+    const auto sequence = g_vulkan_sequence.fetch_add(1, std::memory_order_relaxed);
+    auto& entry = g_vulkan_diagnostics[sequence % g_vulkan_diagnostics.size()];
+    // A fault or a concurrent driver callback may interrupt a writer. Never wait for it.
+    if (entry.busy.test_and_set(std::memory_order_acquire)) {
+        return;
+    }
+    if (entry.sequence < sequence + 1) {
+        entry.length = std::min(message.size(), entry.text.size());
+        for (std::size_t i = 0; i < entry.length; ++i) {
+            const auto c = static_cast<unsigned char>(message[i]);
+            entry.text[i] = c < 32 || c == 127 ? ' ' : message[i];
+        }
+        entry.sequence = sequence + 1;
+    }
+    entry.busy.clear(std::memory_order_release);
+}
+
+void write_report(int fd, const char* reason, Kind kind, long long now) {
+    const int fds[1] = {fd};
+    Out out(fds, 1);
+    out.str("==== OpenRAC crash report ====\n");
+    write_head(out, reason, kind, now);
+    capture();
+    write_backtrace(out);
+    write_breadcrumbs(out);
+    write_tail(out);
+}
+
+const char* report(const char* reason, Kind kind) {
+    if (g_reporting.exchange(1) != 0) {
+        return nullptr;
+    }
+    capture();
+    const long long now = static_cast<long long>(std::time(nullptr));
+    int file = -1;
+    if (g_folder[0] != '\0') {
+        make_dir(g_folder);
+        char name[64];
+        file_name(now, g_offset, name, sizeof(name));
+        for (int attempt = 0; attempt < 10 && file < 0; ++attempt) {
+            Text path;
+            path.str(g_folder).str("/");
+            if (attempt == 0) {
+                path.str(name);
+            } else {
+                // Two in one second (a fault while the first was reported cannot get here): -2...
+                char stem[64];
+                std::memcpy(stem, name, sizeof(stem));
+                stem[std::strlen(stem) - 4] = '\0';
+                path.str(stem).str("-").dec(attempt + 1).str(".txt");
+            }
+            file = open_new(path.c_str());
+            if (file >= 0) {
+                std::memcpy(g_written, path.c_str(), path.size() + 1);
+            }
+        }
+    }
+    // The file gets the whole report; the session log and stderr the reason, the backtrace and the
+    // state (the log has its own header and lines already).
+    const int log_fd = log::file_descriptor();
+    {
+        const int fds[2] = {log_fd, kStderr};
+        Out out(fds, 2);
+        out.str("[error] ==== the program stopped: ").str(kind_name(kind)).str(" ====\n");
+        write_head(out, reason, kind, now);
+        write_backtrace(out);
+        write_breadcrumbs(out);
+        if (file >= 0) {
+            const char* slash = std::strrchr(g_written, '/');
+            out.str("Crash report: ").str(g_folder_shown).str(slash != nullptr ? slash : "").str("\n");
+        }
+        out.str("[error] ==== end of the crash ====\n");
+    }
+    if (file < 0) {
+        return nullptr;
+    }
+    {
+        const int fds[1] = {file};
+        Out out(fds, 1);
+        out.str("==== OpenRAC crash report ====\n");
+        write_head(out, reason, kind, now);
+        write_backtrace(out);
+        write_breadcrumbs(out);
+        write_tail(out);
+    }
+    close_fd(file);
+    return g_written;
+}
+
+}  // namespace openrac::crash

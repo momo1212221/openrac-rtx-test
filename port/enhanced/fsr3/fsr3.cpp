@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// Fsr3 setup keeps optional SDK resources in enhanced Vulkan rendering and preserves HUD resolution.
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <utility>
+
+#include "common/log.h"
+#include "enhanced/fsr3/fsr3_internal.h"
+#include "enhanced/fsr3/temporal_math.h"
+#include "fsr3_shaders.h"
+#include "renderer/gl.h"
+#include "renderer/render_opt.h"
+#include "scene/level_renderer.h"
+
+#include <FidelityFX/host/ffx_fsr3upscaler.h>
+
+namespace openrac::enhanced {
+using namespace openrac::gl;
+
+namespace {
+// The reactive mask's format: one channel (fsr-reactive-r8), or RGBA8 as before it.
+GLenum reactive_format() {
+    return renderer::render_opt::enabled(renderer::render_opt::Opt::FsrReactiveR8)
+               ? 0x8229 /* GL_R8 */
+               : GL_RGBA8;
+}
+
+// Diagnostics only (the capture report and the drawer, on the window thread); written on the
+// render thread by configure_upscaler.
+std::atomic<const char*> g_active_upscaler{"none"};
+
+// Camera discontinuities need fresh accumulation; ordinary movement retains temporal history.
+bool camera_cut(const renderer::Camera& current, const renderer::Camera& previous) {
+    float distance_squared = 0;
+    float alignment = 0;
+
+    // Squared displacement and forward alignment distinguish a cut from ordinary camera movement.
+    for (std::size_t n = 0; n < current.position.size(); ++n) {
+        const float delta = current.position[n] - previous.position[n];
+        distance_squared += delta * delta;
+        alignment += current.view[n * 4 + 2] * previous.view[n * 4 + 2];
+    }
+
+    // Eight world units, a 45-degree turn, or a changed projection identifies a cut.
+    return distance_squared > 64 || alignment < .707f
+           || std::abs(current.projection[0] - previous.projection[0]) > .01f
+           || std::abs(current.projection[5] - previous.projection[5]) > .01f;
+}
+}  // namespace
+
+Fsr3::Fsr3() : m_state(std::make_unique<State>()) {}
+
+Fsr3::~Fsr3() {
+    release();
+}
+
+bool Fsr3::available() {
+    vkgl::NativeDevice device;
+    return enhanced_rendering_available() && vkgl::native_device(device) && device.storage_formats;
+}
+
+const char* Fsr3::active_upscaler() {
+    return g_active_upscaler.load(std::memory_order_relaxed);
+}
+
+#if defined(__ANDROID__)
+constexpr bool kFsrAllowed = false;  // too slow on phones' GPUs: ASR or nothing
+#else
+constexpr bool kFsrAllowed = true;
+#endif
+
+bool Fsr3::State::asr_possible() const {
+    return !asr_refused && asr_detail::preferred();
+}
+
+bool Fsr3::State::configure_upscaler(
+    std::array<int, 2> size, std::array<int, 2> display_size, std::string& error
+) {
+    plain = plain_wanted || (!kFsrAllowed && !(asr_possible() && asr_detail::supports(size)));
+    if (plain) {
+        sdk.release();
+        asr.release();
+        valid = valid && !use_asr;
+        use_asr = false;
+        g_active_upscaler = "none";
+        return true;
+    }
+
+    // ASR is tried until it fails once; a device it cannot start on keeps FSR 3.1, and so do
+    // frames too small for it.
+    if (!asr_refused && asr_detail::preferred() && asr_detail::supports(size)) {
+        std::string reason;
+
+        if (asr.configure(size, display_size, reason)) {
+            sdk.release();
+            // The other upscaler's history does not carry over: the first frame starts afresh.
+            valid = valid && use_asr;
+            use_asr = true;
+            g_active_upscaler = "Arm ASR";
+            return true;
+        }
+
+        log::warn("Arm ASR unavailable: {}", reason);
+        asr.release();
+        asr_refused = true;
+        if (!kFsrAllowed) {
+            plain = true;
+            valid = false;
+            use_asr = false;
+            g_active_upscaler = "none";
+            return true;
+        }
+    }
+
+    if (use_asr) {
+        asr.release();
+        use_asr = false;
+        valid = false;
+    }
+
+    if (!sdk.configure(size, display_size, error)) {
+        return false;
+    }
+
+    g_active_upscaler = "FSR 3.1";
+    return true;
+}
+
+bool Fsr3::State::dispatch_upscaler(std::array<unsigned, 5> inputs, std::string& error) {
+    if (!use_asr) {
+        return sdk.dispatch(inputs, dispatch, error);
+    }
+
+    if (asr.dispatch(inputs, dispatch, error)) {
+        return true;
+    }
+
+    // A device that cannot run ASR's passes upscales with FSR 3.1 from the next frame on.
+    asr_refused = true;
+    asr_dispatch_failed = true;
+    return false;
+}
+
+void Fsr3::set_scene(
+    std::span<const scene::Instance> instances, std::span<const renderer::Mat4> palette
+) {
+    m_state->instances.assign(instances.begin(), instances.end());
+    m_state->palette.assign(palette.begin(), palette.end());
+}
+
+bool Fsr3::State::build_shaders(std::string& error) {
+    // Retain compiled helper programs across resolution and quality changes.
+    if (camera_motion.id() && object_motion.id() && reactive_mask.id() && late_world_depth.id()) {
+        return true;
+    }
+
+    return camera_motion.build(
+               "temporal camera motion",
+               shaders::fullscreen_vert,
+               shaders::camera_motion_frag,
+               error
+           )
+           && object_motion.build(
+               "temporal object motion",
+               scene ? scene->deformation_vertex(shaders::motion_vert)
+                     : std::string(shaders::motion_vert),
+               scene ? scene->motion_fragment(shaders::motion_frag)
+                     : std::string(shaders::motion_frag),
+               error
+           )
+           && reactive_mask.build(
+               "temporal reactive mask", shaders::fullscreen_vert, shaders::reactive_frag, error
+           )
+           && late_world_depth.build(
+               "late world depth", shaders::fullscreen_vert, shaders::late_world_depth_frag, error
+           );
+}
+
+bool Fsr3::State::configure(
+    renderer::FrameBuffer& output, std::array<int, 2> size, std::string& error
+) {
+    const bool resized = world.width() != size[0] || world.height() != size[1]
+                         || display.width != output.width() || display.height != output.height();
+
+    // History images can be reused only at identical input and output dimensions.
+    if (world.width() != size[0] || world.height() != size[1]) {
+        valid = false;
+
+        // RGBA16F preserves signed velocity and its history flag; R32F stores depth without a
+        // stencil aspect. Reactivity is one channel, which R8 holds in a quarter of RGBA8's bytes
+        // (the upscaler reads its red alone either way).
+        if (!world.create(size[0], size[1], error, 1, true)
+            || !motion.create(size[0], size[1], 0x881A, 0, error)
+            || !depth.create(size[0], size[1], 0x822E, 0, error)
+            || !reactive.create(size[0], size[1], reactive_format(), 0, error)
+            || !opaque.create(size[0], size[1], GL_RGBA8, 0, error)) {
+            return false;
+        }
+    }
+
+    // The final colour target alone needs storage usage; the original renderer's images remain ordinary attachments.
+    if (!vkgl::storage_texture(output.colour_texture()) || output_texture != output.colour_texture()
+        || display.width != output.width() || display.height != output.height()) {
+        valid = false;
+
+        // Storage capability can change even when a framebuffer reuses the same texture name.
+        if (!vkgl::allocate_storage_texture(
+                output.colour_texture(), GL_RGBA8, output.width(), output.height()
+            )) {
+            error = "cannot allocate FSR output image";
+            return false;
+        }
+
+        output_texture = output.colour_texture();
+    }
+
+    // Only complete setups are reported as active temporal rendering.
+    if (!build_shaders(error)
+        || !configure_upscaler(size, {output.width(), output.height()}, error)) {
+        return false;
+    }
+
+    // Resolution changes are useful diagnostics without a message on every displayed frame.
+    if (resized) {
+        log::info(
+            "{} temporal upscaling: {}x{} to {}x{}",
+            g_active_upscaler.load(std::memory_order_relaxed),
+            size[0],
+            size[1],
+            output.width(),
+            output.height()
+        );
+    }
+
+    return true;
+}
+
+bool Fsr3::State::prepare_camera(TemporalFrame frame, float sharpness, std::string& error) {
+    const std::array<int, 2> size{world.width(), world.height()};
+    camera = frame.input.camera;
+    dispatch.reset = !valid || level != frame.level || camera_cut(camera, old_camera);
+    level = frame.level;
+    const auto now = std::chrono::steady_clock::now();
+    const float elapsed = std::chrono::duration<float, std::milli>(now - last_time).count();
+    dispatch.milliseconds = valid ? std::clamp(elapsed, 1.0f, 250.0f) : 16.666667f;
+    last_time = now;
+    dispatch.sharpness = std::clamp(sharpness, 0.0f, 1.0f);
+    dispatch.vertical_fov = 2 * std::atan(1 / camera.projection[5]);
+    // The near plane the projection was made with, when a game moved it out from the window's 0.05
+    // (GameProfile::depth_near; perspective_reversed: [10] is (f + n) / (f - n), [14] 2 f n / (f - n)).
+    const float p10 = camera.projection[10], p14 = camera.projection[14];
+    const float near_plane = p14 > 0.0f && p10 > 1.0f ? p14 / (p10 + 1.0f) : 0.0f;
+    dispatch.near_plane = near_plane > 0.05f * 1.01f ? near_plane : 0.05f;
+    // Without an upscaler nothing gathers jittered frames: the camera stays still.
+    if (plain) {
+        dispatch.jitter = {0.0f, 0.0f};
+    } else {
+        const int phases = ffxFsr3UpscalerGetJitterPhaseCount(size[0], frame.display.width());
+        ffxFsr3UpscalerGetJitterOffset(
+            &dispatch.jitter[0], &dispatch.jitter[1], jitter_index, phases
+        );
+        jitter_index = (jitter_index + 1) % phases;
+    }
+    renderer::Mat4 offset = renderer::identity();
+    offset[12] = 2 * dispatch.jitter[0] / static_cast<float>(size[0]);
+    offset[13] = 2 * dispatch.jitter[1] / static_cast<float>(size[1]);
+    frame.input.camera.projection = renderer::multiply(offset, camera.projection);
+    view.raster = renderer::multiply(frame.input.camera.projection, camera.view);
+
+    // Restore the original camera if its projection cannot be inverted.
+    if (!fsr3_detail::invert(view.raster, inverse_raster)) {
+        frame.input.camera = camera;
+        error = "invalid temporal camera projection";
+        return false;
+    }
+
+    view.current = renderer::multiply(camera.projection, camera.view);
+    view.previous =
+        dispatch.reset ? view.current : renderer::multiply(old_camera.projection, old_camera.view);
+    view.size = size;
+    return true;
+}
+
+void Fsr3::State::attach_frame(TemporalFrame frame, std::array<int, 2> size) {
+    scene = &frame.scene;
+    textures = &frame.textures;
+    display = frame.target;
+    has_opaque = false;
+    finish_colour = std::move(frame.finish_colour);
+    frame.target.framebuffer = world.id();
+    frame.target.width = size[0];
+    frame.target.height = size[1];
+    frame.target.depth_texture = world.depth_texture();
+    frame.target.resolve_framebuffer = 0;
+    frame.target.resolves_itself = false;
+    frame.input.on_before_particles = [this](const auto& target) {
+        capture_opaque(target);
+    };
+    frame.input.on_resolve_world = [this](auto& target) {
+        resolve(target);
+    };
+    frame.input.prepares_temporal_chain = display.framebuffer != 0;
+    auto before_hud = std::move(frame.input.before_hud);
+    frame.input.before_hud = [this, before_hud = std::move(before_hud)] {
+        // The renderer clears the display depth immediately after temporal resolve.
+        // Reinstall world depth before the late packets and preserve the caller's hook.
+        restore_world_depth();
+        if (before_hud) {
+            before_hud();
+        }
+    };
+}
+
+bool Fsr3::begin(
+    TemporalFrame frame, renderer::TemporalQuality quality, float sharpness, std::string& error
+) {
+    State& state = *m_state;
+
+    // Motion blur with temporal upscaling off: its motion is drawn, no upscaler runs.
+    const bool blur_only = quality == renderer::TemporalQuality::Off && frame.motion_blur
+                           && frame.motion_blur_strength > 0;
+    if (blur_only) {
+        quality = renderer::TemporalQuality::NativeAA;
+    }
+    state.plain_wanted = blur_only || (!kFsrAllowed && !state.asr_possible());
+    state.blur_strength = frame.motion_blur ? frame.motion_blur_strength : 0.0f;
+    state.blur_settings = frame.blur_settings;
+    state.blur_mode_changed = state.camera_blur != frame.camera_motion_blur;
+    state.camera_blur = frame.camera_motion_blur;
+
+    // Unsupported or failed modes retain native rendering without per-frame retries.
+    if (quality == renderer::TemporalQuality::Off || state.failed || !available()) {
+        return false;
+    }
+
+    // Minimized windows and invalid settings cannot form a temporal frame.
+    if (frame.target.width <= 0 || frame.target.height <= 0
+        || quality >= renderer::TemporalQuality::Count || !std::isfinite(sharpness)) {
+        error = "invalid temporal output or sharpening setting";
+        return false;
+    }
+
+    // Without an upscaler the world is drawn at the picture's own size.
+    const auto size = fsr3_detail::render_extent(
+        {frame.display.width(), frame.display.height()},
+        state.plain_wanted ? renderer::TemporalQuality::NativeAA : quality
+    );
+
+    state.scene = &frame.scene;
+    // A failed setup cannot install callbacks or leave a jittered native fallback.
+    if (!state.configure(frame.display, size, error)
+        || !state.prepare_camera(frame, sharpness, error)) {
+        state.failed = true;
+        return false;
+    }
+
+    state.attach_frame(frame, size);
+    return true;
+}
+
+void Fsr3::reset() {
+    // Switching away from a failed mode retires it, allowing an explicit later retry.
+    if (m_state->failed) {
+        release();
+    }
+
+    m_state->valid = false;
+}
+
+void Fsr3::release() {
+    auto& state = *m_state;
+    state.finish_colour = {};
+    state.sdk.release();
+    state.asr.release();
+    state.use_asr = false;
+    state.blur.release();
+    state.motion.release();
+    state.depth.release();
+    state.reactive.release();
+    state.opaque.release();
+    state.world.release();
+    state.camera_motion.release();
+    state.object_motion.release();
+    state.reactive_mask.release();
+    state.late_world_depth.release();
+    if (state.vao) {
+        glDeleteVertexArrays(1, &state.vao);
+    }
+    state.previous_palette.release();
+    state.vao = 0;
+    state.output_texture = 0;
+    state.valid = false;
+    state.failed = false;
+    state.previous.clear();
+}
+}  // namespace openrac::enhanced

@@ -1,0 +1,372 @@
+#version 430 core
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// GPU SAH-BVH ray-tracing compute pass for Enhanced Graphics RTX (shadows, AO, GI, reflections).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 14) writeonly buffer RtxOutputBuffer {
+    uint rtx_pairs[];
+};
+
+uniform samplerBuffer rtx_bvh_nodes;
+uniform samplerBuffer rtx_triangles;
+uniform sampler2D rtx_depth;
+uniform mat4 rtx_projection;
+uniform mat4 rtx_view;
+uniform vec3 rtx_camera_pos;
+uniform vec3 rtx_sun_dir;
+uniform vec3 rtx_sun_colour;
+uniform vec3 rtx_sky_colour;
+uniform int rtx_node_count;
+uniform int rtx_samples_per_pixel;
+uniform int rtx_flags;  // bit0: shadows, bit1: ao, bit2: reflections, bit3: gi
+uniform int rtx_frame_index;
+uniform int rtx_debug_view;
+uniform float rtx_ray_distance;
+uniform float rtx_ao_radius;
+uniform float rtx_shadow_softness;
+uniform float rtx_gi_strength;
+uniform float rtx_roughness_cutoff;
+
+const float kEarlyGiLogRange = 12.0;
+const float kEarlyGiMax = 16.0;
+
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rand01(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed & 0x00FFFFFFu) * (1.0 / 16777216.0);
+}
+
+void make_basis(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float d = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * d, -s * n.x);
+    b = vec3(d, s + n.y * n.y * a, -n.y);
+}
+
+vec3 sample_cosine_hemisphere(vec3 n, float u1, float u2) {
+    float r = sqrt(u1);
+    float phi = 6.28318530718 * u2;
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(max(0.0, 1.0 - u1));
+    vec3 t, b;
+    make_basis(n, t, b);
+    return normalize(t * x + b * y + n * z);
+}
+
+vec3 unpack_rgb8(uint packed) {
+    return vec3(
+        float(packed & 0xFFu),
+        float((packed >> 8u) & 0xFFu),
+        float((packed >> 16u) & 0xFFu)
+    ) * (1.0 / 255.0);
+}
+
+vec3 encode_early_gi(vec3 gi) {
+    if (all(lessThanEqual(gi, vec3(0.0)))) {
+        return vec3(0.0);
+    }
+    return clamp(
+        (log2(max(gi, vec3(1e-6))) + (kEarlyGiLogRange - log2(kEarlyGiMax))) / kEarlyGiLogRange,
+        0.0,
+        1.0
+    );
+}
+
+vec3 heatmap_colour(float t) {
+    float x = clamp(t, 0.0, 1.0);
+    vec3 c0 = vec3(0.10, 0.20, 0.85);
+    vec3 c1 = vec3(0.05, 0.80, 0.70);
+    vec3 c2 = vec3(0.95, 0.85, 0.15);
+    vec3 c3 = vec3(0.95, 0.15, 0.10);
+    if (x < 0.33) {
+        return mix(c0, c1, x / 0.33);
+    }
+    if (x < 0.66) {
+        return mix(c1, c2, (x - 0.33) / 0.33);
+    }
+    return mix(c2, c3, (x - 0.66) / 0.34);
+}
+
+float view_distance(float depth) {
+    return rtx_projection[3][2] / (depth * 2.0 + (rtx_projection[2][2] - 1.0));
+}
+
+vec3 reconstruct_view(ivec2 pixel, float distance, ivec2 extent) {
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(extent) * 2.0 - 1.0;
+    vec2 scale = vec2(rtx_projection[0][0], rtx_projection[1][1]);
+    return vec3((ndc + rtx_projection[2].xy) / scale, -1.0) * distance;
+}
+
+bool intersect_aabb(vec3 origin, vec3 inv_dir, float t_min, float t_max, vec3 bmin, vec3 bmax) {
+    vec3 t0 = (bmin - origin) * inv_dir;
+    vec3 t1 = (bmax - origin) * inv_dir;
+    vec3 tsmaller = min(t0, t1);
+    vec3 tbigger = max(t0, t1);
+    float tmin = max(t_min, max(tsmaller.x, max(tsmaller.y, tsmaller.z)));
+    float tmax = min(t_max, min(tbigger.x, min(tbigger.y, tbigger.z)));
+    return tmax >= tmin;
+}
+
+bool trace_bvh(
+    vec3 origin,
+    vec3 dir,
+    float t_min,
+    float t_max,
+    bool any_hit,
+    out float hit_t,
+    out vec3 hit_normal,
+    out vec3 hit_albedo,
+    out int steps
+) {
+    hit_t = t_max;
+    hit_normal = vec3(0.0, 0.0, 1.0);
+    hit_albedo = vec3(0.5);
+    steps = 0;
+    if (rtx_node_count <= 0) {
+        return false;
+    }
+
+    vec3 safe_dir = vec3(
+        abs(dir.x) > 1e-8 ? dir.x : (dir.x >= 0.0 ? 1e-8 : -1e-8),
+        abs(dir.y) > 1e-8 ? dir.y : (dir.y >= 0.0 ? 1e-8 : -1e-8),
+        abs(dir.z) > 1e-8 ? dir.z : (dir.z >= 0.0 ? 1e-8 : -1e-8)
+    );
+    vec3 inv_dir = 1.0 / safe_dir;
+
+    int stack[48];
+    int sp = 0;
+    stack[sp++] = 0;
+    bool found = false;
+
+    while (sp > 0 && steps < 256) {
+        ++steps;
+        int idx = stack[--sp];
+        vec4 node_min_left = texelFetch(rtx_bvh_nodes, idx * 2 + 0);
+        vec4 node_max_count = texelFetch(rtx_bvh_nodes, idx * 2 + 1);
+        if (!intersect_aabb(origin, inv_dir, t_min, hit_t, node_min_left.xyz, node_max_count.xyz)) {
+            continue;
+        }
+        int left_or_first = floatBitsToInt(node_min_left.w);
+        int count = floatBitsToInt(node_max_count.w);
+        if (count > 0) {
+            int first = ~left_or_first;
+            for (int i = 0; i < count; ++i) {
+                int tri_base = (first + i) * 4;
+                vec4 tri_v0_mat = texelFetch(rtx_triangles, tri_base + 0);
+                vec4 tri_e1_layer = texelFetch(rtx_triangles, tri_base + 1);
+                vec4 tri_e2_flags = texelFetch(rtx_triangles, tri_base + 2);
+                vec3 e1 = tri_e1_layer.xyz;
+                vec3 e2 = tri_e2_flags.xyz;
+                vec3 pvec = cross(dir, e2);
+                float det = dot(e1, pvec);
+                if (abs(det) < 1e-8) {
+                    continue;
+                }
+                float inv_det = 1.0 / det;
+                vec3 tvec = origin - tri_v0_mat.xyz;
+                float u = dot(tvec, pvec) * inv_det;
+                if (u < 0.0 || u > 1.0) {
+                    continue;
+                }
+                vec3 qvec = cross(tvec, e1);
+                float v = dot(dir, qvec) * inv_det;
+                if (v < 0.0 || u + v > 1.0) {
+                    continue;
+                }
+                float t = dot(e2, qvec) * inv_det;
+                if (t >= t_min && t < hit_t) {
+                    vec4 tri_normal_albedo = texelFetch(rtx_triangles, tri_base + 3);
+                    hit_t = t;
+                    hit_normal = tri_normal_albedo.xyz;
+                    hit_albedo = unpack_rgb8(floatBitsToUint(tri_normal_albedo.w));
+                    found = true;
+                    if (any_hit) {
+                        return true;
+                    }
+                }
+            }
+        } else if (sp + 2 <= 48) {
+            stack[sp++] = left_or_first + 1;
+            stack[sp++] = left_or_first;
+        }
+    }
+    return found;
+}
+
+void main() {
+    ivec2 extent = textureSize(rtx_depth, 0);
+    ivec2 cells = (extent + 1) / 2;
+    ivec2 cell_xy = ivec2(gl_GlobalInvocationID.xy);
+    if (cell_xy.x >= cells.x || cell_xy.y >= cells.y) {
+        return;
+    }
+    int cell = cell_xy.y * cells.x + cell_xy.x;
+    ivec2 base = cell_xy * 2;
+    int pick = (cell_xy.x + cell_xy.y) & 3;
+    ivec2 tap = min(base + ivec2(pick & 1, pick >> 1), extent - 1);
+    float depth = texelFetch(rtx_depth, tap, 0).r;
+    if (depth <= 0.0) {
+        for (int i = 0; i < 4 && depth <= 0.0; ++i) {
+            ivec2 candidate = min(base + ivec2(i & 1, i >> 1), extent - 1);
+            depth = texelFetch(rtx_depth, candidate, 0).r;
+            if (depth > 0.0) {
+                tap = candidate;
+            }
+        }
+    }
+    if (depth <= 0.0) {
+        rtx_pairs[cell * 2 + 0] = 0xFF000000u;
+        rtx_pairs[cell * 2 + 1] = 0u;
+        return;
+    }
+
+    float view_depth = view_distance(depth);
+    vec3 center = reconstruct_view(tap, view_depth, extent);
+    vec3 view_normal = smooth_normal_at(tap, -center);
+    mat3 inverse_view = transpose(mat3(rtx_view));
+    vec3 world = inverse_view * (center - rtx_view[3].xyz);
+    vec3 N = normalize(inverse_view * view_normal);
+    vec3 origin = world + N * 0.03;
+
+    uint seed = pcg_hash(uint(cell) ^ (uint(rtx_frame_index) * 1664525u + 1013904223u));
+    int spp = clamp(rtx_samples_per_pixel, 1, 8);
+    vec3 to_sun = normalize(-rtx_sun_dir);
+    int total_steps = 0;
+
+    // 1. Hardware/BVH ray-traced soft sun shadows.
+    float shadow_vis = 1.0;
+    if ((rtx_flags & 1) != 0) {
+        float ndotl = dot(N, to_sun);
+        if (ndotl > 0.0) {
+            vec3 st, sb;
+            make_basis(to_sun, st, sb);
+            int unoccluded = 0;
+            for (int s = 0; s < spp; ++s) {
+                float u1 = rand01(seed);
+                float u2 = rand01(seed);
+                float r = sqrt(u1) * rtx_shadow_softness;
+                float phi = 6.28318530718 * u2;
+                vec3 dir = normalize(to_sun + (st * cos(phi) + sb * sin(phi)) * r);
+                float ht;
+                vec3 hn, ha;
+                int stp;
+                if (!trace_bvh(origin, dir, 0.025, rtx_ray_distance, true, ht, hn, ha, stp)) {
+                    unoccluded++;
+                }
+                total_steps += stp;
+            }
+            shadow_vis = float(unoccluded) / float(spp);
+        } else {
+            shadow_vis = 0.0;
+        }
+    }
+
+    // 2. Ray-traced ambient occlusion & 1-bounce indirect diffuse GI.
+    float ao_vis = 1.0;
+    vec3 gi_radiance = vec3(0.0);
+    if ((rtx_flags & 10) != 0) {
+        int ao_hits = 0;
+        for (int s = 0; s < spp; ++s) {
+            vec3 dir = sample_cosine_hemisphere(N, rand01(seed), rand01(seed));
+            float max_t = ((rtx_flags & 8) != 0) ? rtx_ray_distance : rtx_ao_radius;
+            float ht;
+            vec3 hn, ha;
+            int stp;
+            if (trace_bvh(origin, dir, 0.025, max_t, false, ht, hn, ha, stp)) {
+                if (ht <= rtx_ao_radius) {
+                    ao_hits++;
+                }
+                if ((rtx_flags & 8) != 0) {
+                    if (dot(hn, dir) > 0.0) {
+                        hn = -hn;
+                    }
+                    vec3 hit_p = origin + dir * ht + hn * 0.03;
+                    float sun_ndotl = max(0.0, dot(hn, to_sun));
+                    float hit_sun = 0.0;
+                    if (sun_ndotl > 0.0) {
+                        float sht;
+                        vec3 shn, sha;
+                        int sstp;
+                        if (!trace_bvh(hit_p, to_sun, 0.025, rtx_ray_distance, true, sht, shn, sha, sstp)) {
+                            hit_sun = sun_ndotl;
+                        }
+                    }
+                    gi_radiance += ha * (rtx_sun_colour * hit_sun + rtx_sky_colour * 0.25);
+                }
+            } else if ((rtx_flags & 8) != 0) {
+                gi_radiance += rtx_sky_colour * max(0.2, 0.5 + 0.5 * dir.z);
+            }
+            total_steps += stp;
+        }
+        if ((rtx_flags & 2) != 0) {
+            ao_vis = 1.0 - (float(ao_hits) / float(spp));
+        }
+        if ((rtx_flags & 8) != 0) {
+            gi_radiance = (gi_radiance / float(spp)) * rtx_gi_strength;
+        }
+    }
+
+    // 3. Ray-traced specular reflections (with glossy roughness cone filtering).
+    vec3 refl_radiance = vec3(0.0);
+    float refl_confidence = 0.0;
+    if ((rtx_flags & 4) != 0 && rtx_roughness_cutoff > 0.05) {
+        vec3 V = normalize(world - rtx_camera_pos);
+        vec3 R = reflect(V, N);
+        float cone_spread = clamp((1.0 - rtx_roughness_cutoff) * 0.12, 0.0, 0.12);
+        if (cone_spread > 0.001) {
+            vec3 lobe = sample_cosine_hemisphere(R, rand01(seed) * cone_spread, rand01(seed));
+            R = normalize(mix(R, lobe, cone_spread));
+        }
+        if (dot(R, N) > 0.01) {
+            float ht;
+            vec3 hn, ha;
+            int stp;
+            if (trace_bvh(origin, R, 0.03, rtx_ray_distance, false, ht, hn, ha, stp)) {
+                if (dot(hn, R) > 0.0) {
+                    hn = -hn;
+                }
+                vec3 hit_p = origin + R * ht + hn * 0.03;
+                float sun_ndotl = max(0.0, dot(hn, to_sun));
+                float hit_sun = 0.0;
+                if (sun_ndotl > 0.0) {
+                    float sht;
+                    vec3 shn, sha;
+                    int sstp;
+                    if (!trace_bvh(hit_p, to_sun, 0.025, rtx_ray_distance, true, sht, shn, sha, sstp)) {
+                        hit_sun = sun_ndotl;
+                    }
+                    total_steps += sstp;
+                }
+                refl_radiance = ha * (rtx_sun_colour * hit_sun + rtx_sky_colour * 0.35);
+                refl_confidence =
+                    clamp(1.0 - ht / rtx_ray_distance, 0.15, 1.0) * clamp(rtx_roughness_cutoff, 0.1, 1.0);
+            } else {
+                refl_radiance = rtx_sky_colour * max(0.25, 0.5 + 0.5 * R.z);
+                refl_confidence = 0.5 * clamp(rtx_roughness_cutoff, 0.1, 1.0);
+            }
+            total_steps += stp;
+        }
+    }
+
+    vec3 encoded_gi = encode_early_gi(gi_radiance);
+    float vis_alpha = shadow_vis * ao_vis;
+    if (rtx_debug_view == 1) {
+        vis_alpha = shadow_vis;
+    } else if (rtx_debug_view == 2) {
+        vis_alpha = ao_vis;
+    } else if (rtx_debug_view == 5) {
+        encoded_gi = heatmap_colour(float(total_steps) / 64.0);
+        vis_alpha = 1.0;
+    }
+    rtx_pairs[cell * 2 + 0] = packUnorm4x8(vec4(encoded_gi, vis_alpha));
+    rtx_pairs[cell * 2 + 1] = packUnorm4x8(vec4(clamp(refl_radiance, 0.0, 1.0), refl_confidence));
+}

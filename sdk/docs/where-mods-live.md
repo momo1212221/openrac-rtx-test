@@ -1,0 +1,74 @@
+# Where mods live
+
+Everything is in the player's own folders, never in the launcher's (which is
+read-only when installed: an AppImage, the macOS app, the Windows installer's
+folder). The launcher keeps its games in an **install folder**, shown in its
+Settings; by default:
+
+| System | Install folder | A game's mods |
+|---|---|---|
+| Linux | `~/OpenRAC` | `~/OpenRAC/active/rac1/data/plugins/` |
+| macOS | `~/OpenRAC` | `~/OpenRAC/active/rac1/data/plugins/` |
+| Windows | `%USERPROFILE%\OpenRAC` | `%USERPROFILE%\OpenRAC\active\rac1\data\plugins\` |
+
+(If that folder cannot be made, the launcher's own data folder:
+`~/.local/share/dev.openrac.launcher`, `~/Library/Application
+Support/dev.openrac.launcher`, `%LOCALAPPDATA%\dev.openrac.launcher`.)
+
+## Inside `plugins/`
+
+```
+plugins/
+├── plugins.json     the mods' order, which are on, their settings (the launcher writes it)
+├── status.json      what the game did with each mod at its last start (the game writes it)
+├── sources.json     where mods installed from a link came from, for updates
+└── <id>/            one mod, as installed: openrac-mod.json, scripts or lib/<platform>/...
+```
+
+`plugins.json`:
+
+```json
+{
+  "format": 1,
+  "mods": [
+    { "id": "lock-strafe", "enabled": true, "settings": { "mode": "lock" } },
+    { "id": "button-swap", "enabled": false, "settings": {} }
+  ]
+}
+```
+
+The order of `mods` is the load order ([hooks](hooks.md)). A folder that is not
+listed shows in the launcher, off.
+
+## How the game finds them
+
+The launcher starts the game with `--data <the game's data folder>` and
+`--plugins <data>/plugins/plugins.json`, or `--no-mods` in purist mode. Neither
+side guesses a path. Run by hand without `--plugins`, the game reads
+`<data>/plugins/plugins.json`.
+
+## Without the launcher
+
+Copy your mod's folder to `plugins/<id>/` and add it to `plugins.json`. This is
+also the quickest way to try a change: edit the files in place and restart the
+game.
+
+## Android
+
+The game runs inside the app there, and Android does not let an app load code it
+wrote itself, so native mods are not loaded on Android. Script mods are.
+
+## A mod's own files
+
+A native mod keeps its own files (a seed, a list of games played) in the folder
+`data_dir` gives it (interface 1.11): `mod-data/<id>/` in OpenRAC's data folder,
+beside the memory cards (`~/.local/share/openrac`, `~/Library/Application
+Support/OpenRAC`, `%LOCALAPPDATA%\openrac`). The game makes it on the first ask
+and never removes it; updating or removing the mod leaves it in place.
+
+Ask `data_dir` for this folder; do not work out a path of your own from `HOME`
+or `XDG_DATA_HOME`. On Android only `data_dir` is a folder the player can
+reach: the Files app shows it as **OpenRAC > Mod files > `<id>`**
+(`files/share/openrac/mod-data/<id>` in the app's storage), where a log or a
+spoiler file can be opened, copied or shared. A folder the mod makes anywhere
+else in the app's storage is hidden from the player.

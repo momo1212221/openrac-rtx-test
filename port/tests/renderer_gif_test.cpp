@@ -1,0 +1,653 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// The direct renderer's CPU half: GIF packets in, triangles and draw groups
+// out. Synthetic packets, laid out the way the game's 2D code builds them.
+
+#include <cfenv>
+#include <cmath>
+#include <cstdio>
+#include <utility>
+
+#include "check.h"
+#include "renderer/direct.h"
+#include "renderer/effects.h"
+#include "renderer_gif_builder.h"
+
+namespace {
+
+using namespace openrac::renderer;
+using openrac::test::GifBuilder;
+using openrac::test::prim;
+using openrac::test::rgbaq;
+using openrac::test::xyz2;
+
+bool near(float a, float b) {
+    return std::fabs(a - b) < 1e-4f;
+}
+
+void sprite() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    b
+        .ad({{gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false)},
+             {gs::kRgbaq, rgbaq(0xFF, 0, 0, 0x80)},
+             {gs::kXyz2, xyz2(0, 0, 100)},
+             {gs::kXyz2, xyz2(256, 224, 100)}},
+            true);
+    CHECK(gif.gif(b.bytes));
+    CHECK(gif.vertices().size() == 6);
+    CHECK(gif.draws().size() == 1);
+    // At their own positions: the shader moves them on by a fraction of the target's pixel (the
+    // chip samples pixels at their integer coordinates, GL at their centres).
+    const DirectVertex& first = gif.vertices()[0];
+    CHECK(near(first.x, -1.0f) && near(first.y, 1.0f));  // the top left corner
+    const DirectVertex& last = gif.vertices()[4];
+    CHECK(near(last.x, 0.0f) && near(last.y, 0.0f));  // the centre of the screen
+    CHECK(first.rgba[0] == 0xFF && first.rgba[3] == 0x80);
+    // Depth: 100 of a 24-bit buffer.
+    CHECK(near(first.z, static_cast<float>(100.0 / 16777215.0 * 2.0 - 1.0)));
+}
+
+// Between kWholeMarker's two markers the draws are the whole target's (a picture's backdrop); the
+// draw after the closing one is the picture's again, and the marker draws nothing itself.
+void whole_target_marker() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    auto square = [](GifBuilder& to, std::uint8_t red, bool eop = false) {
+        to
+            .ad({{gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false)},
+                 {gs::kRgbaq, rgbaq(red, 0, 0, 0x80)},
+                 {gs::kXyz2, xyz2(0, 0, 0)},
+                 {gs::kXyz2, xyz2(64, 64, 0)}},
+                eop);
+    };
+    constexpr std::uint8_t kNop = 0x7F;
+    square(b, 1);
+    b.ad({{kNop, GifInterpreter::kWholeMarker << 48 | 1}});
+    square(b, 2);
+    b.ad({{kNop, GifInterpreter::kWholeMarker << 48}});
+    square(b, 3, true);
+    CHECK(gif.gif(b.bytes));
+    CHECK(gif.vertices().size() == 18);
+    CHECK(gif.draws().size() == 3);
+    if (gif.draws().size() == 3) {
+        CHECK(!gif.draws()[0].state.whole);
+        CHECK(gif.draws()[1].state.whole);
+        CHECK(!gif.draws()[2].state.whole);
+    }
+    // A new frame starts outside any pair.
+    gif.clear();
+    GifBuilder c;
+    c.ad({{kNop, GifInterpreter::kWholeMarker << 48 | 1}}, true);
+    CHECK(gif.gif(c.bytes));
+    gif.clear();
+    GifBuilder d;
+    square(d, 4, true);
+    CHECK(gif.gif(d.bytes));
+    CHECK(gif.draws().size() == 1 && !gif.draws()[0].state.whole);
+}
+
+void strips_and_kicks() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    // A Gouraud strip of four vertices: two triangles.
+    b.ad(
+        {{gs::kPrim, prim(gs::PrimKind::TriangleStrip, true, false, false)},
+         {gs::kRgbaq, rgbaq(10, 0, 0, 0x80)},
+         {gs::kXyz2, xyz2(0, 0, 0)},
+         {gs::kRgbaq, rgbaq(20, 0, 0, 0x80)},
+         {gs::kXyz2, xyz2(10, 0, 0)},
+         {gs::kRgbaq, rgbaq(30, 0, 0, 0x80)},
+         {gs::kXyz2, xyz2(0, 10, 0)},
+         {gs::kRgbaq, rgbaq(40, 0, 0, 0x80)},
+         {gs::kXyz2, xyz2(10, 10, 0)}}
+    );
+    CHECK(gif.gif(b.bytes));
+    CHECK(gif.vertices().size() == 6);
+    CHECK(gif.vertices()[0].rgba[0] == 10);
+    CHECK(gif.vertices()[5].rgba[0] == 40);
+    gif.clear();
+
+    // XYZ3 moves the strip along without drawing; flat shading takes the
+    // last vertex's colour.
+    GifBuilder c;
+    c.ad(
+        {{gs::kPrim, prim(gs::PrimKind::TriangleStrip, false, false, false)},
+         {gs::kRgbaq, rgbaq(1, 0, 0, 0x80)},
+         {gs::kXyz2, xyz2(0, 0, 0)},
+         {gs::kXyz2, xyz2(10, 0, 0)},
+         {gs::kXyz3, xyz2(0, 10, 0)},
+         {gs::kRgbaq, rgbaq(9, 0, 0, 0x80)},
+         {gs::kXyz2, xyz2(10, 10, 0)}}
+    );
+    CHECK(gif.gif(c.bytes));
+    CHECK(gif.vertices().size() == 3);
+    CHECK(gif.vertices()[0].rgba[0] == 9);
+    gif.clear();
+
+    // A fan of five vertices: three triangles around the first.
+    GifBuilder d;
+    d.ad(
+        {{gs::kPrim, prim(gs::PrimKind::TriangleFan, true, false, false)},
+         {gs::kXyz2, xyz2(50, 50, 0)},
+         {gs::kXyz2, xyz2(60, 50, 0)},
+         {gs::kXyz2, xyz2(60, 60, 0)},
+         {gs::kXyz2, xyz2(50, 60, 0)},
+         {gs::kXyz2, xyz2(40, 60, 0)}}
+    );
+    CHECK(gif.gif(d.bytes));
+    CHECK(gif.vertices().size() == 9);
+    CHECK(near(gif.vertices()[6].x, gif.vertices()[0].x));  // every triangle starts at the pivot
+    gif.clear();
+
+    // A PRIM write in the middle drops the vertices queued before it.
+    GifBuilder e;
+    e.ad(
+        {{gs::kPrim, prim(gs::PrimKind::Triangle, true, false, false)},
+         {gs::kXyz2, xyz2(0, 0, 0)},
+         {gs::kXyz2, xyz2(1, 0, 0)},
+         {gs::kPrim, prim(gs::PrimKind::Triangle, true, false, false)},
+         {gs::kXyz2, xyz2(0, 1, 0)}}
+    );
+    CHECK(gif.gif(e.bytes));
+    CHECK(gif.vertices().empty());
+    // Lines and points become quads.
+    GifBuilder f;
+    f.ad(
+        {{gs::kPrim, prim(gs::PrimKind::Line, true, false, false)},
+         {gs::kXyz2, xyz2(0, 0, 0)},
+         {gs::kXyz2, xyz2(100, 0, 0)},
+         {gs::kPrim, prim(gs::PrimKind::Point, true, false, false)},
+         {gs::kXyz2, xyz2(5, 5, 0)}}
+    );
+    CHECK(gif.gif(f.bytes));
+    CHECK(gif.vertices().size() == 12);
+}
+
+void packed_and_reglist() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    // PACKED with PRE: PRIM from the tag; RGBAQ, then XYZ2 twice per loop.
+    const std::uint64_t regs = gs::kPackedRgbaq | (gs::kPackedXyz2 << 4);
+    b.tag(
+        2,
+        false,
+        gs::GifTag::kPacked,
+        2,
+        regs,
+        true,
+        static_cast<std::uint32_t>(prim(gs::PrimKind::Sprite, false, false, false))
+    );
+    b.qword(0x11 | (std::uint64_t{0x22} << 32), 0x33 | (std::uint64_t{0x80} << 32));
+    b.qword(
+        static_cast<std::uint64_t>((2048 - 256) * 16)
+            | (static_cast<std::uint64_t>((2048 - 224) * 16) << 32),
+        5
+    );
+    b.qword(0x11 | (std::uint64_t{0x22} << 32), 0x33 | (std::uint64_t{0x80} << 32));
+    b.qword(
+        static_cast<std::uint64_t>((2048 - 256 + 8) * 16)
+            | (static_cast<std::uint64_t>((2048 - 224 + 8) * 16) << 32),
+        5
+    );
+    CHECK(gif.gif(b.bytes));
+    CHECK(gif.vertices().size() == 6);
+    CHECK(
+        gif.vertices()[0].rgba[0] == 0x11 && gif.vertices()[0].rgba[1] == 0x22
+        && gif.vertices()[0].rgba[2] == 0x33
+    );
+    gif.clear();
+
+    // REGLIST: 64-bit register values, padded to a quadword.
+    GifBuilder r;
+    r.tag(1, true, gs::GifTag::kReglist, 3, gs::kPrim | (gs::kXyz2 << 4) | (gs::kXyz2 << 8));
+    std::uint64_t words[4] =
+        {prim(gs::PrimKind::Sprite, false, false, false), xyz2(0, 0, 0), xyz2(4, 4, 0), 0};
+    r.qword(words[0], words[1]);
+    r.qword(words[2], words[3]);
+    CHECK(gif.gif(r.bytes));
+    CHECK(gif.vertices().size() == 6);
+
+    // A register payload can span raw GIF transfers. Nothing is drawn until
+    // the rest arrives, and then the sprite is emitted exactly once.
+    gif.clear();
+    GifBuilder first;
+    first.tag(3, true, gs::GifTag::kPacked, 1, gs::kPackedAd);
+    first.qword(prim(gs::PrimKind::Sprite, false, false, false), gs::kPrim);
+    CHECK(gif.gif(first.bytes));
+    CHECK(gif.vertices().empty());
+    CHECK(gif.error().empty());
+    GifBuilder rest;
+    rest.qword(xyz2(0, 0, 0), gs::kXyz2);
+    rest.qword(xyz2(4, 4, 0), gs::kXyz2);
+    CHECK(gif.gif(rest.bytes));
+    CHECK(gif.vertices().size() == 6);
+    CHECK(gif.error().empty());
+
+    // A transfer ending inside the tag itself is still malformed.
+    gif.clear();
+    first.bytes.resize(8);
+    CHECK(!gif.gif(first.bytes));
+    CHECK(!gif.error().empty());
+}
+
+void draw_groups() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    const std::uint64_t sprite = prim(gs::PrimKind::Sprite, false, false, false);
+    b.ad(
+        {{gs::kPrim, sprite},
+         {gs::kXyz2, xyz2(0, 0, 0)},
+         {gs::kXyz2, xyz2(4, 4, 0)},
+         // Same state: merged into the first draw.
+         {gs::kPrim, sprite},
+         {gs::kXyz2, xyz2(8, 0, 0)},
+         {gs::kXyz2, xyz2(12, 4, 0)},
+         // Blending on: a new draw.
+         {gs::kAlpha1, openrac::test::alpha_reg(0, 1, 0, 1)},
+         {gs::kPrim, prim(gs::PrimKind::Sprite, false, false, true)},
+         {gs::kXyz2, xyz2(0, 8, 0)},
+         {gs::kXyz2, xyz2(4, 12, 0)},
+         // A new scissor: another.
+         {gs::kScissor1, openrac::test::scissor(0, 100, 0, 100)},
+         {gs::kXyz2, xyz2(0, 16, 0)},
+         {gs::kXyz2, xyz2(4, 20, 0)},
+         // Context 2 has its own (default) registers.
+         {gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false, false, true)},
+         {gs::kXyz2, xyz2(0, 24, 0)},
+         {gs::kXyz2, xyz2(4, 28, 0)}}
+    );
+    CHECK(gif.gif(b.bytes));
+    CHECK(gif.draws().size() == 4);
+    CHECK(gif.draws()[0].count == 12);
+    CHECK(gif.draws()[1].state.blend);
+    CHECK(gif.draws()[2].state.scissor.x1 == 100);
+    CHECK(gif.draws()[3].state.scissor.x1 == 511);
+    CHECK(!gif.draws()[3].state.blend);
+}
+
+// The chip fills a pixel only when its sample point, its integer coordinates, is inside the
+// primitive and the scissor; a primitive between two samples draws nothing. Drawn bigger than the
+// chip's picture, GL would fill the window pixels there: the HUD's air meter slid off the screen's
+// right edge (from 511.5, the game's half-pixel offset) left a line in the last column.
+void no_sample_no_pixel() {
+    TexturePool textures;
+    const std::uint64_t sprite = prim(gs::PrimKind::Sprite, false, false, false);
+    auto vertices = [&](std::initializer_list<GifBuilder::Write> writes, float picture = 1.0f, bool wide = false) {
+        GifInterpreter gif(textures);
+        gif.set_picture(picture, wide);
+        GifBuilder b;
+        b.ad(writes, true);
+        CHECK(gif.gif(b.bytes));
+        return gif.vertices().size();
+    };
+    // Past the last column (511): sample 512 on is out of the scissor.
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(511.5, 100, 0)}, {gs::kXyz2, xyz2(553.5, 292, 0)}}) == 0);
+    // Half a pixel further in it covers column 511.
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(510.5, 100, 0)}, {gs::kXyz2, xyz2(552.5, 292, 0)}}) == 6);
+    // The same rectangle as a textured strip (the meter's picture), two triangles.
+    const std::uint64_t strip = prim(gs::PrimKind::TriangleStrip, false, false, false);
+    CHECK(vertices({{gs::kPrim, strip},
+                    {gs::kXyz2, xyz2(511.5, 100, 0)},
+                    {gs::kXyz2, xyz2(553.5, 100, 0)},
+                    {gs::kXyz2, xyz2(511.5, 292, 0)},
+                    {gs::kXyz2, xyz2(553.5, 292, 0)}})
+          == 0);
+    CHECK(vertices({{gs::kPrim, strip},
+                    {gs::kXyz2, xyz2(510.5, 100, 0)},
+                    {gs::kXyz2, xyz2(552.5, 100, 0)},
+                    {gs::kXyz2, xyz2(510.5, 292, 0)},
+                    {gs::kXyz2, xyz2(552.5, 292, 0)}})
+          == 6);
+    // Thinner than a pixel between two rows: nothing; one sixteenth over a row: that row.
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(10, 100.0625, 0)}, {gs::kXyz2, xyz2(50, 100.9375, 0)}}) == 0);
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(10, 100, 0)}, {gs::kXyz2, xyz2(50, 100.0625, 0)}}) == 6);
+    // Nothing of no width; the right edge is out (x0 <= x < x1).
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(10, 10, 0)}, {gs::kXyz2, xyz2(10, 50, 0)}}) == 0);
+    // Below the last line (447).
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(10, 447.5, 0)}, {gs::kXyz2, xyz2(50, 480, 0)}}) == 0);
+    // Outside a smaller scissor, by its own columns (300..319).
+    CHECK(vertices({{gs::kScissor1, openrac::test::scissor(300, 319, 300, 319)},
+                    {gs::kPrim, sprite},
+                    {gs::kXyz2, xyz2(319.5, 300, 0)},
+                    {gs::kXyz2, xyz2(340, 319, 0)}})
+          == 0);
+    CHECK(vertices({{gs::kScissor1, openrac::test::scissor(300, 319, 300, 319)},
+                    {gs::kPrim, sprite},
+                    {gs::kXyz2, xyz2(318.5, 300, 0)},
+                    {gs::kXyz2, xyz2(340, 319, 0)}})
+          == 6);
+    // A 16:9 target with the HUD at its sides (picture 0.75 of it): the screen is 85 whole pixels
+    // wider on each side (as far as the HUD is moved out), so 596 is its last column there.
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(596.5, 100, 0)}, {gs::kXyz2, xyz2(638.5, 292, 0)}}, 0.75f, true)
+          == 0);
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(595.5, 100, 0)}, {gs::kXyz2, xyz2(637.5, 292, 0)}}, 0.75f, true)
+          == 6);
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(-85.5, 100, 0)}, {gs::kXyz2, xyz2(-84.5, 292, 0)}}, 0.75f, true)
+          == 6);
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(-86.5, 100, 0)}, {gs::kXyz2, xyz2(-85.5, 292, 0)}}, 0.75f, true)
+          == 0);
+    // Without the HUD at the sides the picture's own columns are all there is.
+    CHECK(vertices({{gs::kPrim, sprite}, {gs::kXyz2, xyz2(595.5, 100, 0)}, {gs::kXyz2, xyz2(637.5, 292, 0)}}, 0.75f, false)
+          == 0);
+}
+
+// A plain fill over the screen's last column or line goes on to its edge: the game's fills run
+// from -0.5 to 511.5, and drawn there they left the right and bottom half pixel unfilled (a line
+// of the old picture along them under a fade). Edges inside the screen stay where they are.
+void fill_to_the_edges() {
+    TexturePool textures;
+    auto corners = [&](double x0, double y0, double x1, double y1) {
+        GifInterpreter gif(textures);
+        GifBuilder b;
+        b
+            .ad({{gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false)},
+                 {gs::kRgbaq, rgbaq(0, 0, 0, 0x80)},
+                 {gs::kXyz2, xyz2(x0, y0, 0)},
+                 {gs::kXyz2, xyz2(x1, y1, 0)}},
+                true);
+        CHECK(gif.gif(b.bytes));
+        CHECK(gif.vertices().size() == 6);
+        return std::make_pair(gif.vertices()[0], gif.vertices()[4]);
+    };
+    const auto [first, last] = corners(-0.5, 99.5, 511.5, 447.5);
+    CHECK(near(first.x, -1.0f - 0.5f / 256.0f) && near(first.y, 1.0f - 99.5f / 224.0f));
+    CHECK(near(last.x, 1.0f) && near(last.y, -1.0f));
+    const auto [inner_first, inner_last] = corners(9.5, 99.5, 300.5, 200.5);
+    CHECK(near(inner_last.x, 300.5f / 256.0f - 1.0f) && near(inner_last.y, 1.0f - 200.5f / 224.0f));
+}
+
+// A full-screen black fill at full strength is the frame's clear before the world (left out: the
+// renderer clears) and a fade's last step after it (set_over_world: drawn over the world). Left
+// out there, Maktar's arena showed the world unfaded for a tick on each side of its scene's load.
+void fill_over_the_world() {
+    TexturePool textures;
+    auto vertices = [&](bool over_world, bool blended = true) {
+        GifInterpreter gif(textures);
+        gif.set_over_world(over_world);
+        GifBuilder b;
+        b
+            .ad({{gs::kScissor1, openrac::test::scissor(0, 511, 0, 447)},
+                 {gs::kPrim, prim(gs::PrimKind::Sprite, false, false, blended)},
+                 {gs::kRgbaq, rgbaq(0, 0, 0, 0x80)},
+                 {gs::kXyz2, xyz2(-0.5, -0.5, 0)},
+                 {gs::kXyz2, xyz2(511.5, 447.5, 0)}},
+                true);
+        CHECK(gif.gif(b.bytes));
+        return gif.vertices().size();
+    };
+    CHECK(vertices(false) == 0);
+    CHECK(vertices(true) == 6);
+    // Unblended, it is a clear wherever it comes (the weapon upgrade's black, three passes of 16).
+    CHECK(vertices(true, false) == 0);
+}
+
+// The NTSC games draw into a 416-line buffer (XYOFFSET 2048 - 208), stretched onto the 448-line
+// picture. Its scissor of lines 0 to 415 is the picture's 0 to 447: the scale rounded first (448 /
+// 416 as a float, times 416) came to just under 448 and cut the last line, where the cutscene bars
+// left a line of the world showing under them. The renderer runs in the EE's rounding mode, toward
+// zero, where that product falls short.
+void scissor_of_a_shorter_buffer() {
+    const int rounding = std::fegetround();
+    CHECK(std::fesetround(FE_TOWARDZERO) == 0);
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    const std::uint64_t ofy = (2048 - 208) * 16;
+    const std::uint64_t ofx = (2048 - 256) * 16;
+    b
+        .ad({{gs::kXyoffset1, ofx | (ofy << 32)},
+             {gs::kScissor1, openrac::test::scissor(0, 511, 0, 415)},
+             {gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false)},
+             // The bottom bar: its lines 364 to 415 (the default offset's 380 to 431).
+             {gs::kXyz2, xyz2(0, 380, 0)},
+             {gs::kXyz2, xyz2(512, 432, 0)}},
+            true);
+    CHECK(gif.gif(b.bytes));
+    CHECK(gif.draws().size() == 1);
+    const gs::Scissor& cut = gif.draws()[0].state.scissor;
+    CHECK(cut.x0 == 0 && cut.x1 == 511 && cut.y0 == 0 && cut.y1 == 447);
+    // Its bottom (416) is the picture's bottom edge.
+    CHECK(near(gif.vertices()[4].y, -1.0f));
+    CHECK(std::fesetround(rounding) == 0);
+}
+
+void textures_and_vif() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    std::vector<std::uint8_t> pixels(4 * 4 * 4, 0x40);
+    b.image(0x800, 1, gs::kPsmct32, 4, 4, pixels);
+    b.ad(
+        {{gs::kTex0_1, openrac::test::tex0(0x800, 1, gs::kPsmct32, 2, 2, true)},
+         {gs::kPrim, prim(gs::PrimKind::Sprite, false, true, false, true)},
+         {gs::kUv, openrac::test::uv(0, 0)},
+         {gs::kXyz2, xyz2(0, 0, 0)},
+         {gs::kUv, openrac::test::uv(2, 4)},
+         {gs::kXyz2, xyz2(8, 8, 0)}}
+    );
+
+    // The same packet inside a VIF1 stream, as the display list carries it:
+    // NOPs to align, then DIRECT with the size in quadwords.
+    std::vector<std::uint8_t> vif(12, 0);
+    const std::uint32_t direct = 0x50000000u | static_cast<std::uint32_t>(b.bytes.size() / 16);
+    vif.push_back(static_cast<std::uint8_t>(direct));
+    vif.push_back(static_cast<std::uint8_t>(direct >> 8));
+    vif.push_back(static_cast<std::uint8_t>(direct >> 16));
+    vif.push_back(static_cast<std::uint8_t>(direct >> 24));
+    vif.insert(vif.end(), b.bytes.begin(), b.bytes.end());
+    CHECK(gif.vif(vif));
+    CHECK(gif.draws().size() == 1);
+    const DirectState& s = gif.draws()[0].state;
+    CHECK(s.textured && s.tcc);
+    CHECK(s.texture != textures.placeholder());
+    CHECK(textures.image(s.texture).texel(0, 0) == rgba(0x40, 0x40, 0x40, 0x40));
+    // UV in texels over the texture's size: 2 of 4 across, 4 of 4 down.
+    const DirectVertex& corner = gif.vertices()[4];
+    CHECK(near(corner.s, 0.5f) && near(corner.t, 1.0f) && near(corner.q, 1.0f));
+
+    // A VU program's command is not the direct path.
+    std::vector<std::uint8_t> mscal = {0, 0, 0, 0x14};
+    CHECK(!gif.vif(mscal));
+}
+
+// A block the game drew into off-screen, then uploaded a texture to (its 2D pages reuse that
+// memory): a draw of the texture reads the upload, not the old target.
+void offscreen_then_upload() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    constexpr std::uint32_t kBlock = 0x1000;
+    const std::uint64_t offscreen = std::uint64_t{kBlock / 32} | (std::uint64_t{4} << 16);
+    const std::uint64_t frame = std::uint64_t{8} << 16;  // the display buffer, 512 pixels wide
+    b.ad({{gs::kFrame1, offscreen},
+          {gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false)},
+          {gs::kRgbaq, rgbaq(0xFF, 0, 0, 0x80)},
+          {gs::kXyz2, xyz2(0, 0, 0)},
+          {gs::kXyz2, xyz2(16, 16, 0)},
+          {gs::kFrame1, frame}});
+    std::vector<std::uint8_t> texels(4 * 4 * 4, 0x40);
+    b.image(kBlock, 1, gs::kPsmct32, 4, 4, texels);
+    b.ad({{gs::kTex0_1, openrac::test::tex0(kBlock, 1, gs::kPsmct32, 2, 2, true)},
+          {gs::kPrim, prim(gs::PrimKind::Sprite, false, true, false, true)},
+          {gs::kUv, openrac::test::uv(0, 0)},
+          {gs::kXyz2, xyz2(0, 0, 0)},
+          {gs::kUv, openrac::test::uv(4, 4)},
+          {gs::kXyz2, xyz2(8, 8, 0)}});
+    CHECK(gif.gif(b.bytes));
+    CHECK(!gif.draws().empty());
+    if (!gif.draws().empty()) {
+        const DirectState& s = gif.draws().back().state;
+        CHECK(s.source == 0);
+        CHECK(s.textured && s.texture != textures.placeholder());
+    }
+}
+
+// The game names a block in FRAME (its register sets name a panel's target whether or not that
+// panel is drawn) where a texture of its already is: with nothing drawn there, the block is still
+// that texture.
+void frame_named_without_draw() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    constexpr std::uint32_t kBlock = 0x2000;
+    std::vector<std::uint8_t> texels(4 * 4 * 4, 0x40);
+    b.image(kBlock, 1, gs::kPsmct32, 4, 4, texels);
+    b.ad({{gs::kFrame1, std::uint64_t{kBlock / 32} | (std::uint64_t{4} << 16)},
+          {gs::kFrame1, std::uint64_t{8} << 16},
+          {gs::kTex0_1, openrac::test::tex0(kBlock, 1, gs::kPsmct32, 2, 2, true)},
+          {gs::kPrim, prim(gs::PrimKind::Sprite, false, true, false, true)},
+          {gs::kUv, openrac::test::uv(0, 0)},
+          {gs::kXyz2, xyz2(0, 0, 0)},
+          {gs::kUv, openrac::test::uv(4, 4)},
+          {gs::kXyz2, xyz2(8, 8, 0)}});
+    CHECK(gif.gif(b.bytes));
+    CHECK(!gif.draws().empty());
+    if (!gif.draws().empty()) {
+        const DirectState& s = gif.draws().back().state;
+        CHECK(s.source == 0);
+        CHECK(s.textured && s.texture != textures.placeholder());
+    }
+}
+
+// An upload that starts below an off-screen target and runs over it: what was drawn there is gone.
+void upload_over_offscreen() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    constexpr std::uint32_t kBase = 0x2000;
+    constexpr std::uint32_t kTarget = kBase + 64;  // two pages in: line 64 of a 256-pixel buffer
+    b.ad({{gs::kFrame1, std::uint64_t{kTarget / 32} | (std::uint64_t{4} << 16)},
+          {gs::kPrim, prim(gs::PrimKind::Sprite, false, false, false)},
+          {gs::kRgbaq, rgbaq(0xFF, 0, 0, 0x80)},
+          {gs::kXyz2, xyz2(0, 0, 0)},
+          {gs::kXyz2, xyz2(16, 16, 0)},
+          {gs::kFrame1, std::uint64_t{8} << 16}});
+    std::vector<std::uint8_t> texels(256 * 128 * 4, 0x40);
+    b.image(kBase, 4, gs::kPsmct32, 256, 128, texels);
+    b.ad({{gs::kTex0_1, openrac::test::tex0(kTarget, 4, gs::kPsmct32, 4, 4, true)},
+          {gs::kPrim, prim(gs::PrimKind::Sprite, false, true, false, true)},
+          {gs::kUv, openrac::test::uv(0, 0)},
+          {gs::kXyz2, xyz2(0, 0, 0)},
+          {gs::kUv, openrac::test::uv(16, 16)},
+          {gs::kXyz2, xyz2(8, 8, 0)}});
+    CHECK(gif.gif(b.bytes));
+    if (!gif.draws().empty()) {
+        CHECK(gif.draws().back().state.source == 0);
+    }
+}
+
+// A texture in the pages under the 448-line draw buffer (line 448 on) is a texture, not the frame.
+void texture_under_draw_buffer() {
+    TexturePool textures;
+    GifInterpreter gif(textures);
+    GifBuilder b;
+    set_draw_buffer_block(0x1000, 448);
+    const std::uint32_t block = 0x1000 + 14 * 8 * 32;  // page row 14: line 448
+    std::vector<std::uint8_t> texels(4 * 4 * 4, 0x40);
+    b.ad({{gs::kFrame1, std::uint64_t{0x1000 / 32} | (std::uint64_t{8} << 16)}});
+    b.image(block, 1, gs::kPsmct32, 4, 4, texels);
+    b.ad({{gs::kTex0_1, openrac::test::tex0(block, 1, gs::kPsmct32, 2, 2, true)},
+          {gs::kPrim, prim(gs::PrimKind::Sprite, false, true, false, true)},
+          {gs::kUv, openrac::test::uv(0, 0)},
+          {gs::kXyz2, xyz2(0, 0, 0)},
+          {gs::kUv, openrac::test::uv(4, 4)},
+          {gs::kXyz2, xyz2(8, 8, 0)}});
+    CHECK(gif.gif(b.bytes));
+    CHECK(!gif.draws().empty());
+    if (!gif.draws().empty()) {
+        const DirectState& s = gif.draws().back().state;
+        CHECK(!s.frame_source);
+        CHECK(s.textured && s.texture != textures.placeholder());
+    }
+}
+
+// Weights the GS takes above 1 (As, FIX up to 0xFF) go to the shader, and the strips' TEST keeps
+// a layer that writes no Z (Oltanis's ice) out of the liquids.
+void blend_weights() {
+    using openrac::test::alpha_reg;
+    const auto blend = [](std::uint64_t bits) {
+        return translate_blend(gs::Alpha::decode(bits));
+    };
+    const GlBlend add_as = blend(alpha_reg(0, 2, 0, 1));  // Cs * As + Cd
+    CHECK(add_as.source_scale == SourceScale::Alpha && add_as.src == 1u && add_as.dst == 1u);
+    const GlBlend add_fix = blend(alpha_reg(0, 2, 2, 1, 0xC0));  // Cs * FIX + Cd, FIX 1.5
+    CHECK(add_fix.source_scale == SourceScale::Fix && add_fix.fix == 1.5f && add_fix.exact);
+    const GlBlend sub_fix = blend(alpha_reg(2, 0, 2, 1, 0xA0));  // Cd - Cs * FIX
+    CHECK(sub_fix.source_scale == SourceScale::Fix && sub_fix.equation == 0x800Bu);
+    // FIX at or below 1 keeps GL's constant; (Cs - Cd) As + Cd keeps SRC_ALPHA.
+    CHECK(blend(alpha_reg(0, 2, 2, 1, 0x80)).source_scale == SourceScale::None);
+    CHECK(blend(alpha_reg(0, 1, 0, 1)).source_scale == SourceScale::None);
+    CHECK(!blend(alpha_reg(0, 1, 2, 1, 0xC0)).exact);  // (Cs - Cd) FIX + Cd beyond 1
+    // Cd (As + 1), Maktar's arena curtain (0x49): As written as the colour, DST_COLOR + ONE.
+    const GlBlend brighten = blend(alpha_reg(1, 2, 0, 1));
+    CHECK(brighten.source_scale == SourceScale::WeightAlpha && brighten.src == 0x0306u);
+    CHECK(brighten.dst == 1u && brighten.equation == 0x8006u && brighten.exact);
+    CHECK(blend(alpha_reg(1, 2, 2, 1, 0x40)).source_scale == SourceScale::WeightFix);
+    CHECK(!blend(alpha_reg(1, 2, 2, 1, 0xC0)).exact);  // Cd (FIX + 1) beyond 2
+
+    CHECK(liquid_strip(0x8000000064ull, 0));         // no TEST seen: a sea, as before
+    CHECK(liquid_strip(0x8000000064ull, 0x5360B));   // Z written where As >= 0x60
+    CHECK(!liquid_strip(0x8000000064ull, 0x513F1));  // NEVER, FB_ONLY: no Z
+    CHECK(!liquid_strip(0x4000000064ull, 0x5360B));  // FIX 0x40: not drawn solid
+    // A blended strip goes with the liquids when the game sent it before the world's mobys
+    // (Dobbo's water), and with the other effects when not.
+    EffectStrip water;
+    water.alpha = 0x3200000044ull;
+    water.test = 0x5310B;
+    CHECK(!liquid_pass_strip(water));
+    water.before_mobys = true;
+    CHECK(liquid_pass_strip(water));
+    CHECK(test_writes_z(0x5310B));   // GEQUAL 0x10, RGB_ONLY: Z where the test passes
+    CHECK(!test_writes_z(0x513F1));  // NEVER, FB_ONLY: the lists' additive glows, colour only
+    // Z only where the list shows a surface: Dobbo's water alpha-tests what it draws; Oozla's
+    // additive shine over its water (ALPHA 0x48, TEST 0x513F0: no alpha test, no ZBUF) writes none,
+    // or it cut the glows of the bolts lying in the water in half.
+    CHECK(before_mobys_writes_z(water));
+    EffectStrip shine;
+    shine.before_mobys = true;
+    shine.alpha = 0x8000000048ull;
+    shine.test = 0x513F0;
+    CHECK(!before_mobys_writes_z(shine));
+    shine.z_written = true;  // the list set ZBUF without ZMSK
+    CHECK(before_mobys_writes_z(shine));
+    shine.z_masked = true;
+    shine.z_written = false;
+    shine.test = 0x5310B;
+    CHECK(!before_mobys_writes_z(shine));  // ZMSK: none, whatever the test
+    EffectStrip glow = water;
+    glow.test = 0x513F1;
+    CHECK(!before_mobys_writes_z(glow));
+    EffectStrip solid;
+    solid.before_mobys = true;
+    solid.alpha = 0x8000000064ull;
+    solid.test = 0x513F0;
+    CHECK(before_mobys_writes_z(solid));  // a solid strip, as the liquids' pass drew it before
+}
+
+}  // namespace
+
+int main() {
+    blend_weights();
+    sprite();
+    whole_target_marker();
+    strips_and_kicks();
+    packed_and_reglist();
+    draw_groups();
+    no_sample_no_pixel();
+    fill_to_the_edges();
+    fill_over_the_world();
+    scissor_of_a_shorter_buffer();
+    textures_and_vif();
+    offscreen_then_upload();
+    frame_named_without_draw();
+    upload_over_offscreen();
+    texture_under_draw_buffer();
+    return openrac::test::result();
+}

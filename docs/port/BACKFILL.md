@@ -1,0 +1,475 @@
+# When to stop matching, and backfill in C
+
+For anyone, person or agent, matching functions in one of OpenRAC's
+decompilations. It answers two questions: **when is a function not worth
+another attempt**, and **what do you write instead**.
+
+The short version: some functions cannot be matched from C at all, and some
+can but have already cost more than they return. Neither kind blocks the
+native port, because the port only needs C that *does what the function
+does*. That C is the backfill. It is kept apart from the matching source and
+never counted as a match.
+
+## Two kinds of C
+
+| | Matching C | Functional C (the backfill) |
+|---|---|---|
+| Compiles to | the retail bytes, exactly | anything that behaves the same |
+| Proven by | the build: the linked program equals retail | fcheck: the same result and memory as retail on real calls (the gate, below), or nothing yet |
+| Lives in | `src/` | `nonmatching/functional/`, listed in `nonmatching/functional.tsv` |
+| Counted in the progress report | yes | never |
+| Read by | the matching build and the port | the port only |
+
+`games/rac1/decomp` has this in place (321 functions listed on 2026-10-13); the
+port reads the list through `port/game/rac1-pal/hostgen.json` ("candidates").
+A decompilation without the list yet should add the same two paths, not a new
+scheme.
+
+## Functions that C cannot match
+
+Recognise these before spending an attempt. Each was measured, mostly on
+Ratchet & Clank (PAL), and the same signs hold in the other games.
+
+**1. It is not a function.** The catalogue ends a function wherever the next
+address looks like a start, so one real function can show as several entries.
+Of the 241 unmatched entries of 400 bytes or less that Ratchet & Clank had
+left on 2026-10-12, **120 were pieces of a neighbour**. The signs:
+
+- it reads a register it never sets (and that register is not an argument);
+- it branches to an address outside its own bytes, or a neighbour branches
+  into it;
+- it has no `jr $ra`, or starts with instructions that only make sense after
+  a prologue someone else ran;
+- it is one or two words on an 8-byte boundary after a function that already
+  returned (what the linker left of a function it stripped).
+
+What to do: do not write C. Join it to its owner
+(`config/overlays/joined.tsv` in rac1; fix the catalogue in `tools/levels.py`
+in rac2) or list it as a linker remnant. The owner's C then covers it.
+
+**2. It was written in assembly.** No compiler produced it, so no C
+reproduces it. The signs:
+
+- COP2 / VU0 macro instructions (`lqc2`, `sqc2`, `vmul`, `vadd`, `vdiv`,
+  `qmfc2`, `cfc2`);
+- `$at` used as a working register;
+- a return with a live instruction after its delay slot (`jr $ra; lui $ra, …`);
+- an `addi` (which traps on overflow) where the compiler always writes
+  `addiu`; a trailing `sync`;
+- multimedia instructions in a two-instruction body.
+
+What to do: mark it `ASM_FUNC` in place of `INCLUDE_ASM`. It stays assembly
+and counts as finished, because the original was assembly too. Mark it only
+on this evidence (or because it is byte-identical, and longer than 16 bytes,
+to a routine another decompilation already classifies this way), never
+because it resisted matching. For the port, write functional C: a VU0 dot
+product is three multiplies and two adds in plain floats.
+
+**3. The build cannot express what it needs.** The builds reproduce the retail
+compilers and change nothing they emit; flags apply to whole files. A function
+that would only match with a step that edits compiler output, or with flags of
+its own inside a file that needs others, is not matched by doing that. One
+real case: two functions in one file that each need the same global declared
+at a different size. Record what it needs in its near-miss note; it may become
+possible when the file is split the way retail's was.
+
+## Functions that C can match, but not today
+
+Everything else is matchable in principle. What stops an attempt is cost.
+These are the measured walls:
+
+- **The compiler is not the problem.** On 2026-10-12 Ratchet & Clank's level
+  code was compiled with three other compilers (SN 2.95.2, SN 2.95.3 v1.36,
+  and the patched 2.9-ee the NTSC decompilation uses). None turned a single
+  one of 492 near misses into a match. Do not go looking for another compiler
+  or another flag for one function.
+- **Ties.** Register allocation and instruction scheduling have ties that
+  wording does not move: the loop counter in `$s1` where retail has `$s0`, a
+  store that lands in a delay slot. When three different wordings compile to
+  the same bytes, a fourth will too.
+- **Size.** Small models stop being productive above about 1.5 KB: two waves
+  of the smallest tier on 1.7 to 3 KB functions matched 0 of 88.
+
+So every attempt has a bound, set before it starts:
+
+| Stop when | |
+|---|---|
+| the run budget is spent | 8 to 15 compiles per function, by tier |
+| three different wordings give identical bytes | a tie; rewording will not move it |
+| about ten compiles pass without getting closer | you are circling |
+| it shows a sign from the list above | it was never going to match |
+
+Stopping is a normal result. Leave the best attempt as a near miss
+(`nonmatching/<area>/<function>.c`) with two or three lines: what the function
+does, where it differs, what would unblock it. Then it goes **up one tier**
+(small model, then mid, then large), each starting from that note. A function
+does not go round the same tier twice.
+
+## Before any model
+
+Much of what looks like matching work needs no attempt at all. In this order:
+
+1. Is it a piece or a remnant? (above)
+2. Is it handwritten? (above)
+3. Is the same function already matched somewhere? Another version of the
+   same game, or another game: `tools/xmap.py ports` lists them and
+   `tools/port.py` carries the C across and checks it. Identical bytes with a
+   compiler of the same family is nearly always a match; across compiler
+   families, about a third pass as they are.
+4. Does an exact attempt exist that never landed? (`wave.py salvage` in rac1.)
+5. Is it a variant of a matched function, the same instructions with another
+   constant? (`overlay_variants.py clone` in rac1.)
+
+Only what is left is worth a model's time.
+
+## Writing the backfill
+
+When a function has stopped and the port needs it, write functional C. A near
+miss that is 95% byte-identical is usually already that; start from it.
+
+- **Same behaviour, not same bytes.** The same reads, writes and calls, with
+  the same arguments, in the same order; the same return value. Locals,
+  helpers and clearer control flow are fine. Keep the function's name and
+  signature.
+- **Write it for the host too.** These broke the port in practice:
+  - PlayStation 2 floats never produce NaN or infinity. Take `sqrt` of an
+    absolute value where retail could go slightly negative, and clamp.
+  - A call written `f()` that relied on a register still holding an argument
+    must pass that argument.
+  - `long` is 64 bits and `long long` 128 in the original compilers.
+  - A pointer is a 32-bit game address, not a host pointer.
+- **Say how sure you are.** The file's first line is a comment:
+  `/* functional: high|medium|low. <what differs from retail, and why that
+  does not change behaviour> */`. Say `low` when any part is a guess.
+- **Check what can be checked.** It must compile in place of its stub. Byte
+  similarity is evidence, not proof: a one-instruction difference can be a
+  wrong constant. Reading it against the assembly is not proof either: a
+  wrong constants address and a literal read from the wrong copy both shipped
+  in C that read right. The proof is fcheck (the gate, below).
+- **Keep it out of `src/`.** It goes in `nonmatching/functional/` with a row
+  in `functional.tsv`. The progress report must not change.
+
+What it is not: a way to raise the percentage, or a place for a match that
+only works with a trick. If a later attempt matches the function, the match
+goes in `src/` and the functional file and its row are removed.
+
+## The gate: done means fcheck says SAME
+
+A backfilled function is **done only when fcheck says SAME on captured calls
+of the retail game**. Anything fcheck cannot reach is **unchecked**, which is
+not done; it stays on the list with its reason. Reading the C, a high
+confidence line and a clean build are not a verdict.
+
+fcheck (rac1-decomp `tools/fcheck.py`, test-only) plays the PAL disc headless
+into level 0, captures the machine state at real calls of a function, runs the
+retail code from each state in OpenRAC's interpreter build, then runs the
+candidate from the same state and compares memory (but the dead stack and the
+scratchpad), the result by the return type, the registers a function keeps,
+and the order of device accesses and system calls. It is an offline check: it
+is never shipped and never used to play.
+
+**Levels.** fcheck's own run stops in level 0 and takes states at the boot
+executable's addresses. In a level, the code above 0x15F000 is the level's
+overlay: the level's own functions (`func_LNN_`) and the executable's
+functions linked into it at places of their own (rac1-decomp's
+`config/overlays/functions.tsv`). The gate captures there itself: one headless
+`openrac-boot --capture` run per level (`--level N`, six at once), at each
+function's places in that level, with the CRC of the level's own bytes, into
+`build-sn/fcheck/gate/lstates/LNN/`. A level's function is checked from its
+own level's states; an executable function the boot run never calls, from the
+first three levels whose run called it. The candidate is built by
+`tools/fcheck_level_build.py`, which is fcheck's own build with the symbols
+resolved the way rac1-decomp's `overlay_check.py` resolves them for that level
+(it runs in rac1-decomp's container, from the ignored `build-sn/fcheck/gate/`;
+nothing in rac1-decomp is changed). The state holds the whole machine, the
+level's code and data with it.
+
+**The test copy.** fcheck compiles the candidate inside its source file in
+rac1-decomp, which can clash with what that file declares. The gate's copy
+(only the copy) gets: a prototype or typedef the file has differently renamed
+for the copy (`NAME__gate`; an address name still resolves to its retail
+address), the function itself exported under its own name when it is the one
+renamed, a `static` helper made `__inline__` (fcheck places one function), the
+host library's `sqrtf`/`fabsf` as the console's FPU computes them, and a
+scratch source for a function no source file has (a libgcc routine, a second
+entry point inside another function). The log says what was renamed.
+
+The verdicts are kept in files OpenRAC owns, one per backfill table and keyed
+by function name, so the tables themselves (`functional.tsv` is synced from
+rac1-decomp, both are read by hostgen) are never changed:
+`port/game/rac1-pal/fcheck.tsv` for `nonmatching/functional.tsv` and
+`port/game/rac1-ntsc/hand/fcheck.tsv` for `hand/hand.tsv`. Columns, after
+`name`:
+
+| Column | Meaning |
+|---|---|
+| `status` | `same`: compared real calls, all equal. `differs`: a difference (the note says where; fix the C, not the verdict). `unchecked`: fcheck could not compare (the C did not build or place, every state was skipped, no oracle for that version); the note says why. `no-states`: no capture run calls it (title, menu and every level for an executable function; its own level for a level function). `not-executable`: neither a `func_XXXXXXXX` nor a `func_LNN_XXXXXXXX` |
+| `date` | the day it was run |
+| `fcheck` | the rac1-decomp commit fcheck ran from (`+dirty` when `tools/fcheck.py` had local edits) |
+| `csum` | the first 12 hex digits of the sha1 of the C file; an edit after the verdict makes it stale |
+| `note` | the call count, the differing lines, or the reason for `unchecked` |
+
+Only `same` counts as done. `differs` is a bug to fix. The rest are open: say
+so when you hand the function on, and never call it verified. A backfill row with no
+verdict has not been through the gate.
+
+**`same-run`: C the gate cannot run.** fcheck delivers no interrupts, frames or disc, so a function
+that waits on them is `unchecked`. Such a function can get a weaker verdict, `same-run`, kept apart in
+`port/game/rac2-ntsc/fcheck_run.tsv`: a whole headless run with the function's calls sent to the C
+(`openrac-boot --swap`), whose main memory at a field (`--dump-ram`) equals a plain run's under the same
+script and `OPENRAC_CLOCK`, leaving out the C's code and the stack. It says less than `same`: it compares
+memory once, at that field, not the result, kept registers or device order of each call, and covers only
+what that route ran. A difference overwritten before the field goes unseen. **`same-run` is not `same`:
+it does not make a row done.** Compare memory, not the random state and the hero's place: a loader with
+its `resume` test inverted passed those, and memory caught it.
+
+A verdict needs its controls: two plain runs agree on `--digest` (a hash of memory each field), and the
+function's own retail bytes through `--swap` give no differing field. `--cover` says what the route ran;
+the note gives it. `--returns` compares each return, for a difference a later field overwrites. A difference on some fields needs reading, not waving away: code that takes other
+instruction counts moves counters and load progress (retail's bytes padded with 400 `nop`s differed on
+more fields than any candidate here), but the difference can also be a bug. Columns: `name`, `status`, `date`,
+`decomp` (the commit), `csum`, `route`, `field`, `calls`, `note`.
+
+The gate uses the test-only interpreter in `tools/interpreter/` (built on its own with `cmake -S tools/interpreter -B build/interpreter`); it is never part of the port, the launcher or any release, and is never used to play.
+
+Run it (the interpreter built so that `build/interpreter/openrac-fcheck` and
+`openrac-boot` exist; the PAL disc in place; a container runtime for the
+retail compiler; headless, it opens no window):
+
+```sh
+python3 tools/fcheck_gate.py run                       # every PAL row: capture what is missing, check in parallel, write fcheck.tsv
+python3 tools/fcheck_gate.py run --no-levels           # the boot run only (level functions stay not-executable); --frames N, --press F:B[:N] for the capture runs
+python3 tools/fcheck_gate.py run --only func_001F7E98  # one or a few rows after you changed their C
+python3 tools/fcheck_gate.py report [--strict]         # joins each backfill table with its verdicts: counts, differing, stale and unverdicted rows; --strict exits 1 on any
+python3 tools/fcheck_gate.py us                        # the US table: unchecked, no US oracle
+python3 -m unittest tools/test_fcheck_gate.py
+```
+
+`OPENRAC_ROOT` names the OpenRAC checkout with the interpreter build
+(default: the checkout holding the script). `OPENRAC_DECOMP` names the
+rac1-decomp checkout; without it the gate uses `OPENRAC_SOURCE_RAC1_PAL`, else
+the `checkout` that `games/rac1/game.json` names for pal. Each log is kept in rac1-decomp's
+`build-sn/fcheck/gate/logs/`. The gate copies each C file into
+`build-sn/fcheck/gate/`, which is ignored; it edits nothing else there.
+
+**Going Commando (USA v1.01, SCUS_972.68).** The same gate, with rac2-decomp's
+own driver, `tools/fcheck.py` (same role as rac1-decomp's): it compiles the
+function's unit in `src/` with the unit's flags (`config/cflags.txt`), the
+candidate in place of the function's `INCLUDE_ASM` line or C (or, when that
+does not compile, the candidate on its own with the unit's flags), places the
+function's section at 0x000A0000 and resolves every relocation against
+retail: names as the boot build derived them (`build/boot/placed.json`), the
+unit's writable data where retail has it (one unit's `.data`/`.bss` is shared
+by its functions), read-only data (strings, switch jump tables) copied after
+the code with its entries pointing at the placed code, and `$gp`-relative
+references (-G8 units) only within `$gp`'s window (0x1AEFF0 +- 32 KB; a
+literal is taken where retail's `core.lit`/`.lit` hold the same bytes).
+`openrac-fcheck` gets the capture run's hooks table and disc (`--hooks`,
+`--disc`), so a hooked library function (the SIF, disc and card calls) answers
+as it did in the capture rather than running its body without its first
+word, and it runs every state on a fresh machine: a state holds the
+processors and memory, not what the kernel and the services remember
+(semaphore ids, handlers, DMA registers, the sound server's handles), so
+retail and candidate must start from the same of those. A word that holds an
+address inside the candidate's code compares equal to retail's when it is at
+the same distance from the entry (a label's address kept in memory), and a
+candidate gets eight times retail's instructions (at least 20 million) before
+it counts as not returning. A load or store of a halfword, word or doubleword
+at an address that is not a multiple of its size, which the console refuses
+with an address error and the interpreter performs, is counted, and a
+candidate that makes more of them than retail differs. Retail gets 40 million
+instructions per state; a call that needs more waits for an interrupt, a
+frame or the disc, which no fcheck run delivers, and its state is skipped.
+
+What it covers: **the boot executable and every level but 30**, from headless
+capture runs of the US disc: the boot, title and main menu with its Load,
+Options and New Game pages backed out of (`menu`), New Game up to the first
+level's load, stopped before the level runs (`newgame`), and New Game into each
+level, played to frame 7000 (`level00`, `level01`, ...: Cross through the intro,
+then running with the left stick (`openrac-boot --stick`), jumping, the wrench,
+the pause menu, weapons and the map). A level past 00 is reached by keeping the
+boot's next-level word (0x1B1680, RequestLevelExit's destination) at its number
+through New Game (`openrac-boot --write 900:1b1680:N:740`): no save and no
+play-through. Level 30 crashes on that load, so its functions stay `no-states`.
+Each run is cut into phases and takes two calls in each (one past level 00)
+(`openrac-boot --capture-phases`, `--capture-spread`), so a function called
+every frame has states from each part of the run. A capture line holds the
+function's first bytes and their CRC-32, so a level function's place is taken
+only once that level's program is loaded there. A function is captured in its
+own level and its lowest other places, three levels at most. A function with
+a place in a level's program (a `func_LNN_` row, or a boot or shared function
+with an `NN:` place in `config/levels/functions.tsv`) is checked there: its
+symbols resolve at that level's addresses (its function places, the values
+`tools/build.py level NN` derived, the boot's below 0x1A7C80, which stays
+resident, and boot data the level moved, read from the level's copies of boot
+functions, which are the same code), against that level's bytes. A boot
+function below 0x1A7C80 called in a level is checked as the boot's. A function
+with states from several programs is built once for each and must be SAME in
+all. Level states are about 16 MB each (the boot's about 5).
+
+```sh
+# rac2-decomp built (python3 tools/build.py all), its compiler reachable through
+# RAC2_LINUX (on a Mac: a container of rac2-build:latest mounting your home at the same path)
+docker run -d --name rac2-gate --platform linux/386 -v $HOME:$HOME rac2-build:latest sleep infinity
+export RAC2_LINUX="docker exec rac2-gate" OPENRAC_SOURCE_RAC2_NTSC=~/Projects/RAC/rac2-decomp
+python3 tools/fcheck_gate.py run --game rac2                 # every row of nonmatching/functional.tsv: capture, check, write fcheck.tsv
+python3 tools/fcheck_gate.py run --game rac2 --only func_00285030
+python3 tools/fcheck_gate.py report --game rac2
+python3 tools/fcheck_gate.py calibrate -j 16 --mutants 20    # the harness's own test (below)
+```
+
+The verdicts go to `port/game/rac2-ntsc/fcheck.tsv` (same columns; `fcheck` is
+the rac2-decomp commit), known harness artefacts to
+`port/game/rac2-ntsc/fcheck_artefacts.tsv`. States, test copies and logs are in
+the ignored `build/fcheck/rac2-ntsc/` (states are about 5 MB each, level 00's about 16). A single
+function can be checked from rac2-decomp directly:
+`RAC2_FCHECK_STATES=<OpenRAC>/build/fcheck/rac2-ntsc/states python3
+tools/fcheck.py check func_XXXXXXXX nonmatching/functional/func_XXXXXXXX.c`.
+
+**Calibration** is the acceptance test of the rac2 harness: every matched boot
+function (placed byte for byte by the boot build) that the capture runs call
+is checked from its own C in `src/`, which must give SAME (a DIFFERS there is a
+harness bug, not a verdict), then wrong variants of some of them (one constant,
+comparison, operator or return value changed) must give DIFFERS. A variant
+that still says SAME is one whose change the captured calls never exercise:
+the reason more states per function are taken. Results go to
+`build/fcheck/rac2-ntsc/calibration.tsv` and `mutants.tsv`.
+On 2026-10-27, 513 of the 2,074 matched boot functions were called in the two
+runs: 502 SAME, 0 differs, 11 unchecked (retail waits for a frame or the disc
+in every state); of 20 wrong variants 14 differed, and the 6 that did not
+change a branch, a comparison boundary or a constant the captured calls never
+reach. For level 00 (the same day), the 988 matched functions with level-00
+states (922 at their places in level 00's program, 66 resident boot ones; each
+also with its boot states, if any): 985 SAME, 0 differs, 3 unchecked (retail
+waits in every state). Getting there fixed the harness three times: the
+scratchpad is compared as memory is (a return address a callee saves on a
+stack it keeps there is the candidate's own code at the same distance from the
+entry), boot data a level moves is read from the level's copies of boot
+functions (the same code, so their references pair with the boot's) rather
+than guessed by alignment, and a boot function's own copy takes what its
+copy's code refers to (the level's own variant of a callback). Statically,
+all 2,394 functions level 00's build places, placed at their own addresses,
+give retail's bytes but for 23 jump-table addresses (the table is copied after
+the code). Of 20 wrong variants of level-placed functions 11 differed; the 9
+that did not change an index or offset that is 0 in the captured calls, a
+comparison whose two sides are equal there (one an equivalent `min`), or a
+branch whose two sides do the same in those calls. A function's own retail
+bytes, moved to 0x000A0000, can stand in for the C (`tools/fcheck.py check
+NAME --retail`): a DIFFERS on them is the harness's or the states', never the
+C's.
+
+**A translation through the gate.** A function hostgen translates from assembly has no row, but
+the same check answers for it: `hostgen.py --asm-console DIR --asm-console-names FILE` writes each
+named function in the console's form, and `tools/fcheck.py check NAME DIR/NAME.c` runs that
+against retail. `port/game/rac2-ntsc/fcheck_asm.tsv` keeps those verdicts (columns: name, status,
+level, calls, note). It proves the console form: the host build is the same text with hostgen's
+host macros, which only play proves. Three things to know: a whole kernel needs
+`RAC2_FCHECK_OPT=-O1`, since cc1 runs out of address space at -O2, and the driver sends a branch
+out of the assembler's range through a jump of its own; the console form holds the addresses of
+the copy it was written from, so a boot function checked on a level's states needs that level's
+data and call addresses put in (rac2's level copies differ from the boot's in those words); and
+the translation's registers start at 0, so a word that only saves a caller's register (`sd ra`,
+`sq t8` into memory the callee reads back) differs at the gate and nowhere else. Such a
+difference is noted in the file, never counted as `same`.
+
+**How a worker reports.** A backfill worker hands a function on as one of:
+
+- `SAME`, with the call count from `tools/fcheck.py FUNC FILE` (or the row the
+  gate wrote). Then it is done.
+- `unchecked`, with the reason in one line: no states (never called in the
+  capture run), not executable (a level function), the candidate did not
+  build, every state skipped, or no oracle for the version. It is delivered
+  as unchecked and listed as such in the report, never as done or verified.
+- `differs`: not delivered. Fix the C and run fcheck again, or hand the
+  function back with the difference as it printed. Before touching the C, test
+  whether the harness is at fault: paste the function's own retail assembly
+  in as the candidate (a top-level `__asm__` block); if that gets the same
+  DIFFERS, the C is not the cause. Such a function, and one whose difference
+  is the host having no hardware to act on (FlushCache), goes in
+  `port/game/rac1-pal/fcheck_artefacts.tsv` with the reason; the gate then
+  writes it as `unchecked` with that reason, never as `same`.
+
+A report line that says a backfill is finished without one of those is
+incomplete. The lead runs `fcheck_gate.py run --only ...` over the batch
+before landing and commits `fcheck.tsv` with the files.
+
+**The US table has no oracle.** `port/game/rac1-ntsc/hand/hand.tsv` rows are
+all `unchecked (no US oracle)` in `hand/fcheck.tsv`: fcheck's interpreter build, its hooks file and
+its capture list know the PAL disc and the PAL executable only. A US oracle
+would need: an interpreter build that boots the NTSC-U disc (its executable
+SCUS_971.99, its own hooks file, the button presses for its menus and a level
+start); a capture list keyed by the US executable's `FUN_` names, addresses
+and code bytes (fcheck reads function bytes from the PAL assembly and
+executable, and only takes `func_XXXXXXXX`); a way to compile a candidate in
+place of its stub with the NTSC decomp's compiler and place it with US
+addresses (the sections from `core.lit` on sit 0x100 lower than PAL's); and a
+check of what the PAL oracle cannot say. Until then a US function whose PAL
+counterpart the version map calls `same` has the PAL verdict as evidence (not
+a verdict of its own), and the rest stay unchecked.
+
+## Picking what to backfill first
+
+The port does not need every function at once: it needs the ones gameplay goes
+through. `port/tools/hostgen/priority.py` ranks the weak ones by static
+analysis, from what hostgen already wrote, without running the game:
+
+```sh
+cmake --build --preset release            # in port/: hostgen writes gen/report.json
+python3 port/tools/hostgen/priority.py --game port/game/rac1-pal/hostgen.json \
+    --gen port/build/release/games/rac1-pal/gen \
+    --dump games/rac1/decomp/baserom/overlays --exe games/rac1/decomp/baserom/SCES_509.16 \
+    --out build/priority/rac1-pal.md
+python3 -m unittest port/tools/hostgen/test_priority.py   # its test (no Clang)
+```
+
+A weak function is one with no C, C hostgen cannot translate, a call that
+leaves an argument out (filled with 0), C that is not matched (a candidate or
+the port's hand C, weighted by its confidence line: low, medium, then high;
+VU0 microcode first of all), a candidate whose declarations hostgen's prep
+renamed wrongly (in `extern T a(..), b(..);` the calls to `b` reach `a`), or
+matched C its callers declare differently (hostgen's `call_site_mismatches`:
+more or fewer integer or float arguments than it takes, or a result it does
+not return; extra arguments it never reads are left out). For each level program it follows hostgen's `call_graph`, the
+retail code's own calls where only the level knows the target (the level
+hooks, functions with no C yet), and every function the level's `vtbl`,
+`camvtbl`, `sndvtbl` and data records point at (the moby class tables). The
+report ranks what every level reaches, or what sits on a hot path (hero,
+camera, collision, HUD, 2D draw, moby update and draw, sound, level load),
+first; then by the number of levels; then by how weak; and suggests a tier
+(Haiku for small plain functions, Sonnet up to 1 KB or for one argument read
+from the assembly, Opus for large or hand-written ones).
+
+What it cannot see: calls through pointers computed at run time and kept
+outside those records (a pointer built in the heap, a table in the
+executable's own data), so "no level reaches it" means nothing it follows
+does. Hot paths come from source units, readable names and table roles,
+carried two calls down; read them as a hint. Without `--dump` it uses the
+roles in `config/overlays/names.tsv` instead of the records.
+
+## Deciding, in one pass
+
+```
+is it a piece of a neighbour, or a linker remnant?  -> join or list it; no C
+is it handwritten assembly?                         -> ASM_FUNC; functional C for the port
+is the same code matched elsewhere?                 -> port it mechanically
+try to match, within the bound for its tier
+  matched                                           -> src/, the build proves it
+  stopped                                           -> near miss with a note; next tier up
+no tier left, or the port needs it now              -> functional C, with its confidence
+  fcheck SAME on captured calls                     -> done
+  unchecked (with the reason) or differs            -> not done
+```
+
+## Where the pieces are
+
+| | Ratchet & Clank (PAL) | Going Commando |
+|---|---|---|
+| Near misses | `nonmatching/<area>/` | `nonmatching/<area>/` |
+| Functional C | `nonmatching/functional/`, `functional.tsv`; verdicts in OpenRAC's `port/game/rac1-pal/fcheck.tsv` | `nonmatching/functional/`, `functional.tsv`; verdicts in OpenRAC's `port/game/rac2-ntsc/fcheck.tsv` |
+| Pieces of one function | `config/overlays/joined.tsv` | the catalogue, `tools/levels.py` |
+| Handwritten | `ASM_FUNC`, counted as finished | `ASM_FUNC`, counted as finished |
+| Worker bound and protocol | `docs/QUEUE.md`, `docs/AGENT_WORKFLOW.md` | `docs/AGENT_WORKFLOW.md` |
+
+The measurements behind this page are in the commit history of 2026-10-12
+(the compiler comparison, the small-function sweep and its joins) and in
+[games/rac1/decomp/docs/NONMATCHING.md](../../games/rac1/decomp/docs/NONMATCHING.md).
