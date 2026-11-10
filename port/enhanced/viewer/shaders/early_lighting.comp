@@ -22,6 +22,10 @@ uniform int rtx_enabled;
 uniform int rtx_flags;
 uniform int rtx_denoise;
 uniform int rtx_debug_view;
+// The result from an earlier frame (Metal traces a frame behind): read through that frame's camera.
+uniform int rtx_reproject;
+uniform mat4 rtx_source_view_projection;
+uniform vec2 rtx_source_cells;
 
 vec3 position_at(ivec2 pixel, float depth) {
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(textureSize(early_depth, 0)) * 2.0 - 1.0;
@@ -129,11 +133,24 @@ void main() {
         );
     }
     float shadow = sun_shadow_visibility(world, normal, normal);
-    if (rtx_enabled != 0) {
+    // Where this point is in the traced grid: this frame's own cell, or, for a result traced a
+    // frame or two earlier, the cell this world point had in that frame.
+    ivec2 rtx_grid = half_extent;
+    ivec2 rtx_cell = cell;
+    bool rtx_here = rtx_enabled != 0;
+    if (rtx_here && rtx_reproject != 0) {
+        vec4 clip = rtx_source_view_projection * vec4(world, 1.0);
+        vec2 uv = clip.w > 1e-4 ? clip.xy / clip.w * 0.5 + 0.5 : vec2(-1.0);
+        rtx_grid = ivec2(rtx_source_cells);
+        rtx_cell = clamp(ivec2(floor(uv * vec2(rtx_grid))), ivec2(0), rtx_grid - 1);
+        rtx_here = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+    }
+    int rtx_index = rtx_cell.y * rtx_grid.x + rtx_cell.x;
+    if (rtx_here) {
         // rtx_trace.comp's two words: (bounce, sun visibility), (weighted reflection, ambient
         // visibility). The filter averages decoded values, never the log-encoded bytes.
-        vec4 s0 = texelFetch(rtx_values, index * 2);
-        vec4 s1 = texelFetch(rtx_values, index * 2 + 1);
+        vec4 s0 = texelFetch(rtx_values, rtx_index * 2);
+        vec4 s1 = texelFetch(rtx_values, rtx_index * 2 + 1);
         vec3 gi = decode_rtx_gi(s0.rgb);
         float sun = s0.a, ambient = s1.a;
         vec3 reflection = s1.rgb;
@@ -150,7 +167,8 @@ void main() {
                     }
                     float plane = abs(dot(nv, position_at(np, nd) - centre));
                     float w = exp(-float(dx * dx + dy * dy) * 0.5 - plane * plane / 0.01);
-                    int nidx = nc.y * half_extent.x + nc.x;
+                    ivec2 rc = clamp(rtx_cell + ivec2(dx, dy), ivec2(0), rtx_grid - 1);
+                    int nidx = rc.y * rtx_grid.x + rc.x;
                     vec4 n0 = texelFetch(rtx_values, nidx * 2);
                     vec4 n1 = texelFetch(rtx_values, nidx * 2 + 1);
                     sum_gi += decode_rtx_gi(n0.rgb) * w;
@@ -193,10 +211,11 @@ void main() {
             ao = 1.0;
             covered = true;
         } else {
-            // The bounce takes the probes' place where there are none, and shares it half and
-            // half where there are: both are the same light, which added would count it twice.
-            if ((rtx_flags & 8) != 0) {
-                irradiance = covered ? mix(irradiance, gi, 0.5) : gi;
+            // The bounce fills only where no probe reaches: a verified bake is the calibrated
+            // light (all bounces, the sky), the traced one bounce of the sun is far dimmer, and
+            // mixed in it darkened every lit level.
+            if ((rtx_flags & 8) != 0 && !covered) {
+                irradiance = gi;
                 covered = true;
             }
             // Reflections are specular: Schlick's Fresnel keeps them to grazing angles instead of
@@ -207,13 +226,16 @@ void main() {
                 irradiance += reflection * fresnel;
             }
             // Traced AO replaces the screen-space one (not both: that darkened every corner
-            // twice); the traced sun visibility replaces the shadow map's and touches only
-            // the sun's light, never the ambient.
+            // twice), at three quarters of its depth: a few rays a cell never prove a point
+            // fully closed, and taken whole they left black blotches.
             if ((rtx_flags & 2) != 0) {
-                ao = ambient;
+                ao = 1.0 - 0.75 * (1.0 - ambient);
             }
+            // The traced sun visibility joins the shadow map's, the darker wins: the map tests
+            // alpha (leaves, vines, fences), the trace adds what the map's reach and resolution
+            // miss. Either way it touches only the sun's light, never the ambient.
             if ((rtx_flags & 1) != 0) {
-                shadow = sun;
+                shadow = min(shadow, sun);
             }
         }
     }

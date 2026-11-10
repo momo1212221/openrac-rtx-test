@@ -1091,6 +1091,7 @@ void submit(VkSemaphore wait_semaphore, VkSemaphore signal, bool wait, VkCommand
     }
     ++g->submission.submits;
     f.submitted = true;
+    f.submitted_count = g->frame_count;
     if (wait) {
         crash::breadcrumb("Vulkan wait for submitted frame");
         require_success(

@@ -1,0 +1,67 @@
+#version 430 core
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 the OpenRAC contributors
+//
+// The ray tracing's inputs for Metal's intersector (enhanced/renderer/rtx_metal.mm): each cell of
+// the half-resolution grid's world position and normal, chosen and reconstructed exactly as
+// rtx_trace.comp does before it traces. Two vec4 a cell: (position, 1 or 0 for sky), (normal,
+// roughness). rtx_out is only declared so that the result buffer is the renderer's storage too.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 14) writeonly buffer RtxGbuffer {
+    vec4 rtx_cells[];
+};
+layout(std430, binding = 15) buffer RtxResult {
+    uint rtx_out[];
+};
+uniform sampler2D rtx_depth;
+uniform mat4 rtx_projection;
+uniform mat4 rtx_view;
+uniform float rtx_roughness;
+
+float view_distance(float depth) {
+    return rtx_projection[3][2] / (depth * 2.0 + (rtx_projection[2][2] - 1.0));
+}
+
+vec3 reconstruct_view(ivec2 pixel, float distance, ivec2 extent) {
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(extent) * 2.0 - 1.0;
+    vec2 scale = vec2(rtx_projection[0][0], rtx_projection[1][1]);
+    return vec3((ndc + rtx_projection[2].xy) / scale, -1.0) * distance;
+}
+
+void main() {
+    ivec2 extent = textureSize(rtx_depth, 0);
+    ivec2 cells = (extent + 1) / 2;
+    ivec2 cell_xy = ivec2(gl_GlobalInvocationID.xy);
+    if (cell_xy.x >= cells.x || cell_xy.y >= cells.y) {
+        return;
+    }
+    int cell = cell_xy.y * cells.x + cell_xy.x;
+    if (cell < 0) {
+        rtx_out[0] = 0u;  // never: keeps rtx_out alive in the program's interface
+    }
+    ivec2 base = cell_xy * 2;
+    int pick = (cell_xy.x + cell_xy.y) & 3;
+    ivec2 tap = min(base + ivec2(pick & 1, pick >> 1), extent - 1);
+    float depth = texelFetch(rtx_depth, tap, 0).r;
+    if (depth <= 0.0) {
+        for (int i = 0; i < 4 && depth <= 0.0; ++i) {
+            ivec2 candidate = min(base + ivec2(i & 1, i >> 1), extent - 1);
+            depth = texelFetch(rtx_depth, candidate, 0).r;
+            if (depth > 0.0) {
+                tap = candidate;
+            }
+        }
+    }
+    if (depth <= 0.0) {
+        rtx_cells[cell * 2 + 0] = vec4(0.0);
+        rtx_cells[cell * 2 + 1] = vec4(0.0, 0.0, 1.0, 1.0);
+        return;
+    }
+    vec3 center = reconstruct_view(tap, view_distance(depth), extent);
+    vec3 view_normal = smooth_normal_at(tap, -center);
+    mat3 inverse_view = transpose(mat3(rtx_view));
+    vec3 world = inverse_view * (center - rtx_view[3].xyz);
+    vec3 normal = normalize(inverse_view * view_normal);
+    rtx_cells[cell * 2 + 0] = vec4(world, 1.0);
+    rtx_cells[cell * 2 + 1] = vec4(normal, rtx_roughness);
+}

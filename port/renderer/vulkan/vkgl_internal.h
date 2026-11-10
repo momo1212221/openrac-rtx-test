@@ -312,6 +312,7 @@ struct Frame {
     VkDeviceSize chunk_used = 0;
     std::vector<std::function<void()>> deferred;
     bool submitted = false;  // the fence will be signalled
+    std::uint64_t submitted_count = 0;  // the frame_count it was submitted as (completed_frame)
     // Secondary command buffers the passes of attachment-discard are recorded into, from `pool`;
     // the first `secondary_at` are this recording's.
     std::vector<VkCommandBuffer> secondaries;
@@ -1231,6 +1232,7 @@ struct Context {
     int frame = 0;
     bool frame_pending = false;     // Selected slot has not yet been reclaimed for recording.
     std::uint64_t frame_count = 1;  // frames selected
+    bool metal_objects = false;     // VK_EXT_metal_objects (MoltenVK): vkgl_metal.cpp
     std::uint64_t recording = 1;    // command buffers begun (a flush begins new ones)
     bool upload_used = false;
     bool bulk_texture_upload = false;

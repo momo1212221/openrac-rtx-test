@@ -157,6 +157,13 @@ public:
         const renderer::Camera* camera,
         bool depth_matched
     ) const override;
+    void set_level_sun(
+        const renderer::Vec3& travel, const renderer::Vec3& colour, const renderer::Vec3& fill
+    ) override {
+        m_level_sun = travel;
+        m_level_sun_colour = colour;
+        m_level_fill_colour = fill;
+    }
     bool render_early(
         unsigned depth,
         const renderer::FrameInput& input,
@@ -210,6 +217,10 @@ private:
     enhanced::HeroFur m_fur;
     enhanced::WaterFloat m_water_float;
     enhanced::Atmosphere m_atmosphere;
+    // The level's main light and fill (set_level_sun), for the traced sunlight and sky.
+    std::optional<renderer::Vec3> m_level_sun;
+    renderer::Vec3 m_level_sun_colour{1.0f, 0.96f, 0.88f};
+    renderer::Vec3 m_level_fill_colour{0.4f, 0.45f, 0.55f};
     enhanced::RtxPipeline m_rtx;     // Native hardware ray-tracing pipeline (Metal / CUDA / Vulkan).
     ProbeLighting m_probes;          // The level's probe bake on the GPU.
     EarlyLighting m_early_lighting;  // The early-lit world's per-pixel lighting.

@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -319,6 +320,223 @@ kernel void rtx_trace_screen_kernel(
     out_rgba8_pairs[cell * 2u + 0u] = pack_rgba8(float4(encoded_gi, combined_vis));
     out_rgba8_pairs[cell * 2u + 1u] = pack_rgba8(float4(clamp(refl_radiance, 0.0f, 1.0f), refl_confidence));
 }
+// ---- One frame on the GPU (RtxFrameJob): rtx_gbuffer.comp's cells in, rtx_trace.comp's words out.
+
+struct FrameParams {
+    float4x4 prev_view_projection;
+    float4 camera_pos;
+    float4 sun_dir;      // the light's travel direction
+    float4 sun_colour;
+    float4 sky_colour;
+    uint width;
+    uint height;
+    uint samples;
+    uint flags;          // bit0 shadows, bit1 AO, bit2 reflections, bit3 bounce
+    uint frame_index;
+    uint has_dynamic;
+    uint history_valid;
+    uint pad0;
+    float ray_distance;
+    float ao_radius;
+    float shadow_softness;
+    float gi_strength;
+    float roughness_cutoff;
+    float history_blend;
+    float pad1;
+    float pad2;
+};
+
+struct FrameHit {
+    bool hit;
+    float t;
+    float3 normal;
+    float3 albedo;
+};
+
+// The nearer hit of the level's structure and the mobys'.
+inline FrameHit frame_closest(ray r, primitive_acceleration_structure level,
+                              device const RtxTriangleGpu* level_tris,
+                              primitive_acceleration_structure mobys,
+                              device const RtxTriangleGpu* moby_tris, bool has_mobys) {
+    intersector<triangle_data> it;
+    it.assume_geometry_type(geometry_type::triangle);
+    FrameHit h;
+    h.hit = false;
+    h.t = r.max_distance;
+    h.normal = float3(0.0f, 0.0f, 1.0f);
+    h.albedo = float3(0.5f);
+    auto a = it.intersect(r, level);
+    if (a.type == intersection_type::triangle) {
+        RtxTriangleGpu tri = level_tris[a.primitive_id];
+        h.hit = true;
+        h.t = a.distance;
+        h.normal = tri.normal_albedo.xyz;
+        h.albedo = unpack_rgb8(as_type<uint>(tri.normal_albedo.w));
+        r.max_distance = a.distance;
+    }
+    if (has_mobys) {
+        auto b = it.intersect(r, mobys);
+        if (b.type == intersection_type::triangle) {
+            RtxTriangleGpu tri = moby_tris[b.primitive_id];
+            h.hit = true;
+            h.t = b.distance;
+            h.normal = tri.normal_albedo.xyz;
+            h.albedo = unpack_rgb8(as_type<uint>(tri.normal_albedo.w));
+        }
+    }
+    return h;
+}
+
+inline bool frame_blocked(ray r, primitive_acceleration_structure level,
+                          primitive_acceleration_structure mobys, bool has_mobys) {
+    intersector<triangle_data> it;
+    it.assume_geometry_type(geometry_type::triangle);
+    it.accept_any_intersection(true);
+    if (it.intersect(r, level).type != intersection_type::none) {
+        return true;
+    }
+    return has_mobys && it.intersect(r, mobys).type != intersection_type::none;
+}
+
+inline float4 unpack_rgba8(uint u) {
+    return float4(float(u & 0xFFu), float((u >> 8u) & 0xFFu), float((u >> 16u) & 0xFFu),
+                  float(u >> 24u)) * (1.0f / 255.0f);
+}
+
+kernel void rtx_trace_frame_kernel(
+    primitive_acceleration_structure level [[buffer(0)]],
+    device const RtxTriangleGpu* level_tris [[buffer(1)]],
+    primitive_acceleration_structure mobys [[buffer(2)]],
+    device const RtxTriangleGpu* moby_tris [[buffer(3)]],
+    device const float4* cells [[buffer(4)]],
+    constant FrameParams& p [[buffer(5)]],
+    device uint* result [[buffer(6)]],
+    device const uint* history [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= p.width || gid.y >= p.height) {
+        return;
+    }
+    uint cell = gid.y * p.width + gid.x;
+    float4 position = cells[cell * 2u];
+    if (position.w <= 0.0f) {
+        result[cell * 2u + 0u] = 0xFF000000u;
+        result[cell * 2u + 1u] = 0xFF000000u;
+        return;
+    }
+    float4 normal_rough = cells[cell * 2u + 1u];
+    float3 N = normalize(normal_rough.xyz);
+    float3 origin = position.xyz + N * 0.03f;
+    uint seed = pcg_hash(cell ^ (p.frame_index * 1664525u + 1013904223u));
+    uint spp = clamp(p.samples, 1u, 8u);
+    bool mobys_on = p.has_dynamic != 0u;
+    float3 to_sun = normalize(-p.sun_dir.xyz);
+
+    // Sun: soft shadow rays toward a cone around the sun.
+    float sun_visible = 1.0f;
+    if ((p.flags & 1u) != 0u) {
+        if (dot(N, to_sun) > 0.0f) {
+            float3 st, sb;
+            make_orthonormal_basis(to_sun, st, sb);
+            uint lit = 0u;
+            for (uint s = 0u; s < spp; ++s) {
+                float r = sqrt(rand01(seed)) * p.shadow_softness;
+                float phi = 6.28318530718f * rand01(seed);
+                ray sr(origin, normalize(to_sun + (st * cos(phi) + sb * sin(phi)) * r), 0.025f,
+                       p.ray_distance);
+                lit += frame_blocked(sr, level, mobys, mobys_on) ? 0u : 1u;
+            }
+            sun_visible = float(lit) / float(spp);
+        } else {
+            sun_visible = 0.0f;
+        }
+    }
+
+    // Ambient occlusion, and the bounce where no probe bake lights the level.
+    float ambient = 1.0f;
+    float3 bounce = float3(0.0f);
+    if ((p.flags & 10u) != 0u) {
+        bool gi = (p.flags & 8u) != 0u;
+        uint blocked = 0u;
+        for (uint s = 0u; s < spp; ++s) {
+            float3 dir = sample_cosine_hemisphere(N, rand01(seed), rand01(seed));
+            ray br(origin, dir, 0.025f, gi ? p.ray_distance : p.ao_radius);
+            if (!gi) {
+                blocked += frame_blocked(br, level, mobys, mobys_on) ? 1u : 0u;
+                continue;
+            }
+            FrameHit h = frame_closest(br, level, level_tris, mobys, moby_tris, mobys_on);
+            if (h.hit) {
+                blocked += h.t <= p.ao_radius ? 1u : 0u;
+                float3 hn = dot(h.normal, dir) > 0.0f ? -h.normal : h.normal;
+                float ndotl = max(0.0f, dot(hn, to_sun));
+                float sun_at_hit = 0.0f;
+                if (ndotl > 0.0f) {
+                    ray sr(origin + dir * h.t + hn * 0.03f, to_sun, 0.025f, p.ray_distance);
+                    sun_at_hit = frame_blocked(sr, level, mobys, mobys_on) ? 0.0f : ndotl;
+                }
+                bounce += h.albedo * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.25f);
+            } else {
+                bounce += p.sky_colour.xyz * max(0.2f, 0.5f + 0.5f * dir.z);
+            }
+        }
+        if ((p.flags & 2u) != 0u) {
+            ambient = 1.0f - float(blocked) / float(spp);
+        }
+        bounce = gi ? bounce / float(spp) * p.gi_strength : float3(0.0f);
+    }
+
+    // A reflection, weighted by its confidence.
+    float3 reflection = float3(0.0f);
+    if ((p.flags & 4u) != 0u && p.roughness_cutoff > 0.05f) {
+        float3 V = normalize(position.xyz - p.camera_pos.xyz);
+        float3 R = reflect(V, N);
+        float cone = clamp((1.0f - p.roughness_cutoff) * 0.12f, 0.0f, 0.12f);
+        if (cone > 0.001f) {
+            R = normalize(mix(R, sample_cosine_hemisphere(R, rand01(seed) * cone, rand01(seed)), cone));
+        }
+        if (dot(R, N) > 0.01f) {
+            ray rr(origin, R, 0.03f, p.ray_distance);
+            FrameHit h = frame_closest(rr, level, level_tris, mobys, moby_tris, mobys_on);
+            float confidence;
+            float3 seen;
+            if (h.hit) {
+                float3 hn = dot(h.normal, R) > 0.0f ? -h.normal : h.normal;
+                float ndotl = max(0.0f, dot(hn, to_sun));
+                float sun_at_hit = 0.0f;
+                if (ndotl > 0.0f) {
+                    ray sr(origin + R * h.t + hn * 0.03f, to_sun, 0.025f, p.ray_distance);
+                    sun_at_hit = frame_blocked(sr, level, mobys, mobys_on) ? 0.0f : ndotl;
+                }
+                seen = h.albedo * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.35f);
+                confidence = clamp(1.0f - h.t / p.ray_distance, 0.15f, 1.0f)
+                             * clamp(p.roughness_cutoff, 0.1f, 1.0f);
+            } else {
+                seen = p.sky_colour.xyz * max(0.25f, 0.5f + 0.5f * R.z);
+                confidence = 0.5f * clamp(p.roughness_cutoff, 0.1f, 1.0f);
+            }
+            reflection = clamp(seen * confidence, 0.0f, 1.0f);
+        }
+    }
+
+    float4 word0 = float4(encode_early_gi(bounce), sun_visible);
+    float4 word1 = float4(reflection, ambient);
+    // The previous job's result at this point through its camera: several frames' rays together.
+    if (p.history_valid != 0u) {
+        float4 clip = p.prev_view_projection * float4(position.xyz, 1.0f);
+        if (clip.w > 1e-4f) {
+            float2 uv = clip.xy / clip.w * 0.5f + 0.5f;
+            if (all(uv >= float2(0.0f)) && all(uv < float2(1.0f))) {
+                uint2 prev = min(uint2(uv * float2(p.width, p.height)), uint2(p.width - 1u, p.height - 1u));
+                uint pi = prev.y * p.width + prev.x;
+                word0 = mix(unpack_rgba8(history[pi * 2u]), word0, p.history_blend);
+                word1 = mix(unpack_rgba8(history[pi * 2u + 1u]), word1, p.history_blend);
+            }
+        }
+    }
+    result[cell * 2u + 0u] = pack_rgba8(word0);
+    result[cell * 2u + 1u] = pack_rgba8(word1);
+}
 )msl";
 
 struct alignas(16) MetalScreenParams {
@@ -339,18 +557,34 @@ struct alignas(16) MetalScreenParams {
     float pad[2]{};
 };
 
+// FrameParams in the kernel, field for field.
+struct alignas(16) MetalFrameParams {
+    float prev_view_projection[16]{};
+    float camera_pos[4]{};
+    float sun_dir[4]{};
+    float sun_colour[4]{};
+    float sky_colour[4]{};
+    std::uint32_t width = 0, height = 0, samples = 1, flags = 0;
+    std::uint32_t frame_index = 0, has_dynamic = 0, history_valid = 0, pad0 = 0;
+    float ray_distance = 120.0f, ao_radius = 2.5f, shadow_softness = 0.035f, gi_strength = 1.0f;
+    float roughness_cutoff = 0.65f, history_blend = 1.0f, pad1 = 0.0f, pad2 = 0.0f;
+};
+static_assert(sizeof(MetalFrameParams) == 192);  // FrameParams: 64 + 4 x 16 + 8 x 4 + 8 x 4
+
 class MetalRtxBackend final : public RtxHardwareBackend {
 public:
     MetalRtxBackend(
         id<MTLDevice> device,
         id<MTLCommandQueue> queue,
         id<MTLComputePipelineState> trace_rays_pso,
-        id<MTLComputePipelineState> trace_screen_pso
+        id<MTLComputePipelineState> trace_screen_pso,
+        id<MTLComputePipelineState> trace_frame_pso
     )
         : m_device(device),
           m_queue(queue),
           m_trace_rays_pso(trace_rays_pso),
-          m_trace_screen_pso(trace_screen_pso) {
+          m_trace_screen_pso(trace_screen_pso),
+          m_trace_frame_pso(trace_frame_pso) {
         if (m_device && [m_device name]) {
             m_device_name = std::string([[m_device name] UTF8String]) + " (Metal RT)";
         } else {
@@ -594,7 +828,145 @@ public:
         }
     }
 
+    void* native_device() const override { return (__bridge void*)m_device; }
+
+    // Builds the mobys' structure into `cmd` when they changed; false without any.
+    bool prepare_mobys(id<MTLCommandBuffer> cmd, const RtxFrameJob& job) {
+        if (job.dynamic_key == m_moby_key && (m_moby_accel != nil || job.dynamic_triangles.empty())) {
+            return m_moby_accel != nil;
+        }
+        m_moby_key = job.dynamic_key;
+        m_moby_accel = nil;
+        m_moby_triangles = nil;
+        const auto tris = job.dynamic_triangles;
+        if (tris.empty()) {
+            return false;
+        }
+        std::vector<float> vertices(tris.size() * 9);
+        for (std::size_t i = 0; i < tris.size(); ++i) {
+            const auto& t = tris[i];
+            for (int a = 0; a < 3; ++a) {
+                vertices[i * 9 + a] = t.v0_mat[a];
+                vertices[i * 9 + 3 + a] = t.v0_mat[a] + t.e1_layer[a];
+                vertices[i * 9 + 6 + a] = t.v0_mat[a] + t.e2_flags[a];
+            }
+        }
+        id<MTLBuffer> vertex = [m_device newBufferWithBytes:vertices.data()
+                                                     length:vertices.size() * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        m_moby_triangles = [m_device newBufferWithBytes:tris.data()
+                                                 length:tris.size() * sizeof(RtxTriangle)
+                                                options:MTLResourceStorageModeShared];
+        MTLAccelerationStructureTriangleGeometryDescriptor* geom =
+            [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        geom.vertexBuffer = vertex;
+        geom.vertexStride = sizeof(float) * 3;
+        geom.triangleCount = tris.size();
+        geom.opaque = YES;
+        MTLPrimitiveAccelerationStructureDescriptor* desc =
+            [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        desc.geometryDescriptors = @[ geom ];
+        // Rebuilt as the mobys move: built fast, traced a little slower.
+        desc.usage = MTLAccelerationStructureUsagePreferFastBuild;
+        const MTLAccelerationStructureSizes sizes =
+            [m_device accelerationStructureSizesWithDescriptor:desc];
+        id<MTLAccelerationStructure> accel =
+            [m_device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+        id<MTLBuffer> scratch =
+            [m_device newBufferWithLength:std::max<NSUInteger>(sizes.buildScratchBufferSize, 256)
+                                  options:MTLResourceStorageModePrivate];
+        if (accel == nil || scratch == nil || vertex == nil || m_moby_triangles == nil) {
+            m_moby_triangles = nil;
+            return false;
+        }
+        id<MTLAccelerationStructureCommandEncoder> enc = [cmd accelerationStructureCommandEncoder];
+        [enc buildAccelerationStructure:accel descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
+        [enc endEncoding];
+        m_moby_accel = accel;
+        return true;
+    }
+
+    std::uint64_t submit_frame(const RtxFrameJob& job, std::string& error) override {
+        @autoreleasepool {
+            std::lock_guard lock(m_mutex);
+            if (m_accel == nil || m_triangle_buffer == nil || m_trace_frame_pso == nil
+                || job.cells == nullptr || job.result == nullptr || job.width <= 0
+                || job.height <= 0) {
+                return 0;
+            }
+            id<MTLBuffer> cells = (__bridge id<MTLBuffer>)job.cells;
+            id<MTLBuffer> result = (__bridge id<MTLBuffer>)job.result;
+            id<MTLBuffer> history = job.history ? (__bridge id<MTLBuffer>)job.history : result;
+            id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
+            cmd.label = @"OpenRAC ray tracing";
+            const bool mobys = prepare_mobys(cmd, job);
+
+            MetalFrameParams p{};
+            std::memcpy(p.prev_view_projection, job.prev_view_projection.data(), sizeof(float) * 16);
+            std::memcpy(p.camera_pos, job.camera_pos.data(), sizeof(float) * 3);
+            std::memcpy(p.sun_dir, job.sun_dir.data(), sizeof(float) * 3);
+            std::memcpy(p.sun_colour, job.sun_colour.data(), sizeof(float) * 3);
+            std::memcpy(p.sky_colour, job.sky_colour.data(), sizeof(float) * 3);
+            p.width = static_cast<std::uint32_t>(job.width);
+            p.height = static_cast<std::uint32_t>(job.height);
+            const auto& s = job.settings;
+            p.samples = static_cast<std::uint32_t>(
+                s.quality == renderer::RtxQuality::Performance ? 1
+                : s.quality == renderer::RtxQuality::Balanced ? std::min(2, s.samples_per_pixel)
+                                                               : std::clamp(s.samples_per_pixel, 1, 8)
+            );
+            p.flags = static_cast<std::uint32_t>(job.flags);
+            p.frame_index = job.frame_index;
+            p.has_dynamic = mobys ? 1u : 0u;
+            p.history_valid = job.history != nullptr ? 1u : 0u;
+            p.ray_distance = s.ray_distance;
+            p.ao_radius = s.ao_radius;
+            p.shadow_softness = s.shadow_softness;
+            p.gi_strength = s.gi_strength;
+            p.roughness_cutoff = s.reflection_roughness_cutoff;
+            p.history_blend = job.history != nullptr ? 0.25f : 1.0f;
+
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:m_trace_frame_pso];
+            [enc setAccelerationStructure:m_accel atBufferIndex:0];
+            [enc setBuffer:m_triangle_buffer offset:0 atIndex:1];
+            [enc setAccelerationStructure:(mobys ? m_moby_accel : m_accel) atBufferIndex:2];
+            [enc setBuffer:(mobys ? m_moby_triangles : m_triangle_buffer) offset:0 atIndex:3];
+            [enc setBuffer:cells offset:job.cells_offset atIndex:4];
+            [enc setBytes:&p length:sizeof p atIndex:5];
+            [enc setBuffer:result offset:job.result_offset atIndex:6];
+            [enc setBuffer:history offset:(job.history ? job.history_offset : job.result_offset) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake((p.width + 7) / 8, (p.height + 7) / 8, 1)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            const std::uint64_t number = m_next_job++;
+            m_jobs[number % m_jobs.size()] = {number, cmd};
+            (void)error;
+            return number;
+        }
+    }
+
+    bool finished(std::uint64_t job) const override {
+        const auto& slot = m_jobs[job % m_jobs.size()];
+        if (slot.number != job || slot.commands == nil) {
+            return true;  // long gone: done
+        }
+        const MTLCommandBufferStatus status = slot.commands.status;
+        return status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError;
+    }
+
 private:
+    struct Job {
+        std::uint64_t number = 0;
+        id<MTLCommandBuffer> commands = nil;
+    };
+    std::array<Job, 8> m_jobs{};
+    std::uint64_t m_next_job = 1;
+    id<MTLComputePipelineState> m_trace_frame_pso = nil;
+    id<MTLAccelerationStructure> m_moby_accel = nil;
+    id<MTLBuffer> m_moby_triangles = nil;
+    std::uint64_t m_moby_key = 0;
     std::mutex m_mutex;
     id<MTLDevice> m_device = nil;
     id<MTLCommandQueue> m_queue = nil;
@@ -615,37 +987,53 @@ bool metal_rtx_supported() {
     }
 }
 
+namespace {
+
+std::unique_ptr<RtxHardwareBackend> make_metal_backend(id<MTLDevice> device) {
+    if (!device || ![device supportsRaytracing]) {
+        return nullptr;
+    }
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (!queue) {
+        return nullptr;
+    }
+    MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+    opts.languageVersion = MTLLanguageVersion2_4;
+    NSError* err = nil;
+    NSString* src = [NSString stringWithUTF8String:kMetalRtxShaderSource];
+    id<MTLLibrary> lib = [device newLibraryWithSource:src options:opts error:&err];
+    if (!lib) {
+        NSLog(@"OpenRAC Metal RT: %@", err.localizedDescription);
+        return nullptr;
+    }
+    id<MTLFunction> rays_fn = [lib newFunctionWithName:@"rtx_trace_rays_kernel"];
+    id<MTLFunction> screen_fn = [lib newFunctionWithName:@"rtx_trace_screen_kernel"];
+    id<MTLFunction> frame_fn = [lib newFunctionWithName:@"rtx_trace_frame_kernel"];
+    if (!rays_fn || !screen_fn || !frame_fn) {
+        return nullptr;
+    }
+    id<MTLComputePipelineState> rays_pso = [device newComputePipelineStateWithFunction:rays_fn error:&err];
+    id<MTLComputePipelineState> screen_pso =
+        [device newComputePipelineStateWithFunction:screen_fn error:&err];
+    id<MTLComputePipelineState> frame_pso =
+        [device newComputePipelineStateWithFunction:frame_fn error:&err];
+    if (!rays_pso || !screen_pso || !frame_pso) {
+        return nullptr;
+    }
+    return std::make_unique<MetalRtxBackend>(device, queue, rays_pso, screen_pso, frame_pso);
+}
+
+}  // namespace
+
 std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend() {
     @autoreleasepool {
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        if (!device || ![device supportsRaytracing]) {
-            return nullptr;
-        }
-        id<MTLCommandQueue> queue = [device newCommandQueue];
-        if (!queue) {
-            return nullptr;
-        }
-        MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        opts.languageVersion = MTLLanguageVersion2_4;
-        NSError* err = nil;
-        NSString* src = [NSString stringWithUTF8String:kMetalRtxShaderSource];
-        id<MTLLibrary> lib = [device newLibraryWithSource:src options:opts error:&err];
-        if (!lib) {
-            return nullptr;
-        }
-        id<MTLFunction> rays_fn = [lib newFunctionWithName:@"rtx_trace_rays_kernel"];
-        id<MTLFunction> screen_fn = [lib newFunctionWithName:@"rtx_trace_screen_kernel"];
-        if (!rays_fn || !screen_fn) {
-            return nullptr;
-        }
-        id<MTLComputePipelineState> rays_pso =
-            [device newComputePipelineStateWithFunction:rays_fn error:&err];
-        id<MTLComputePipelineState> screen_pso =
-            [device newComputePipelineStateWithFunction:screen_fn error:&err];
-        if (!rays_pso || !screen_pso) {
-            return nullptr;
-        }
-        return std::make_unique<MetalRtxBackend>(device, queue, rays_pso, screen_pso);
+        return make_metal_backend(MTLCreateSystemDefaultDevice());
+    }
+}
+
+std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend_on(void* device) {
+    @autoreleasepool {
+        return make_metal_backend((__bridge id<MTLDevice>)device);
     }
 }
 

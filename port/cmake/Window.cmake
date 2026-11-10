@@ -112,7 +112,7 @@ if(OPENRAC_VULKAN)
     renderer/vulkan/prepared_raster.cpp
     renderer/vulkan/temporal_graph.cpp
     renderer/vulkan/temporal_compute.cpp
-    renderer/vulkan/native_compute.cpp
+    renderer/vulkan/native_compute.cpp renderer/vulkan/native_metal.cpp
     renderer/vulkan/depth_combine.cpp
     renderer/vulkan/graph_states.cpp
     renderer/vulkan/graph_execution.cpp
@@ -532,6 +532,7 @@ openrac_embed_shaders(openrac_enhanced_viewer enhanced_viewer openrac::lighting
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/local_lights.glsl"
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/local_lights.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/rtx_trace.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/rtx_gbuffer.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/water.glsl"
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/water_transmission.glsl"
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/renderer/shaders/environment.glsl"

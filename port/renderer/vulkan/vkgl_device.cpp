@@ -680,6 +680,13 @@ bool make_device(std::string& error) {
             if (std::strcmp(e.extensionName, kPortabilitySubset) == 0) {
                 extensions.push_back(kPortabilitySubset);
             }
+            // MoltenVK's Metal objects behind Vulkan's (vkgl_metal.cpp): the ray tracing reads
+            // the renderer's buffers on the same MTLDevice with Metal's own intersector.
+            constexpr const char* kMetalObjects = "VK_EXT_metal_objects";  // vulkan_metal.h
+            if (std::strcmp(e.extensionName, kMetalObjects) == 0) {
+                extensions.push_back(kMetalObjects);
+                g->metal_objects = true;
+            }
             if (std::strcmp(e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0) {
                 VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
                 query.pNext = &fault;

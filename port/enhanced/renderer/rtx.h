@@ -86,9 +86,39 @@ struct RtxStatus {
     bool vulkan_ray_query_supported = false;
 };
 
+// One frame's tracing on the GPU, with no copy through the CPU: the cells' positions and normals
+// (rtx_gbuffer.comp's two vec4 a cell) and the result (rtx_trace.comp's two RGBA8 words a cell)
+// are the renderer's own buffers, given as the backend's native objects. Metal: id<MTLBuffer>.
+struct RtxFrameJob {
+    void* cells = nullptr;
+    std::size_t cells_offset = 0;
+    void* result = nullptr;
+    std::size_t result_offset = 0;
+    void* history = nullptr;  // the previous job's result, blended in through its camera
+    std::size_t history_offset = 0;
+    std::array<float, 16> prev_view_projection{};
+    int width = 0, height = 0;  // cells
+    std::array<float, 3> camera_pos{}, sun_dir{}, sun_colour{}, sky_colour{};
+    renderer::RtxSettings settings;
+    int flags = 0;  // RtxPipeline::effect_flags
+    std::uint32_t frame_index = 0;
+    // The mobys' world-space triangles, rebuilt into their own structure when `dynamic_key` changes.
+    std::span<const RtxTriangle> dynamic_triangles;
+    std::uint64_t dynamic_key = 0;
+};
+
 // Native hardware backend interface (implemented by Metal on macOS and CUDA on NVIDIA).
 class RtxHardwareBackend {
 public:
+    // Queues `job` on the GPU without waiting; its number for finished(), 0 when it cannot.
+    virtual std::uint64_t submit_frame(const RtxFrameJob& /*job*/, std::string& /*error*/) {
+        return 0;
+    }
+    // Whether the job numbered `job` is done (its result may be read); never blocks.
+    virtual bool finished(std::uint64_t /*job*/) const { return true; }
+    // The native device it runs on (Metal: id<MTLDevice>), to match the renderer's.
+    virtual void* native_device() const { return nullptr; }
+
     virtual ~RtxHardwareBackend() = default;
     virtual renderer::RtxBackend kind() const = 0;
     virtual std::string_view device_name() const = 0;
@@ -122,6 +152,8 @@ public:
 
 // Factory functions for the native Apple Metal and NVIDIA CUDA backends.
 std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend();
+// The Metal backend on a given id<MTLDevice> (the renderer's, vkgl::metal_device()).
+std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend_on(void* device);
 std::unique_ptr<RtxHardwareBackend> create_cuda_rtx_backend();
 bool metal_rtx_supported();
 bool cuda_rtx_supported();
@@ -181,6 +213,9 @@ public:
     );
 
     bool active(const renderer::FrameInput& input, const renderer::RenderState& state) const;
+    // Whether a verified probe bake lights this level (its bounce then needs no rays).
+    void set_probe_coverage(bool covers) { m_probes_cover = covers; }
+    int effect_flags(const renderer::RtxSettings& settings) const;
     unsigned output_buffer() const { return m_output_buffer; }
     unsigned output_texture() const { return m_output_texture; }
     // The static tree; the mobys' is apart (dynamic_*).
@@ -193,6 +228,42 @@ public:
 private:
     void build_bvh();
     void ensure_gpu_buffers();
+    // Metal's own ray tracing on the renderer's device (Vulkan through MoltenVK): whether it runs
+    // this frame, and its frame (render's work when it does).
+    bool metal_frames(const renderer::FrameInput& input);
+    bool render_metal(
+        unsigned depth,
+        const renderer::FrameInput& input,
+        const renderer::RenderTarget& target,
+        const renderer::Vec3& sun_direction,
+        const renderer::Vec3& sun_colour,
+        const renderer::Vec3& sky_colour,
+        std::string& error
+    );
+    void release_metal_slots();
+
+    // One frame's cells and result on their way through Metal: Free; Written (the Vulkan frame
+    // that fills `cells` is queued); Submitted (Metal traces them); Done (`result` is readable).
+    struct MetalSlot {
+        enum class State { Free, Written, Submitted, Done } state = State::Free;
+        unsigned cells = 0, result = 0, result_texture = 0;
+        int width = 0, height = 0;
+        std::uint64_t vk_frame = 0, job = 0, serial = 0;
+        renderer::Mat4 view_projection{};
+        RtxFrameJob params;  // all but the buffers, taken when the slot is written
+        std::vector<RtxTriangle> mobys;
+    };
+    std::array<MetalSlot, 3> m_slots{};
+    int m_next_slot = 0, m_latest_slot = -1, m_last_submitted = -1;
+    std::uint64_t m_slot_serial = 0;
+    renderer::Shader m_gbuffer_compute;
+    bool m_gbuffer_failed = false;
+    // Early lighting reads the result through the camera it was traced from (render_metal), or
+    // this frame's own cells (the compute pass).
+    bool m_reproject = false;
+    unsigned m_metal_texture = 0;  // the newest finished slot's result (not owned)
+    renderer::Mat4 m_source_view_projection{};
+    std::array<int, 2> m_source_cells{};
     RtxHardwareBackend* select_hardware_backend(renderer::RtxBackend requested) const;
 
     void clear_dynamic();
@@ -223,8 +294,14 @@ private:
     unsigned m_dyn_bvh_texture = 0;
     unsigned m_dyn_tri_buffer = 0;
     unsigned m_dyn_tri_texture = 0;
-    unsigned m_output_buffer = 0;
+    unsigned m_output_buffer = 0;   // this frame's result
     unsigned m_output_texture = 0;
+    unsigned m_history_buffer = 0;  // the previous frame's, swapped each frame
+    unsigned m_history_texture = 0;
+    bool m_history_valid = false;
+    renderer::Mat4 m_prev_view{};
+    renderer::Mat4 m_prev_projection{};
+    std::array<float, 3> m_prev_camera{};
     bool m_static_dirty = false;
     bool m_dynamic_dirty = false;
     bool m_compute_failed = false;
@@ -234,6 +311,7 @@ private:
     unsigned m_target = 0;
     std::uint64_t m_frame = 0;
     bool m_ready = false;
+    bool m_probes_cover = false;
     const char* m_logged = nullptr;  // the last state logged (render's reasons), once each
 };
 

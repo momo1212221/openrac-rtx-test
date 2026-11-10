@@ -203,6 +203,14 @@ public:
         bool depth_matched
     ) const = 0;
 
+    // The level's own main light (light set 0's first light: its travel direction and colour)
+    // and its fill light's colour, which the scene gives before each render_early, so that
+    // traced sunlight falls as the shadow maps' does.
+    virtual void set_level_sun(
+        const renderer::Vec3& /*travel*/, const renderer::Vec3& /*colour*/,
+        const renderer::Vec3& /*fill*/
+    ) {}
+
     // Draws the early lighting from the world's `depth`; `bind_lighting` sets the scene's own
     // lighting on its shader. Returns whether it drew, with `error` when it could not.
     virtual bool render_early(

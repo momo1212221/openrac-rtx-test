@@ -465,14 +465,21 @@ bool SceneLighting::render_early(
 ) {
     if (input.rtx) {
         std::string rtx_error;
+        // The level's own sun, as the shadow maps take it (level_shadows.cpp): its authored
+        // travel direction, then a verified bake's or the runtime's override. Without light sets,
+        // a high sun from behind the default camera.
         const renderer::Vec3 sun_dir =
-            sunlight_direction({-0.57735f, -0.57735f, -0.57735f});
-        const renderer::Vec3 sun_col{1.0f, 0.96f, 0.88f};
-        const renderer::Vec3 sky_col{
-            input.clear_colour[0] * 0.5f + 0.15f,
-            input.clear_colour[1] * 0.5f + 0.18f,
-            input.clear_colour[2] * 0.5f + 0.25f
+            sunlight_direction(m_level_sun.value_or(renderer::Vec3{-0.57735f, -0.57735f, -0.57735f}));
+        // Its colour and the fill's, normalised to the brightest channel: the traced pass asks
+        // what tint the light has and where it reaches, the shading keeps the level's brightness.
+        const auto tint = [](const renderer::Vec3& c, const renderer::Vec3& fallback) {
+            const float peak = std::max({c[0], c[1], c[2]});
+            return peak > 1e-4f ? renderer::Vec3{c[0] / peak, c[1] / peak, c[2] / peak} : fallback;
         };
+        const renderer::Vec3 sun_col = tint(m_level_sun_colour, {1.0f, 0.96f, 0.88f});
+        const renderer::Vec3 fill = tint(m_level_fill_colour, {0.75f, 0.82f, 1.0f});
+        const renderer::Vec3 sky_col{fill[0] * 0.6f, fill[1] * 0.6f, fill[2] * 0.6f};
+        m_rtx.set_probe_coverage(m_probes.active());
         if (!m_rtx.render(depth, input, target, sun_dir, sun_col, sky_col, rtx_error)
             && !rtx_error.empty()) {
             log::warn("rtx: {}", rtx_error);

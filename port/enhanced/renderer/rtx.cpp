@@ -22,6 +22,7 @@
 #include "renderer/gl.h"
 #if defined(OPENRAC_VULKAN)
 #include "renderer/vulkan/native_compute.h"
+#include "renderer/vulkan/native_metal.h"
 #endif
 #include "renderer/world/gl_world.h"
 #include "renderer_shaders.h"
@@ -337,6 +338,10 @@ bool metal_rtx_supported() {
 std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend() {
     return nullptr;
 }
+
+std::unique_ptr<RtxHardwareBackend> create_metal_rtx_backend_on(void*) {
+    return nullptr;
+}
 #endif
 
 RtxStatus rtx_status() {
@@ -431,7 +436,11 @@ void RtxPipeline::upload(const scene::LevelData& level) {
             if (prim.material >= 0
                 && static_cast<std::size_t>(prim.material) < level.materials.size()) {
                 const auto& mat = level.materials[static_cast<std::size_t>(prim.material)];
-                if (mat.blend) {
+                // Blended and alpha-tested (cutout) surfaces are left out: the tree has no
+                // texture to test, so a leaf card or a vine's quad would block as a solid wall,
+                // blackening the ambient and casting square shadows. The shadow maps keep their
+                // alpha-tested shadows (early_lighting.comp takes the darker of both).
+                if (mat.blend || mat.cutout) {
                     continue;
                 }
             }
@@ -568,8 +577,15 @@ void RtxPipeline::prepare_instances(
             key = (key ^ bytes[i]) * 1099511628211ull;
         }
     };
+    // Skinned mobys (Ratchet, enemies: a joint palette) are left out: the tree holds bind poses,
+    // and a T-posed body shadowed the animated one and cast a second, wrong shadow beside the
+    // hero shadow map's. Rigid mobys (crates, props, machines) stay.
+    const auto traced = [&](const scene::Instance& inst) {
+        return !inst.stand_in && !inst.lighting_only && inst.palette < 0
+               && inst.model < m_moby_meshes.size();
+    };
     for (const auto& inst : instances) {
-        if (inst.stand_in || inst.lighting_only || inst.model >= m_moby_meshes.size()) {
+        if (!traced(inst)) {
             continue;
         }
         mix(&inst.model, sizeof inst.model);
@@ -585,7 +601,7 @@ void RtxPipeline::prepare_instances(
     std::vector<RtxTriangle> dyn_tris;
     dyn_tris.reserve(std::min<std::size_t>(kMaxDynamicMobyTriangles, instances.size() * 64));
     for (const auto& inst : instances) {
-        if (inst.stand_in || inst.lighting_only || inst.model >= m_moby_meshes.size()) {
+        if (!traced(inst)) {
             continue;
         }
         const auto& slice = m_moby_meshes[inst.model].local_triangles;
@@ -702,6 +718,8 @@ void RtxPipeline::ensure_gpu_buffers() {
         glGenTextures(1, &m_dyn_tri_texture);
         glGenBuffers(1, &m_output_buffer);
         glGenTextures(1, &m_output_texture);
+        glGenBuffers(1, &m_history_buffer);
+        glGenTextures(1, &m_history_texture);
         m_static_dirty = true;
         m_dynamic_dirty = true;
     }
@@ -766,6 +784,10 @@ bool RtxPipeline::render(
     if (!depth || target.width < 2 || target.height < 2) {
         return false;
     }
+    m_reproject = false;
+    if (metal_frames(input)) {
+        return render_metal(depth, input, target, sun_direction, sun_colour, sky_colour, error);
+    }
 
     const int width = target.width;
     const int height = target.height;
@@ -787,15 +809,31 @@ bool RtxPipeline::render(
     }
 
     ensure_gpu_buffers();
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_output_buffer);
+    // Last frame's result becomes the history this frame reads; this frame writes the other.
+    std::swap(m_output_buffer, m_history_buffer);
+    std::swap(m_output_texture, m_history_texture);
     if (width != m_width || height != m_height) {
-        glBufferData(
-            GL_SHADER_STORAGE_BUFFER,
-            cells * 2 * sizeof(std::uint32_t),
-            nullptr,
-            GL_DYNAMIC_DRAW
-        );
+        for (unsigned buffer : {m_output_buffer, m_history_buffer}) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+            glBufferData(
+                GL_SHADER_STORAGE_BUFFER, cells * 2 * sizeof(std::uint32_t), nullptr, GL_DYNAMIC_DRAW
+            );
+        }
+        m_history_valid = false;
     }
+    // History holds only across consecutive frames of one camera: a cut, a teleport or a frame
+    // skipped starts over.
+    const auto& cam = input.camera.position;
+    const float dx = cam[0] - m_prev_camera[0], dy = cam[1] - m_prev_camera[1],
+                dz = cam[2] - m_prev_camera[2];
+    const bool history =
+        m_history_valid && input.frame >= m_frame && input.frame - m_frame <= 1
+        && dx * dx + dy * dy + dz * dz < 4.0f;
+    glActiveTexture(GL_TEXTURE0 + 28);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_history_texture);
+    glTexBuffer(wgl::GL_TEXTURE_BUFFER, GL_RGBA8, m_history_buffer);
+    glActiveTexture(GL_TEXTURE0);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_output_buffer);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 14, m_output_buffer);
 
     glActiveTexture(GL_TEXTURE0 + 23);
@@ -811,8 +849,7 @@ bool RtxPipeline::render(
     glBindTexture(wgl::GL_TEXTURE_BUFFER, m_dyn_tri_texture);
 
     const auto& s = input.rtx_settings;
-    const int flags = (s.shadows ? 1 : 0) | (s.ambient_occlusion ? 2 : 0)
-                      | (s.reflections ? 4 : 0) | (s.global_illumination ? 8 : 0);
+    const int flags = effect_flags(s);
     const int quality_spp = s.quality == renderer::RtxQuality::Performance ? 1
                             : s.quality == renderer::RtxQuality::Balanced  ? std::min(2, s.samples_per_pixel)
                                                                            : s.samples_per_pixel;
@@ -855,6 +892,14 @@ bool RtxPipeline::render(
         m_compute.uniform("rtx_dynamic_node_count"), static_cast<int>(m_dynamic_nodes.size())
     );
     glUniform1i(m_compute.uniform("rtx_step_budget"), step_budget(s.quality));
+    glUniform1i(m_compute.uniform("rtx_history"), 28);
+    glUniform1i(m_compute.uniform("rtx_history_valid"), history ? 1 : 0);
+    glUniformMatrix4fv(m_compute.uniform("rtx_prev_view"), 1, GL_FALSE, m_prev_view.data());
+    glUniformMatrix4fv(
+        m_compute.uniform("rtx_prev_projection"), 1, GL_FALSE, m_prev_projection.data()
+    );
+    // A quarter of each frame's own sample: about the last eight frames' rays together.
+    glUniform1f(m_compute.uniform("rtx_history_blend"), history ? 0.25f : 1.0f);
     glUniform1i(m_compute.uniform("rtx_samples_per_pixel"), std::clamp(quality_spp, 1, 8));
     glUniform1i(m_compute.uniform("rtx_flags"), flags);
     glUniform1i(m_compute.uniform("rtx_frame_index"), static_cast<int>(input.frame));
@@ -890,6 +935,10 @@ bool RtxPipeline::render(
     m_height = height;
     m_target = target.framebuffer;
     m_frame = input.frame;
+    m_history_valid = true;
+    m_prev_view = input.camera.view;
+    m_prev_projection = input.camera.projection;
+    m_prev_camera = {cam[0], cam[1], cam[2]};
     m_ready = true;
     glBindTexture(GL_TEXTURE_2D, 0);
     stats::gauge("rtx ray tracing cells", static_cast<double>(cells));
@@ -901,10 +950,269 @@ bool RtxPipeline::render(
     return true;
 }
 
+bool RtxPipeline::metal_frames(const renderer::FrameInput& input) {
+#if defined(OPENRAC_VULKAN) && defined(__APPLE__)
+    const auto wanted = input.rtx_settings.backend;
+    if (!is_vulkan() || !vkgl::metal_available()
+        || (wanted != renderer::RtxBackend::Auto && wanted != renderer::RtxBackend::Metal)) {
+        return false;
+    }
+    // The backend must run on the renderer's own MTLDevice, whose buffers it reads.
+    void* device = vkgl::metal_device();
+    if (device == nullptr) {
+        return false;
+    }
+    if (!m_metal_backend || m_metal_backend->native_device() != device) {
+        m_metal_backend = create_metal_rtx_backend_on(device);
+        if (!m_metal_backend) {
+            return false;
+        }
+        std::string error;
+        if (!m_metal_backend->upload_scene(m_triangles, m_nodes, error)) {
+            log::warn("rtx: Metal: {}", error);
+            m_metal_backend.reset();
+            return false;
+        }
+        release_metal_slots();
+    }
+    return true;
+#else
+    (void)input;
+    return false;
+#endif
+}
+
+void RtxPipeline::release_metal_slots() {
+    for (auto& slot : m_slots) {
+        if (slot.cells) {
+            glDeleteBuffers(1, &slot.cells);
+        }
+        if (slot.result) {
+            glDeleteBuffers(1, &slot.result);
+        }
+        if (slot.result_texture) {
+            glDeleteTextures(1, &slot.result_texture);
+        }
+        slot = MetalSlot{};
+    }
+    m_next_slot = 0;
+    m_latest_slot = -1;
+    m_last_submitted = -1;
+}
+
+// Metal's intersector on the renderer's device, a frame behind. A Vulkan pass writes the cells'
+// positions and normals (rtx_gbuffer.comp) into one of three slots; once the GPU has finished that
+// frame, the slot goes to Metal, which traces into the slot's result; early lighting reads the
+// newest finished result through the camera it was traced from. The three slots let Vulkan write
+// one while Metal traces another and early lighting reads a third, without the CPU waiting.
+bool RtxPipeline::render_metal(
+    unsigned depth,
+    const renderer::FrameInput& input,
+    const renderer::RenderTarget& target,
+    const renderer::Vec3& sun_direction,
+    const renderer::Vec3& sun_colour,
+    const renderer::Vec3& sky_colour,
+    std::string& error
+) {
+#if defined(OPENRAC_VULKAN) && defined(__APPLE__)
+    using State = MetalSlot::State;
+    auto* hw = m_metal_backend.get();
+    const int cells_w = (target.width + 1) / 2;
+    const int cells_h = (target.height + 1) / 2;
+    const std::size_t cells = static_cast<std::size_t>(cells_w) * static_cast<std::size_t>(cells_h);
+    GLint limit = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &limit);
+    if (cells * 2 > static_cast<std::size_t>(limit)) {
+        return false;
+    }
+
+    // 1. Slots whose Vulkan frame the GPU has finished go to Metal.
+    const std::uint64_t done = vkgl::completed_frame();
+    for (int i = 0; i < static_cast<int>(m_slots.size()); ++i) {
+        MetalSlot& slot = m_slots[static_cast<std::size_t>(i)];
+        if (slot.state != State::Written || slot.vk_frame > done) {
+            continue;
+        }
+        vkgl::MetalBuffer c, r, h;
+        if (!vkgl::metal_buffer(slot.cells, c) || !vkgl::metal_buffer(slot.result, r)) {
+            slot.state = State::Free;
+            continue;
+        }
+        RtxFrameJob job = slot.params;
+        job.cells = c.buffer;
+        job.cells_offset = c.offset;
+        job.result = r.buffer;
+        job.result_offset = r.offset;
+        job.dynamic_triangles = slot.mobys;
+        // The previous job's result blends in through its camera, when it is of the same grid
+        // and its camera did not jump.
+        if (m_last_submitted >= 0 && m_last_submitted != i) {
+            const MetalSlot& prev = m_slots[static_cast<std::size_t>(m_last_submitted)];
+            const auto& a = prev.params.camera_pos;
+            const auto& b = job.camera_pos;
+            const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+            if ((prev.state == State::Submitted || prev.state == State::Done)
+                && prev.width == slot.width && prev.height == slot.height
+                && dx * dx + dy * dy + dz * dz < 4.0f && vkgl::metal_buffer(prev.result, h)) {
+                job.history = h.buffer;
+                job.history_offset = h.offset;
+                job.prev_view_projection = prev.view_projection;
+            }
+        }
+        slot.job = hw->submit_frame(job, error);
+        if (slot.job == 0) {
+            slot.state = State::Free;
+            continue;
+        }
+        slot.state = State::Submitted;
+        m_last_submitted = i;
+    }
+
+    // 2. Finished traces: the newest becomes what early lighting reads.
+    for (int i = 0; i < static_cast<int>(m_slots.size()); ++i) {
+        MetalSlot& slot = m_slots[static_cast<std::size_t>(i)];
+        if (slot.state == State::Submitted && hw->finished(slot.job)) {
+            slot.state = State::Done;
+            if (m_latest_slot < 0
+                || slot.serial > m_slots[static_cast<std::size_t>(m_latest_slot)].serial) {
+                m_latest_slot = i;
+            }
+        }
+    }
+
+    // 3. This frame's cells into a slot nobody reads or traces.
+    MetalSlot& next = m_slots[static_cast<std::size_t>(m_next_slot)];
+    const bool free = next.state == State::Free
+                      || (next.state == State::Done && m_next_slot != m_latest_slot
+                          && m_next_slot != m_last_submitted);
+    if (free && !m_gbuffer_failed) {
+        if (!m_gbuffer_compute.id()) {
+            std::string source = lighting::shaders::rtx_gbuffer_comp;
+            source.insert(source.find('\n') + 1, renderer::shaders::surface_normal_glsl);
+            if (!m_gbuffer_compute.build_compute("rtx cells", source, error)) {
+                m_gbuffer_failed = true;
+                return false;
+            }
+        }
+        if (!next.cells) {
+            glGenBuffers(1, &next.cells);
+            glGenBuffers(1, &next.result);
+            glGenTextures(1, &next.result_texture);
+        }
+        if (next.width != cells_w || next.height != cells_h) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, next.cells);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, cells * 2 * 16, nullptr, GL_DYNAMIC_DRAW);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, next.result);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, cells * 2 * 4, nullptr, GL_DYNAMIC_DRAW);
+            glActiveTexture(GL_TEXTURE0 + 25);
+            glBindTexture(wgl::GL_TEXTURE_BUFFER, next.result_texture);
+            glTexBuffer(wgl::GL_TEXTURE_BUFFER, GL_RGBA8, next.result);
+            glActiveTexture(GL_TEXTURE0);
+            next.width = cells_w;
+            next.height = cells_h;
+        }
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 14, next.cells);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, next.result);
+        m_gbuffer_compute.use();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, depth);
+        glUniform1i(m_gbuffer_compute.uniform("rtx_depth"), 0);
+        glUniform1i(m_gbuffer_compute.uniform("surface_normals"), 19);
+        glUniform1i(m_gbuffer_compute.uniform("surface_normals_enabled"), target.normal_texture != 0 ? 1 : 0);
+        glActiveTexture(GL_TEXTURE0 + 19);
+        glBindTexture(GL_TEXTURE_2D, target.normal_texture);
+        glActiveTexture(GL_TEXTURE0);
+        glUniformMatrix4fv(m_gbuffer_compute.uniform("rtx_projection"), 1, GL_FALSE, input.camera.projection.data());
+        glUniformMatrix4fv(m_gbuffer_compute.uniform("rtx_view"), 1, GL_FALSE, input.camera.view.data());
+        glUniform1f(
+            m_gbuffer_compute.uniform("rtx_roughness"),
+            std::clamp(input.rtx_settings.reflection_roughness_cutoff * 0.5f, 0.04f, 1.0f)
+        );
+        const std::array<ComputeOutput, 2> outputs{
+            {{next.cells, cells * 2 * 16}, {next.result, cells * 2 * 4}}
+        };
+        if (!run_compute_graph(
+                "rtx cells",
+                outputs,
+                [&] {
+                    const stats::Scope pass("rtx cells", stats::kGpu);
+                    glDispatchCompute(
+                        static_cast<unsigned>((cells_w + 7) / 8),
+                        static_cast<unsigned>((cells_h + 7) / 8),
+                        1
+                    );
+                },
+                error
+            )) {
+            return false;
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+        next.vk_frame = vkgl::recording_frame();
+        next.serial = ++m_slot_serial;
+        next.view_projection = renderer::multiply(input.camera.projection, input.camera.view);
+        RtxFrameJob& p = next.params;
+        p = RtxFrameJob{};
+        p.width = cells_w;
+        p.height = cells_h;
+        p.camera_pos = {input.camera.position[0], input.camera.position[1], input.camera.position[2]};
+        p.sun_dir = {sun_direction[0], sun_direction[1], sun_direction[2]};
+        p.sun_colour = {sun_colour[0], sun_colour[1], sun_colour[2]};
+        p.sky_colour = {sky_colour[0], sky_colour[1], sky_colour[2]};
+        p.settings = input.rtx_settings;
+        p.flags = effect_flags(input.rtx_settings);
+        p.frame_index = static_cast<std::uint32_t>(input.frame);
+        p.dynamic_key = m_dynamic_key;
+        next.mobys = m_dynamic_triangles;
+        next.state = State::Written;
+        m_next_slot = (m_next_slot + 1) % static_cast<int>(m_slots.size());
+    }
+
+    // 4. Early lighting reads the newest finished result.
+    if (m_latest_slot < 0) {
+        return false;
+    }
+    const MetalSlot& latest = m_slots[static_cast<std::size_t>(m_latest_slot)];
+    if (latest.width != cells_w || latest.height != cells_h) {
+        return false;
+    }
+    m_metal_texture = latest.result_texture;
+    m_reproject = true;
+    m_source_view_projection = latest.view_projection;
+    m_source_cells = {latest.width, latest.height};
+    m_width = target.width;
+    m_height = target.height;
+    m_target = target.framebuffer;
+    m_frame = input.frame;
+    m_ready = true;
+    {
+        std::lock_guard lock(g_rtx_mutex);
+        g_rtx_status.active_backend = renderer::RtxBackend::Metal;
+        g_rtx_status.device_name = std::string(hw->device_name());
+    }
+    stats::gauge("rtx ray tracing cells", static_cast<double>(cells));
+    static const char* const kMetal = "Apple Metal RT";
+    if (m_logged != kMetal) {
+        log::info("rtx: tracing {}x{} cells on Apple Metal RT ({}), {} static and {} moby triangles",
+                  cells_w, cells_h, hw->device_name(), m_triangles.size(), m_dynamic_triangles.size());
+        m_logged = kMetal;
+    }
+    return true;
+#else
+    (void)depth;
+    (void)input;
+    (void)target;
+    (void)sun_direction;
+    (void)sun_colour;
+    (void)sky_colour;
+    (void)error;
+    return false;
+#endif
+}
+
 void RtxPipeline::bind_for_early_lighting(
     const renderer::Shader& shader, const renderer::FrameInput& input
 ) const {
-    const bool enabled = m_ready && input.rtx && m_frame == input.frame && m_output_texture != 0;
+    const bool enabled = m_ready && input.rtx && m_frame == input.frame && (m_reproject ? m_metal_texture : m_output_texture) != 0;
     glUniform1i(shader.uniform("rtx_enabled"), enabled ? 1 : 0);
     glUniform1i(shader.uniform("rtx_values"), 25);
     glActiveTexture(GL_TEXTURE0 + 25);
@@ -914,13 +1222,30 @@ void RtxPipeline::bind_for_early_lighting(
         return;
     }
     const auto& s = input.rtx_settings;
-    const int flags = (s.shadows ? 1 : 0) | (s.ambient_occlusion ? 2 : 0)
-                      | (s.reflections ? 4 : 0) | (s.global_illumination ? 8 : 0);
+    const int flags = effect_flags(s);
     glUniform1i(shader.uniform("rtx_flags"), flags);
+    glUniform1i(shader.uniform("rtx_reproject"), m_reproject ? 1 : 0);
+    glUniformMatrix4fv(
+        shader.uniform("rtx_source_view_projection"), 1, GL_FALSE, m_source_view_projection.data()
+    );
+    glUniform2f(
+        shader.uniform("rtx_source_cells"), float(m_source_cells[0]), float(m_source_cells[1])
+    );
     glUniform1i(shader.uniform("rtx_denoise"), s.denoise ? 1 : 0);
     glUniform1i(shader.uniform("rtx_debug_view"), static_cast<int>(rtx_debug_view()));
-    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_output_texture);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_reproject ? m_metal_texture : m_output_texture);
     glActiveTexture(GL_TEXTURE0);
+}
+
+// The effects worth their rays this frame. The bounce only fills where no probe bake reaches
+// (early_lighting.comp), so with a bake its long rays and their shadow rays would be thrown away;
+// without it the AO rays also stop at the AO radius instead of the bounce's reach. Performance
+// leaves out reflections, a long ray and a shadow ray a cell for a Fresnel-weighted touch.
+int RtxPipeline::effect_flags(const renderer::RtxSettings& s) const {
+    const bool reflections = s.reflections && s.quality != renderer::RtxQuality::Performance;
+    const bool bounce = s.global_illumination && !m_probes_cover;
+    return (s.shadows ? 1 : 0) | (s.ambient_occlusion ? 2 : 0) | (reflections ? 4 : 0)
+           | (bounce ? 8 : 0);
 }
 
 bool RtxPipeline::active(
@@ -970,19 +1295,22 @@ void RtxPipeline::release() {
         glDeleteTextures(1, &m_output_texture);
         m_output_texture = 0;
     }
-    for (unsigned* buffer : {&m_dyn_bvh_buffer, &m_dyn_tri_buffer}) {
+    for (unsigned* buffer : {&m_dyn_bvh_buffer, &m_dyn_tri_buffer, &m_history_buffer}) {
         if (*buffer) {
             glDeleteBuffers(1, buffer);
             *buffer = 0;
         }
     }
-    for (unsigned* texture : {&m_dyn_bvh_texture, &m_dyn_tri_texture}) {
+    for (unsigned* texture : {&m_dyn_bvh_texture, &m_dyn_tri_texture, &m_history_texture}) {
         if (*texture) {
             glDeleteTextures(1, texture);
             *texture = 0;
         }
     }
+    m_gbuffer_compute.release();
+    release_metal_slots();
     m_width = m_height = 0;
+    m_history_valid = false;
     m_ready = false;
     m_compute_failed = false;
 }

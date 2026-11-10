@@ -23,6 +23,12 @@ uniform samplerBuffer rtx_dynamic_nodes;      // the mobys' tree, rebuilt as the
 uniform samplerBuffer rtx_dynamic_triangles;
 uniform int rtx_dynamic_node_count;
 uniform int rtx_step_budget;                  // nodes a ray may visit, by quality
+// The previous frame's result (same layout as rtx_pairs) and its camera, for accumulation.
+uniform samplerBuffer rtx_history;
+uniform int rtx_history_valid;
+uniform mat4 rtx_prev_view;
+uniform mat4 rtx_prev_projection;
+uniform float rtx_history_blend;  // weight of this frame's sample, 1 without history
 uniform int rtx_samples_per_pixel;
 uniform int rtx_flags;  // bit0: shadows, bit1: ao, bit2: reflections, bit3: gi
 uniform int rtx_frame_index;
@@ -443,6 +449,25 @@ void main() {
     if (rtx_debug_view == 5) {
         encoded_gi = heatmap_colour(float(total_steps) / float(max(rtx_step_budget, 1)));
     }
-    rtx_pairs[cell * 2 + 0] = packUnorm4x8(vec4(encoded_gi, shadow_vis));
-    rtx_pairs[cell * 2 + 1] = packUnorm4x8(vec4(reflection, ao_vis));
+    vec4 word0 = vec4(encoded_gi, shadow_vis);
+    vec4 word1 = vec4(reflection, ao_vis);
+    // Temporal accumulation: the same world point in the previous frame's result, found through
+    // the previous camera. One or two noisy rays a cell become several frames' worth.
+    if (rtx_history_valid != 0 && rtx_debug_view != 5) {
+        vec4 clip = rtx_prev_projection * (rtx_prev_view * vec4(world, 1.0));
+        if (clip.w > 1e-4) {
+            vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+            ivec2 prev_cell = ivec2(floor(uv * vec2(extent))) / 2;
+            if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))
+                && all(lessThan(prev_cell, cells))) {
+                int prev = prev_cell.y * cells.x + prev_cell.x;
+                vec4 h0 = texelFetch(rtx_history, prev * 2 + 0);
+                vec4 h1 = texelFetch(rtx_history, prev * 2 + 1);
+                word0 = mix(h0, word0, rtx_history_blend);
+                word1 = mix(h1, word1, rtx_history_blend);
+            }
+        }
+    }
+    rtx_pairs[cell * 2 + 0] = packUnorm4x8(word0);
+    rtx_pairs[cell * 2 + 1] = packUnorm4x8(word1);
 }

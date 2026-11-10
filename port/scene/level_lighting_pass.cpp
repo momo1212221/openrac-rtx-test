@@ -165,6 +165,13 @@ void LevelScene::render_early_lighting(
         prepare_shadows(input, state);
     }
     state.world_shadows_prepared = true;
+    if (m_lighting && m_light_sets.size() == std::size_t{16} * 16) {
+        // Light set 0: colour A, travel direction A, colour B (the fill), direction B.
+        const float* set = m_light_sets.data();
+        m_lighting->set_level_sun(
+            {set[4], set[5], set[6]}, {set[0], set[1], set[2]}, {set[8], set[9], set[10]}
+        );
+    }
     std::string error;
     // Drawn only where it is needed (needs_early_lighting), which takes registered lighting.
     state.early_lighting =
