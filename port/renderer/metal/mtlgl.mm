@@ -983,6 +983,14 @@ bool encode_native(const std::function<void(void* commands)>& record) {
     return true;
 }
 
+unsigned long long recording_frame() {
+    return g != nullptr ? g->serial : 0;
+}
+
+unsigned long long completed_frame() {
+    return g != nullptr ? g->completed.load(std::memory_order_acquire) : 0;
+}
+
 std::string device_name() {
     return g == nullptr ? std::string() : g->renderer;
 }

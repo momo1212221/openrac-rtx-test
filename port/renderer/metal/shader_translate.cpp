@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <format>
 #include <memory>
+#include <set>
+#include <unordered_map>
 
 #include <spirv_msl.hpp>
 
@@ -17,11 +19,62 @@ using spirv_cross::CompilerMSL;
 using spirv_cross::MSLResourceBinding;
 using spirv_cross::Resource;
 
+// The uniform variables of `code` that are read through a sampler: sampled, gathered or passed on.
+// The others (texelFetch and textureSize alone, which SPIR-V makes of OpImage) need no sampler state,
+// so their texture takes no sampler slot: Metal has 16 a stage, far fewer than textures (README.md).
+// Unsure uses count as sampled.
+std::set<std::uint32_t> filtered_variables(const std::vector<std::uint32_t>& code) {
+    std::unordered_map<std::uint32_t, std::uint32_t> root;  // an id derived from a variable: it
+    for (std::size_t i = 5; i < code.size(); i += code[i] >> 16) {
+        const auto op = static_cast<spv::Op>(code[i] & 0xffff);
+        if (op == spv::OpVariable && code[i + 3] == spv::StorageClassUniformConstant) {
+            root.emplace(code[i + 2], code[i + 2]);
+        }
+    }
+    std::set<std::uint32_t> filtered;
+    for (std::size_t i = 5; i < code.size(); i += code[i] >> 16) {
+        const auto op = static_cast<spv::Op>(code[i] & 0xffff);
+        const std::uint32_t count = code[i] >> 16;
+        switch (op) {
+            // Names, decorations and interfaces mention a variable without reading it.
+            case spv::OpName:
+            case spv::OpMemberName:
+            case spv::OpDecorate:
+            case spv::OpMemberDecorate:
+            case spv::OpDecorateId:
+            case spv::OpEntryPoint:
+            case spv::OpVariable:
+                continue;
+            case spv::OpLoad:
+            case spv::OpCopyObject:
+            case spv::OpAccessChain:
+            case spv::OpInBoundsAccessChain:
+                if (const auto found = root.find(code[i + 3]); found != root.end()) {
+                    root.emplace(code[i + 2], found->second);
+                    continue;
+                }
+                break;
+            // The image alone: its fetches and size queries take no sampler.
+            case spv::OpImage:
+                continue;
+            default:
+                break;
+        }
+        for (std::uint32_t w = 1; w < count; ++w) {
+            if (const auto found = root.find(code[i + w]); found != root.end()) {
+                filtered.insert(found->second);
+            }
+        }
+    }
+    return filtered;
+}
+
 class Slots {
 public:
     // Gives the program's resources in `compiler` their slots: those met in an earlier stage keep
-    // theirs.
-    void assign(const CompilerMSL& compiler) {
+    // theirs. `code` is the stage's SPIR-V, for which textures are filtered.
+    void assign(const CompilerMSL& compiler, const std::vector<std::uint32_t>& code) {
+        const std::set<std::uint32_t> filtered = filtered_variables(code);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
         for (const auto* list : {&resources.uniform_buffers, &resources.storage_buffers}) {
             for (const Resource& r : *list) {
@@ -32,9 +85,11 @@ public:
             }
         }
         for (const Resource& r : resources.sampled_images) {
-            texture(
-                binding_of(compiler, r), compiler.get_type(r.type_id).image.dim != spv::DimBuffer
-            );
+            const bool sampled = compiler.get_type(r.type_id).image.dim != spv::DimBuffer;
+            texture(binding_of(compiler, r), sampled && filtered.contains(r.id));
+            if (sampled && !filtered.contains(r.id)) {
+                m_fetched.insert(binding_of(compiler, r));
+            }
         }
         for (const Resource& r : resources.storage_images) {
             texture(binding_of(compiler, r), false);
@@ -58,6 +113,20 @@ public:
             b.msl_texture = static_cast<std::uint32_t>(slot);
             b.msl_sampler = static_cast<std::uint32_t>(std::max(t.sampler, 0));
             compiler.add_msl_resource_binding(b);
+        }
+        // A texture only fetched takes a sampler written in the shader (never read) instead of a slot.
+        const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+        for (const Resource& r : resources.sampled_images) {
+            const int binding = binding_of(compiler, r);
+            const auto found = std::ranges::find(m_out.textures, binding, &MslTexture::binding);
+            if (found != m_out.textures.end() && found->sampler < 0 && m_fetched.contains(binding)
+                && compiler.get_type(r.type_id).image.dim != spv::DimBuffer) {
+                compiler.remap_constexpr_sampler_by_binding(
+                    compiler.get_decoration(r.id, spv::DecorationDescriptorSet),
+                    static_cast<std::uint32_t>(binding),
+                    spirv_cross::MSLConstexprSampler{}
+                );
+            }
         }
     }
 
@@ -90,11 +159,15 @@ private:
         const auto found = std::ranges::find(m_out.textures, binding, &MslTexture::binding);
         if (found == m_out.textures.end()) {
             m_out.textures.push_back({binding, sampled ? static_cast<int>(m_samplers++) : -1});
+        } else if (sampled && found->sampler < 0) {
+            // Fetched in one stage, sampled in the other.
+            found->sampler = static_cast<int>(m_samplers++);
         }
     }
 
     MslProgram m_out;
     std::uint32_t m_samplers = 0;
+    std::set<int> m_fetched;  // sampled-image bindings some stage only fetches
 };
 
 // Apple's OpenGL divides as fast::divide does, not exactly as `/` does without fast math. AMD's
@@ -284,7 +357,7 @@ bool translate_program(
             stage.exact =
                 apple && stage.model == spv::ExecutionModelVertex && invariant(stage.code);
             stage.compiler = make_compiler(stage.code, apple, stage.exact);
-            slots.assign(*stage.compiler);
+            slots.assign(*stage.compiler, stage.code);
         }
         if (const std::string why = slots.overflow(); !why.empty()) {
             log += why;

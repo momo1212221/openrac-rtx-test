@@ -62,7 +62,7 @@ bool early_surface(
     ivec2 begin = ivec2(floor(coordinate));
     vec2 fraction = fract(coordinate);
     vec4 samples[4];
-    float scores[4], spatial[4], hero[4];
+    float scores[4], spatial[4], hero[4], local[4];
     int coverage[4];
     float best = 1e30;
     int best_coverage = 0;
@@ -81,6 +81,7 @@ bool early_surface(
         coverage[i] = 0;
         samples[i] = vec4(0);
         hero[i] = 1.0;
+        local[i] = 1.0;
         if ((bits & (1u << 19u)) == 0u) {
             continue;
         }
@@ -107,6 +108,8 @@ bool early_surface(
         coverage[i] = (bits & (1u << 18u)) != 0u ? 1 : 0;
         samples[i] = texelFetch(early_values, index);
         hero[i] = float((bits >> 20u) & 255u) / 255.0;
+        // Bits 28-31: how much of the local lights the ray tracing found blocked (0 none).
+        local[i] = 1.0 - float(bits >> 28u) / 15.0;
         samples[i].rgb = (exp2(samples[i].rgb * 20.0) - 1.0) / 16.0;
         if (scores[i] < best) {
             best = scores[i];
@@ -115,6 +118,7 @@ bool early_surface(
     }
     result = vec4(0);
     hero_visibility = 0.0;
+    float local_visibility = 0.0;
     float total = 0.0;
     for (int i = 0; i < 4; ++i) {
         float difference = min(32.0, max(0.0, scores[i] - best) * 8.0);
@@ -122,10 +126,12 @@ bool early_surface(
         float weight = coverage[i] == best_coverage ? spatial[i] / (1.0 + squared * squared) : 0.0;
         result += samples[i] * weight;
         hero_visibility += hero[i] * weight;
+        local_visibility += local[i] * weight;
         total += weight;
     }
     result = total > 0.0 ? result / total : vec4(0, 0, 0, 1);
     hero_visibility = total > 0.0 ? hero_visibility / total : 1.0;
+    forward_shadow = total > 0.0 ? local_visibility / total : 1.0;
     covered = best_coverage != 0;
     return true;
 }

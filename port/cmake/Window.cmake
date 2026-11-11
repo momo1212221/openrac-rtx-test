@@ -490,6 +490,7 @@ add_library(openrac_enhanced_viewer STATIC
   enhanced/viewer/probe_sphere_culling.cpp
   enhanced/viewer/probe_sphere_instances.cpp
   enhanced/renderer/local_lights.cpp
+  enhanced/renderer/material_sidecars.cpp
   enhanced/renderer/rtx.cpp
   enhanced/renderer/rtx_cuda.cpp
   enhanced/viewer/scene_lighting.cpp

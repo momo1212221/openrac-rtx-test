@@ -58,6 +58,11 @@ uniform float material_emission_contrast;
 uniform float material_diffuse_scale;
 uniform int material_fallback;
 uniform sampler2D gtao_visibility;
+// A texture pack's material maps (enhanced/renderer/material_sidecars.h), side by side. Surface
+// (left): tangent normal x, y, occlusion, emission mask. Response (right): roughness, metallic,
+// specular F0 (0: none), edge wear.
+uniform int material_sidecars_enabled;
+uniform sampler2D material_sidecar_maps;
 #endif
 
 #ifdef OPENRAC_HERO_WETNESS
@@ -108,10 +113,52 @@ vec3 authored_emission() {
     return emitted;
 }
 
+// One half of the side-by-side maps, repeating within it; half a texel in from its edges so that
+// filtering never reads the other half.
+vec4 sidecar_map(float half_index) {
+    float inset = 0.5 / float(textureSize(material_sidecar_maps, 0).x / 2);
+    float u = (clamp(fract(v_uv.x), inset, 1.0 - inset) + half_index) * 0.5;
+    vec2 scale = vec2(0.5, 1.0);
+    return textureGrad(material_sidecar_maps, vec2(u, v_uv.y), dFdx(v_uv) * scale,
+                       dFdy(v_uv) * scale);
+}
+
+// A pack's emission mask lights the texel in its own hue, at the mask's brightness.
+vec3 sidecar_emission(vec4 texel) {
+    if (material_sidecars_enabled == 0) return vec3(0.0);
+    float mask = sidecar_map(0.0).a;
+    if (mask <= 0.02) return vec3(0.0);
+    float peak = max(max(texel.r, texel.g), max(texel.b, 1.0 / 255.0));
+    return probe_linear(clamp(texel.rgb / peak, vec3(0.0), vec3(1.0)))
+        * probe_linear(vec3(mask)).r * 2.5;
+}
+
+// The pack's normal map on the interpolated normal, in a frame from the screen derivatives.
+vec3 sidecar_normal(vec3 n) {
+    if (material_sidecars_enabled == 0) return n;
+    vec2 xy = sidecar_map(0.0).xy * 2.0 - 1.0;
+    vec3 mapped = vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+    vec3 dp1 = dFdx(v_world_position), dp2 = dFdy(v_world_position);
+    vec2 duv1 = dFdx(v_uv), duv2 = dFdy(v_uv);
+    vec3 dp2perp = cross(dp2, n), dp1perp = cross(n, dp1);
+    vec3 tangent = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 bitangent = dp2perp * duv1.y + dp1perp * duv2.y;
+    float scale = max(dot(tangent, tangent), dot(bitangent, bitangent));
+    // Degenerate texture coordinates (a solid colour) keep the smooth normal.
+    if (scale < 1e-16) return n;
+    float inv = inversesqrt(scale);
+    vec3 result = mat3(tangent * inv, bitangent * inv, n) * mapped;
+    return dot(result, result) > 1e-8 ? normalize(result) : n;
+}
+
+float sidecar_occlusion() {
+    return material_sidecars_enabled != 0 ? sidecar_map(0.0).b : 1.0;
+}
+
 vec3 surface_emission(vec4 texel) {
     // Scripted brightness follows the original encoded GS modulation, then decodes once.
     return probe_linear(clamp(texel.rgb * v_script_emission, vec3(0.0), vec3(1.0)))
-        + authored_emission();
+        + authored_emission() + sidecar_emission(texel);
 }
 
 uniform int probe_look_count;
@@ -255,7 +302,8 @@ vec3 probe_surface(vec4 texel, vec3 original) {
         return covered ? mix(vec3(0.0, 0.5, 1.0), vec3(0.0, 1.0, 0.0), dense_weight)
                        : vec3(1.0, 0.0, 1.0);
     }
-    vec3 surface_n = n;
+    // The pack's normal map shades; shadows, probe lookups and early lighting keep the smooth one.
+    vec3 surface_n = sidecar_normal(n);
     float fur_grain = 1.;
 #ifdef OPENRAC_HERO_FUR
     FurSurfaceData fur_surface = FurSurfaceData(n, vec3(0.), transpose(mat3(view)) * (-eye_position), 0., 1.);
@@ -367,7 +415,7 @@ vec3 probe_surface(vec4 texel, vec3 original) {
         return probe_display(fallback);
     }
     // Artistic GI exposure; keep the bake and direct-light energy unchanged.
-    indirect *= probe_gi_multiplier;
+    indirect *= probe_gi_multiplier * sidecar_occlusion();
     if (probe_retail_anchor != 0 && probe_receiver == 2 && probe_mode == 1) {
         indirect = retail_ambient_floor(indirect, v_probe_ambient);
     }
@@ -428,9 +476,54 @@ vec3 probe_surface(vec4 texel, vec3 original) {
         rim = gameplay_rim(indirect, eye_normal, -eye_position);
     }
 #endif
+    // A pack's metal and specular maps: metal reflects in its own colour (silver for grey metal)
+    // and gives up most of its diffuse; a dielectric with a specular map keeps its diffuse.
+    vec3 sidecar_specular = vec3(0.0);
+    float sidecar_metal = 0.0;
+    if (material_sidecars_enabled != 0 && probe_mode == 1) {
+        vec4 response = sidecar_map(1.0);
+        sidecar_metal = response.g;
+        float f0 = response.b > 0.0 ? response.b : 0.04;
+        vec3 eye = probe_unit(toward_camera);
+        if ((sidecar_metal > 0.02 || f0 > 0.045) && dot(surface_n, eye) > 0.0) {
+            float roughness = clamp(response.r * mix(1.0, 0.88, response.a), 0.06, 1.0);
+            // Silver for grey metal even where the old texture is dark (its lighting was painted in).
+            vec3 tint = mix(vec3(f0), clamp(sqrt(albedo) * 1.5, vec3(0.6), vec3(0.98)),
+                            sidecar_metal);
+            int a = (int(selector.x + .5) & 15) * 4;
+            int b = (int(selector.y + .5) & 15) * 4;
+            float blend = clamp(selector.z, 0., 1.);
+            vec3 travel = probe_sunlight_direction.w != 0. ? probe_sunlight_direction.xyz
+                : mix(light_sets[a + 1].xyz, light_sets[b + 1].xyz, blend);
+            vec3 radiance = max(mix(light_sets[a].rgb, light_sets[b].rgb, blend), vec3(0.))
+                * probe_sunlight_scale;
+            vec3 shine = radiance * ggx_specular(surface_n, eye, probe_unit(-travel), roughness, 1.0)
+                * visibility;
+            LOCAL_LIGHT_LOOP(i) {
+                vec4 position = LOCAL_POSITION(i);
+                vec3 delta = position.xyz - v_world_position;
+                float distance = length(delta);
+                if (position.w <= 0. || distance >= position.w || distance <= 1e-6) continue;
+                shine += max(LOCAL_COLOUR(i).rgb, vec3(0.))
+                    * LOCAL_ATTENUATION(distance, position.w) * LOCAL_CONE(i, delta / distance)
+                    * ggx_specular(surface_n, eye, delta / distance, roughness, 1.0);
+            }
+            // The surroundings: the captured environment where this variant has it, else the
+            // irradiance around as a blurred reflection.
+            vec3 around = indirect / 3.14159265359;
+#if (!defined(OPENRAC_SOLID) && (!defined(OPENRAC_COLOUR_SPECIALISED) || (defined(OPENRAC_HERO_WETNESS) && !defined(OPENRAC_STATIC_COLOUR)))) || defined(OPENRAC_HERO_FUR)
+            around = environment_specular(v_world_position, surface_n, eye, roughness, 1.0, around);
+#endif
+            float grazing = pow(1.0 - clamp(dot(surface_n, eye), 0.0, 1.0), 5.0);
+            vec3 fresnel = tint + (1.0 - tint) * grazing;
+            sidecar_specular = (shine + around * 1.6) * fresnel * mix(0.35, 1.0, sidecar_metal);
+        }
+    }
     // Emission is independent of GI exposure, AO and shadow visibility.
-    vec3 diffuse = wet_coat(albedo * illumination * material_diffuse_scale + rim,
-                            surface_n, toward_camera, visibility) + fur_direct + fur_indirect;
+    vec3 diffuse = wet_coat(albedo * mix(1.0, 0.45, sidecar_metal) * illumination
+                                * material_diffuse_scale + rim,
+                            surface_n, toward_camera, visibility) + fur_direct + fur_indirect
+                   + sidecar_specular;
     return probe_display(probe_mode == 1 ? apply_probe_look(diffuse, emitted) : diffuse);
 }
 

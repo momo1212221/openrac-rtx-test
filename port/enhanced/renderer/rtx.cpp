@@ -6,6 +6,7 @@
 // and hardware backend orchestration (Apple Metal RT + NVIDIA CUDA RTX).
 
 #include "enhanced/renderer/rtx.h"
+#include "enhanced/renderer/material_sidecars.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +25,9 @@
 #include "renderer/vulkan/native_compute.h"
 #include "renderer/vulkan/native_metal.h"
 #endif
+#if defined(OPENRAC_METAL)
+#include "renderer/metal/mtlgl.h"
+#endif
 #include "renderer/world/gl_world.h"
 #include "renderer_shaders.h"
 
@@ -31,6 +35,59 @@ namespace openrac::enhanced {
 namespace {
 using namespace openrac::gl;
 namespace wgl = renderer::world::gl;
+
+#if defined(OPENRAC_VULKAN) && defined(__APPLE__)
+// The Metal objects of whichever renderer draws: Metal's own GL (renderer/metal), natively, or
+// Vulkan through MoltenVK, which lends its device and buffers (renderer/vulkan/native_metal.h).
+namespace native {
+bool available() {
+#if defined(OPENRAC_METAL)
+    if (is_metal()) {
+        return mtlgl::native().device != nullptr;
+    }
+#endif
+    return is_vulkan() && vkgl::metal_available();
+}
+
+void* device() {
+#if defined(OPENRAC_METAL)
+    if (is_metal()) {
+        return mtlgl::native().device;
+    }
+#endif
+    return vkgl::metal_device();
+}
+
+// The MTLBuffer behind a GL buffer. Metal's GL gives each GL buffer an MTLBuffer of its own.
+bool buffer(GLuint name, vkgl::MetalBuffer& out) {
+#if defined(OPENRAC_METAL)
+    if (is_metal()) {
+        out = {mtlgl::native_buffer(name), 0, 0};
+        return out.buffer != nullptr;
+    }
+#endif
+    return vkgl::metal_buffer(name, out);
+}
+
+std::uint64_t recording_frame() {
+#if defined(OPENRAC_METAL)
+    if (is_metal()) {
+        return mtlgl::recording_frame();
+    }
+#endif
+    return vkgl::recording_frame();
+}
+
+std::uint64_t completed_frame() {
+#if defined(OPENRAC_METAL)
+    if (is_metal()) {
+        return mtlgl::completed_frame();
+    }
+#endif
+    return vkgl::completed_frame();
+}
+}  // namespace native
+#endif
 
 std::mutex g_rtx_mutex;
 RtxStatus g_rtx_status{};
@@ -282,6 +339,147 @@ void trace_cpu_bvh(
     }
 }
 
+// Whether a material glows (probe-emission.json's runtime emission).
+bool glows(const scene::Material& m) {
+    return std::max({m.emission[0], m.emission[1], m.emission[2]}) > 1e-4f;
+}
+
+// How much of a triangle a texture pack's emission mask marks (0..1): the mask at its centre and
+// half-way to each corner, averaged, so that a wall with one bright texel stays a wall.
+float sidecar_glow(
+    const MaterialSidecars* sidecars, const scene::Material& mat, const scene::Vertex& a,
+    const scene::Vertex& b, const scene::Vertex& c
+) {
+    if (sidecars == nullptr || !sidecars->glows(mat.texture_pack_hash)) {
+        return 0.0f;
+    }
+    const float cu = (a.uv[0] + b.uv[0] + c.uv[0]) / 3.0f;
+    const float cv = (a.uv[1] + b.uv[1] + c.uv[1]) / 3.0f;
+    float sum = sidecars->emission(mat.texture_pack_hash, cu, cv);
+    for (const auto* corner : {&a, &b, &c}) {
+        sum += sidecars->emission(
+            mat.texture_pack_hash, 0.5f * (cu + corner->uv[0]), 0.5f * (cv + corner->uv[1])
+        );
+    }
+    const float glow = sum * 0.25f;
+    return glow >= 0.3f ? glow : 0.0f;
+}
+
+// The colour texture's texel at a texture coordinate (repeating), times the material colour.
+std::array<float, 3> texel_at(const scene::LevelData& level, const scene::Material& mat, float u,
+                              float v) {
+    std::array<float, 3> rgb{mat.colour[0], mat.colour[1], mat.colour[2]};
+    if (mat.image < 0 || static_cast<std::size_t>(mat.image) >= level.images.size()) {
+        return rgb;
+    }
+    const auto& img = level.images[static_cast<std::size_t>(mat.image)];
+    if (img.width <= 0 || img.height <= 0) {
+        return rgb;
+    }
+    const int x = std::clamp(static_cast<int>((u - std::floor(u)) * img.width), 0, img.width - 1);
+    const int y = std::clamp(static_cast<int>((v - std::floor(v)) * img.height), 0, img.height - 1);
+    const std::size_t offset = (static_cast<std::size_t>(y) * img.width + x) * 4;
+    for (int a = 0; a < 3; ++a) {
+        rgb[a] *= img.pixels[offset + a] / 255.0f;
+    }
+    return rgb;
+}
+
+// Sums one instance's glowing triangles (area-weighted centre, normal and colour) under `matrix`.
+struct GlowSum {
+    std::array<float, 3> centre{}, normal{}, colour{};
+    float area = 0;
+};
+
+void sum_glow(
+    const scene::LevelData& level, const scene::Model& model, const renderer::Mat4& matrix,
+    const MaterialSidecars* sidecars, GlowSum& sum
+) {
+    for (const auto& prim : model.primitives) {
+        if (prim.material < 0 || static_cast<std::size_t>(prim.material) >= level.materials.size()) {
+            continue;
+        }
+        const auto& mat = level.materials[static_cast<std::size_t>(prim.material)];
+        const bool emissive = glows(mat);
+        for (std::uint32_t i = 0; i + 2 < prim.index_count; i += 3) {
+            const std::size_t at = static_cast<std::size_t>(prim.first_index + i);
+            if (at + 2 >= level.indices.size()) {
+                break;
+            }
+            const auto i0 = level.indices[at], i1 = level.indices[at + 1], i2 = level.indices[at + 2];
+            if (i0 >= level.vertices.size() || i1 >= level.vertices.size()
+                || i2 >= level.vertices.size()) {
+                continue;
+            }
+            // The game's own glow (a glow packet's vertices, light slot -2: drawn unlit and
+            // bright) counts as well as probe-emission.json's emissive materials.
+            const bool packet = level.vertices[i0].light_slot == -2
+                                || level.vertices[i1].light_slot == -2
+                                || level.vertices[i2].light_slot == -2;
+            // And what a texture pack's emission mask marks (material_sidecars.h).
+            const float mask = emissive || packet
+                                   ? 0.0f
+                                   : sidecar_glow(sidecars, mat, level.vertices[i0],
+                                                  level.vertices[i1], level.vertices[i2]);
+            if (!emissive && !packet && mask <= 0.0f) {
+                continue;
+            }
+            const auto p0 = transform_point(matrix, level.vertices[i0].position);
+            const auto p1 = transform_point(matrix, level.vertices[i1].position);
+            const auto p2 = transform_point(matrix, level.vertices[i2].position);
+            const std::array<float, 3> e1{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+            const std::array<float, 3> e2{p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+            const std::array<float, 3> n{
+                e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0]
+            };
+            const float area = 0.5f * std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (area < 1e-6f) {
+                continue;
+            }
+            const std::uint32_t albedo = sample_material_albedo(level, mat, level.vertices[i0].colour);
+            float rgb[3]{
+                float(albedo & 0xFFu) / 255.0f, float((albedo >> 8u) & 0xFFu) / 255.0f,
+                float((albedo >> 16u) & 0xFFu) / 255.0f
+            };
+            if (mask > 0.0f) {
+                // The glowing texels' own colour, normalised to the mask's brightness (a white
+                // bulb on a dark lamp shade glows white, not the shade's average).
+                const auto& va = level.vertices[i0];
+                const auto& vb = level.vertices[i1];
+                const auto& vc = level.vertices[i2];
+                const auto texel = texel_at(level, mat, (va.uv[0] + vb.uv[0] + vc.uv[0]) / 3.0f,
+                                            (va.uv[1] + vb.uv[1] + vc.uv[1]) / 3.0f);
+                const float peak = std::max({texel[0], texel[1], texel[2], 1.0f / 255.0f});
+                for (int a = 0; a < 3; ++a) {
+                    rgb[a] = texel[a] / peak * mask;
+                }
+            }
+            for (int a = 0; a < 3; ++a) {
+                sum.centre[a] += (p0[a] + p1[a] + p2[a]) / 3.0f * area;
+                sum.normal[a] += n[a] * 0.5f;
+                sum.colour[a] += rgb[a] * (emissive ? mat.emission[a] : 1.0f) * area;
+            }
+            sum.area += area;
+        }
+    }
+}
+
+// A glowing part as a point light: a little off the surface it glows from, its colour the
+// surface's, brighter and reaching further the larger it is.
+LocalLight glow_light(const std::array<float, 3>& centre, const std::array<float, 3>& normal,
+                      const std::array<float, 3>& colour, float area) {
+    const float n = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+    const float size = std::sqrt(area);
+    LocalLight light;
+    for (int a = 0; a < 3; ++a) {
+        light.position[a] = centre[a] + (n > 1e-6f ? normal[a] / n * 0.2f : 0.0f);
+        light.colour[a] = colour[a] * 1.5f * std::clamp(size, 0.5f, 2.5f);
+    }
+    light.range = std::clamp(4.0f + 4.0f * size, 5.0f, 16.0f);
+    return light;
+}
+
 // Builds the SAH tree of `tris` into `nodes` and reorders `tris` to its leaves' order.
 void build_tree(std::vector<RtxTriangle>& tris, std::vector<RtxBvhNode>& nodes) {
     nodes.clear();
@@ -440,7 +638,9 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                 // texture to test, so a leaf card or a vine's quad would block as a solid wall,
                 // blackening the ambient and casting square shadows. The shadow maps keep their
                 // alpha-tested shadows (early_lighting.comp takes the darker of both).
-                if (mat.blend || mat.cutout) {
+                // Glowing surfaces are light sources (emissive_lights), not occluders: a lamp's
+                // bulb would shadow its own light.
+                if (mat.blend || mat.cutout || glows(mat)) {
                     continue;
                 }
             }
@@ -467,6 +667,12 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                 const auto& v0 = level.vertices[i0];
                 const auto& v1 = level.vertices[i1];
                 const auto& v2 = level.vertices[i2];
+                // A glow packet is a light (emissive_lights), not an occluder, nor is what a
+                // texture pack's emission mask marks.
+                if (v0.light_slot == -2 || v1.light_slot == -2 || v2.light_slot == -2
+                    || sidecar_glow(m_sidecars, mat, v0, v1, v2) > 0.0f) {
+                    continue;
+                }
                 const auto p0 = transform_point(inst.matrix, v0.position);
                 const auto p1 = transform_point(inst.matrix, v1.position);
                 const auto p2 = transform_point(inst.matrix, v2.position);
@@ -520,6 +726,60 @@ void RtxPipeline::upload(const scene::LevelData& level) {
         extract_instance(identity_inst, scene::Layer::Mobys, m_moby_meshes[m].local_triangles);
     }
 
+    // The glowing parts: a light per static instance, and per model for the mobys.
+    m_emissive_static.clear();
+    m_emissive_mobys.clear();
+    m_moby_emissive.assign(level.models.size(), {});
+    for (const scene::Layer layer :
+         {scene::Layer::Terrain, scene::Layer::Ties, scene::Layer::Shrubs}) {
+        for (const auto& inst : level.instances[static_cast<std::size_t>(layer)]) {
+            if (inst.stand_in || inst.lighting_only || inst.model >= level.models.size()) {
+                continue;
+            }
+            GlowSum sum;
+            sum_glow(level, level.models[inst.model], inst.matrix, m_sidecars, sum);
+            if (sum.area <= 1e-4f) {
+                continue;
+            }
+            std::array<float, 3> centre{}, colour{};
+            for (int a = 0; a < 3; ++a) {
+                centre[a] = sum.centre[a] / sum.area;
+                colour[a] = sum.colour[a] / sum.area;
+            }
+            m_emissive_static.push_back(glow_light(centre, sum.normal, colour, sum.area));
+        }
+    }
+    // The largest first when a level has more than LocalLights takes beside the others.
+    constexpr std::size_t kStaticGlows = 2048;
+    if (m_emissive_static.size() > kStaticGlows) {
+        std::partial_sort(
+            m_emissive_static.begin(), m_emissive_static.begin() + kStaticGlows,
+            m_emissive_static.end(),
+            [](const LocalLight& a, const LocalLight& b) { return a.range > b.range; }
+        );
+        m_emissive_static.resize(kStaticGlows);
+    }
+    for (std::size_t m = 0; m < level.models.size(); ++m) {
+        GlowSum sum;
+        sum_glow(level, level.models[m], renderer::identity(), m_sidecars, sum);
+        if (sum.area <= 1e-4f) {
+            continue;
+        }
+        auto& part = m_moby_emissive[m];
+        for (int a = 0; a < 3; ++a) {
+            part.centre[a] = sum.centre[a] / sum.area;
+            part.normal[a] = sum.normal[a];
+            part.colour[a] = sum.colour[a] / sum.area;
+        }
+        part.area = sum.area;
+    }
+    ++m_emissive_revision;
+    const auto glowing_models = std::count_if(
+        m_moby_emissive.begin(), m_moby_emissive.end(), [](const auto& p) { return p.area > 1e-4f; }
+    );
+    log::info("rtx: {} glowing surfaces become lights; {} models glow when placed as mobys",
+              m_emissive_static.size(), glowing_models);
+
     build_bvh();
 }
 
@@ -564,6 +824,29 @@ void RtxPipeline::prepare_instances(
         return;
     }
     m_dynamic_instance_count = instances.size();
+    // The glowing mobys' lights follow them. Only rigid ones (lamps, beacons, machines): a
+    // character's glow (Clank's eyes, an antenna, an enemy's visor) is a detail, not a lamp, and
+    // made the hero light up everything around him. At most 256.
+    m_emissive_mobys.clear();
+    for (const auto& inst : instances) {
+        if (inst.stand_in || inst.lighting_only || inst.palette >= 0 || inst.hero_shadow_caster
+            || inst.hero_shadow_anchor || inst.model >= m_moby_emissive.size()) {
+            continue;
+        }
+        const auto& part = m_moby_emissive[inst.model];
+        if (part.area <= 1e-4f || m_emissive_mobys.size() >= 256) {
+            continue;
+        }
+        const auto centre = transform_point(inst.matrix, part.centre.data());
+        const auto& m = inst.matrix;
+        const std::array<float, 3> normal{
+            m[0] * part.normal[0] + m[4] * part.normal[1] + m[8] * part.normal[2],
+            m[1] * part.normal[0] + m[5] * part.normal[1] + m[9] * part.normal[2],
+            m[2] * part.normal[0] + m[6] * part.normal[1] + m[10] * part.normal[2]
+        };
+        m_emissive_mobys.push_back(glow_light(centre, normal, part.colour, part.area));
+    }
+    stats::gauge("rtx glowing mobys", static_cast<double>(m_emissive_mobys.size()));
     if (m_moby_meshes.empty()) {
         publish_counts();
         return;
@@ -795,7 +1078,7 @@ bool RtxPipeline::render(
         static_cast<std::size_t>((width + 1) / 2) * static_cast<std::size_t>((height + 1) / 2);
     GLint limit = 0;
     glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &limit);
-    if (cells * 2 > static_cast<std::size_t>(limit)) {
+    if (cells * 3 > static_cast<std::size_t>(limit)) {
         return false;
     }
 
@@ -816,7 +1099,7 @@ bool RtxPipeline::render(
         for (unsigned buffer : {m_output_buffer, m_history_buffer}) {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
             glBufferData(
-                GL_SHADER_STORAGE_BUFFER, cells * 2 * sizeof(std::uint32_t), nullptr, GL_DYNAMIC_DRAW
+                GL_SHADER_STORAGE_BUFFER, cells * 3 * sizeof(std::uint32_t), nullptr, GL_DYNAMIC_DRAW
             );
         }
         m_history_valid = false;
@@ -911,7 +1194,7 @@ bool RtxPipeline::render(
     glUniform1f(m_compute.uniform("rtx_roughness_cutoff"), s.reflection_roughness_cutoff);
 
     const std::array<ComputeOutput, 1> outputs{
-        {{m_output_buffer, cells * 2 * sizeof(std::uint32_t)}}
+        {{m_output_buffer, cells * 3 * sizeof(std::uint32_t)}}
     };
     const int cells_w = (width + 1) / 2;
     const int cells_h = (height + 1) / 2;
@@ -953,12 +1236,12 @@ bool RtxPipeline::render(
 bool RtxPipeline::metal_frames(const renderer::FrameInput& input) {
 #if defined(OPENRAC_VULKAN) && defined(__APPLE__)
     const auto wanted = input.rtx_settings.backend;
-    if (!is_vulkan() || !vkgl::metal_available()
+    if (!native::available()
         || (wanted != renderer::RtxBackend::Auto && wanted != renderer::RtxBackend::Metal)) {
         return false;
     }
     // The backend must run on the renderer's own MTLDevice, whose buffers it reads.
-    void* device = vkgl::metal_device();
+    void* device = native::device();
     if (device == nullptr) {
         return false;
     }
@@ -993,6 +1276,9 @@ void RtxPipeline::release_metal_slots() {
         if (slot.result_texture) {
             glDeleteTextures(1, &slot.result_texture);
         }
+        if (slot.cells_texture) {
+            glDeleteTextures(1, &slot.cells_texture);
+        }
         slot = MetalSlot{};
     }
     m_next_slot = 0;
@@ -1022,19 +1308,19 @@ bool RtxPipeline::render_metal(
     const std::size_t cells = static_cast<std::size_t>(cells_w) * static_cast<std::size_t>(cells_h);
     GLint limit = 0;
     glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &limit);
-    if (cells * 2 > static_cast<std::size_t>(limit)) {
+    if (cells * 3 > static_cast<std::size_t>(limit)) {
         return false;
     }
 
     // 1. Slots whose Vulkan frame the GPU has finished go to Metal.
-    const std::uint64_t done = vkgl::completed_frame();
+    const std::uint64_t done = native::completed_frame();
     for (int i = 0; i < static_cast<int>(m_slots.size()); ++i) {
         MetalSlot& slot = m_slots[static_cast<std::size_t>(i)];
         if (slot.state != State::Written || slot.vk_frame > done) {
             continue;
         }
-        vkgl::MetalBuffer c, r, h;
-        if (!vkgl::metal_buffer(slot.cells, c) || !vkgl::metal_buffer(slot.result, r)) {
+        vkgl::MetalBuffer c, r, h, hc;
+        if (!native::buffer(slot.cells, c) || !native::buffer(slot.result, r)) {
             slot.state = State::Free;
             continue;
         }
@@ -1044,6 +1330,7 @@ bool RtxPipeline::render_metal(
         job.result = r.buffer;
         job.result_offset = r.offset;
         job.dynamic_triangles = slot.mobys;
+        job.lights = slot.lights;
         // The previous job's result blends in through its camera, when it is of the same grid
         // and its camera did not jump.
         if (m_last_submitted >= 0 && m_last_submitted != i) {
@@ -1053,9 +1340,12 @@ bool RtxPipeline::render_metal(
             const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
             if ((prev.state == State::Submitted || prev.state == State::Done)
                 && prev.width == slot.width && prev.height == slot.height
-                && dx * dx + dy * dy + dz * dz < 4.0f && vkgl::metal_buffer(prev.result, h)) {
+                && dx * dx + dy * dy + dz * dz < 4.0f && native::buffer(prev.result, h)
+                && native::buffer(prev.cells, hc)) {
                 job.history = h.buffer;
                 job.history_offset = h.offset;
+                job.history_cells = hc.buffer;
+                job.history_cells_offset = hc.offset;
                 job.prev_view_projection = prev.view_projection;
             }
         }
@@ -1098,15 +1388,18 @@ bool RtxPipeline::render_metal(
             glGenBuffers(1, &next.cells);
             glGenBuffers(1, &next.result);
             glGenTextures(1, &next.result_texture);
+            glGenTextures(1, &next.cells_texture);
         }
         if (next.width != cells_w || next.height != cells_h) {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, next.cells);
             glBufferData(GL_SHADER_STORAGE_BUFFER, cells * 2 * 16, nullptr, GL_DYNAMIC_DRAW);
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, next.result);
-            glBufferData(GL_SHADER_STORAGE_BUFFER, cells * 2 * 4, nullptr, GL_DYNAMIC_DRAW);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, cells * 3 * 4, nullptr, GL_DYNAMIC_DRAW);
             glActiveTexture(GL_TEXTURE0 + 25);
             glBindTexture(wgl::GL_TEXTURE_BUFFER, next.result_texture);
             glTexBuffer(wgl::GL_TEXTURE_BUFFER, GL_RGBA8, next.result);
+            glBindTexture(wgl::GL_TEXTURE_BUFFER, next.cells_texture);
+            glTexBuffer(wgl::GL_TEXTURE_BUFFER, wgl::GL_RGBA32F, next.cells);
             glActiveTexture(GL_TEXTURE0);
             next.width = cells_w;
             next.height = cells_h;
@@ -1129,7 +1422,7 @@ bool RtxPipeline::render_metal(
             std::clamp(input.rtx_settings.reflection_roughness_cutoff * 0.5f, 0.04f, 1.0f)
         );
         const std::array<ComputeOutput, 2> outputs{
-            {{next.cells, cells * 2 * 16}, {next.result, cells * 2 * 4}}
+            {{next.cells, cells * 2 * 16}, {next.result, cells * 3 * 4}}
         };
         if (!run_compute_graph(
                 "rtx cells",
@@ -1147,7 +1440,7 @@ bool RtxPipeline::render_metal(
             return false;
         }
         glBindTexture(GL_TEXTURE_2D, 0);
-        next.vk_frame = vkgl::recording_frame();
+        next.vk_frame = native::recording_frame();
         next.serial = ++m_slot_serial;
         next.view_projection = renderer::multiply(input.camera.projection, input.camera.view);
         RtxFrameJob& p = next.params;
@@ -1163,6 +1456,28 @@ bool RtxPipeline::render_metal(
         p.frame_index = static_cast<std::uint32_t>(input.frame);
         p.dynamic_key = m_dynamic_key;
         next.mobys = m_dynamic_triangles;
+        // The 64 local lights nearest the camera, with a radius, have their shadows traced.
+        next.lights.clear();
+        const auto& eye = input.camera.position;
+        for (const auto& light : m_local_lights) {
+            if (light[0][3] > 0.0f) {
+                next.lights.push_back(light);
+            }
+        }
+        const auto distance = [&](const RtxLightRecord& l) {
+            const float dx = l[0][0] - eye[0], dy = l[0][1] - eye[1], dz = l[0][2] - eye[2];
+            return dx * dx + dy * dy + dz * dz;
+        };
+        if (next.lights.size() > 64) {
+            std::partial_sort(
+                next.lights.begin(), next.lights.begin() + 64, next.lights.end(),
+                [&](const auto& a, const auto& b) { return distance(a) < distance(b); }
+            );
+            next.lights.resize(64);
+        }
+        if (input.rtx_settings.shadows && !next.lights.empty()) {
+            p.flags |= 16;
+        }
         next.state = State::Written;
         m_next_slot = (m_next_slot + 1) % static_cast<int>(m_slots.size());
     }
@@ -1176,7 +1491,9 @@ bool RtxPipeline::render_metal(
         return false;
     }
     m_metal_texture = latest.result_texture;
+    m_metal_cells_texture = latest.cells_texture;
     m_reproject = true;
+    m_local_traced = (latest.params.flags & 16) != 0;
     m_source_view_projection = latest.view_projection;
     m_source_cells = {latest.width, latest.height};
     m_width = target.width;
@@ -1222,7 +1539,7 @@ void RtxPipeline::bind_for_early_lighting(
         return;
     }
     const auto& s = input.rtx_settings;
-    const int flags = effect_flags(s);
+    const int flags = effect_flags(s) | (m_reproject && m_local_traced ? 16 : 0);
     glUniform1i(shader.uniform("rtx_flags"), flags);
     glUniform1i(shader.uniform("rtx_reproject"), m_reproject ? 1 : 0);
     glUniformMatrix4fv(
@@ -1234,6 +1551,10 @@ void RtxPipeline::bind_for_early_lighting(
     glUniform1i(shader.uniform("rtx_denoise"), s.denoise ? 1 : 0);
     glUniform1i(shader.uniform("rtx_debug_view"), static_cast<int>(rtx_debug_view()));
     glBindTexture(wgl::GL_TEXTURE_BUFFER, m_reproject ? m_metal_texture : m_output_texture);
+    // Where the result in use was traced from, to keep it off the surfaces it was not.
+    glUniform1i(shader.uniform("rtx_source_positions"), 29);
+    glActiveTexture(GL_TEXTURE0 + 29);
+    glBindTexture(wgl::GL_TEXTURE_BUFFER, m_reproject ? m_metal_cells_texture : 0);
     glActiveTexture(GL_TEXTURE0);
 }
 

@@ -56,6 +56,12 @@ public:
     ) const;
     // Releases device resources and clears the authoring snapshot at level unload.
     void release();
+    // This frame's lights as uploaded (the game's eight slots, authored, then emitters): four
+    // float4 each, for the ray tracing's local shadows (rtx.h's RtxLightRecord).
+    std::span<const std::array<std::array<float, 4>, 4>> records() const {
+        return m_enabled ? std::span<const std::array<std::array<float, 4>, 4>>(m_records)
+                         : std::span<const std::array<std::array<float, 4>, 4>>();
+    }
     // Diagnostic reference switch for correctness/profiling; leaves the light table unchanged.
     std::atomic<bool> reference{false};
 

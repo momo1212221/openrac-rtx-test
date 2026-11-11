@@ -15,7 +15,13 @@ float forward_falloff(float distance,float radius) {
 #define LOCAL_ATTENUATION(d,r) forward_falloff(d,r)
 int forward_total() { return forward_count>0?forward_count:8; }
 vec4 forward_position(int i) { return forward_count>0?texelFetch(forward_lights,i*4):probe_point_position[i]; }
-vec4 forward_colour(int i) { return forward_count>0?texelFetch(forward_lights,i*4+1):probe_point_colour[i]; }
+// The traced visibility of the local lights at this pixel (early_surface sets it from the ray
+// tracing; 1 elsewhere): the lights' unshadowed sum, times the share of it that reaches here.
+float forward_shadow=1.;
+vec4 forward_colour(int i) {
+    vec4 c=forward_count>0?texelFetch(forward_lights,i*4+1):probe_point_colour[i];
+    return vec4(c.rgb*forward_shadow,c.a);
+}
 float forward_cone(int i,vec3 toward_light) {
     if(forward_count==0) return 1.;
     vec4 parameters=texelFetch(forward_lights,i*4+3);

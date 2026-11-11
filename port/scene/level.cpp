@@ -153,6 +153,9 @@ int image_index(const fs::path& requested, LevelData& level) {
     renderer::texture_pack::replace(image, {.level = level.level}, &replaced);
     level.image_animations.resize(level.images.size());
     level.image_animations.push_back(std::move(replaced.animation));
+    // The original's hash, by which a pack's material maps are found (Materials/<hash>/).
+    level.image_pack_hashes.resize(level.images.size());
+    level.image_pack_hashes.push_back(replaced.hash);
     bool translucent = false;
     for (std::size_t i = 3; i < image.pixels.size(); i += 4) {
         if (image.pixels[i] < 250) {
@@ -205,6 +208,9 @@ int material_index(
             }
         }
     }
+    if (m.image >= 0 && static_cast<std::size_t>(m.image) < level.image_pack_hashes.size()) {
+        m.texture_pack_hash = level.image_pack_hashes[static_cast<std::size_t>(m.image)];
+    }
     // A texture with texels below full alpha is drawn by the GS as the cutout materials are (the
     // static layers' and mobys' alpha test, GEQUAL 0x80 for the static layers and TEST 0x5360b for
     // mobys: texels at 0x80 written with depth, the others blended, colour only), whatever the
@@ -226,7 +232,7 @@ int material_index(
             && o.clamp_s == m.clamp_s && o.clamp_t == m.clamp_t && o.colour == m.colour
             && o.emission == m.emission && o.emission_image == m.emission_image
             && o.authored_emission == m.authored_emission && o.name == m.name
-            && o.source_slot == m.source_slot) {
+            && o.source_slot == m.source_slot && o.texture_pack_hash == m.texture_pack_hash) {
             return static_cast<int>(i);
         }
     }

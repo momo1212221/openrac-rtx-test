@@ -217,6 +217,7 @@ void SceneLighting::bind_material(
     const renderer::Shader& shader, std::uint32_t model, int slot, const scene::Material& source
 ) const {
     bind_surface_material(shader, model, slot, source);
+    m_sidecars.bind(shader, source.texture_pack_hash);
     const auto location = shader.uniform("object_reflection_enabled");
     if (location < 0) {
         return;
@@ -345,6 +346,10 @@ void SceneLighting::load(const scene::LevelData& level) {
     m_fur.load(level, enhanced::fur_profile(level.game));
     m_water_float.load();
     m_atmosphere.load();
+    if (gl::enhanced_rendering_available()) {
+        m_sidecars.load(level);
+    }
+    m_rtx.set_material_sidecars(&m_sidecars);
     m_rtx.upload(level);
 }
 
@@ -361,6 +366,7 @@ void SceneLighting::release() {
     m_water_float.release();
     m_atmosphere.release();
     m_rtx.release();
+    m_sidecars.release();
     m_probes.release();
     m_early_lighting.release();
 }
@@ -451,6 +457,8 @@ void SceneLighting::bind(
     const renderer::Camera* camera,
     bool depth_matched
 ) const {
+    // Neutral maps until bind_material binds a material's: every declared sampler needs an image.
+    m_sidecars.bind(shader, 0);
     m_probes.bind(shader, layer, all_static_receivers, camera, depth_matched);
     m_local_lights.bind(shader, camera, depth_matched);
     m_atmosphere.bind(shader);
@@ -463,6 +471,23 @@ bool SceneLighting::render_early(
     const std::function<void(const renderer::Shader&)>& bind_lighting,
     std::string& error
 ) {
+    // With ray tracing the glowing surfaces are lights (RtxPipeline::emissive_lights): the
+    // static ones whenever the level or the switch changes, the mobys' every frame.
+    {
+        const std::uint64_t wanted = input.rtx ? m_rtx.emissive_revision() : 0;
+        if (wanted != m_glow_revision) {
+            m_glow_revision = wanted;
+            const auto glows = input.rtx ? m_rtx.emissive_lights() : std::span<const enhanced::LocalLight>();
+            if (const auto set = m_local_lights.set_lights(glows); !set) {
+                log::warn("rtx: glowing surfaces as lights: {}", set.error().message);
+            }
+        }
+        const auto moving =
+            input.rtx ? m_rtx.emissive_moby_lights() : std::span<const enhanced::LocalLight>();
+        if (const auto set = m_local_lights.set_attached_lights(moving); !set) {
+            log::warn("rtx: glowing mobys as lights: {}", set.error().message);
+        }
+    }
     if (input.rtx) {
         std::string rtx_error;
         // The level's own sun, as the shadow maps take it (level_shadows.cpp): its authored
@@ -480,6 +505,8 @@ bool SceneLighting::render_early(
         const renderer::Vec3 fill = tint(m_level_fill_colour, {0.75f, 0.82f, 1.0f});
         const renderer::Vec3 sky_col{fill[0] * 0.6f, fill[1] * 0.6f, fill[2] * 0.6f};
         m_rtx.set_probe_coverage(m_probes.active());
+        m_rtx.set_local_lights(m_local_lights.records());
+
         if (!m_rtx.render(depth, input, target, sun_dir, sun_col, sky_col, rtx_error)
             && !rtx_error.empty()) {
             log::warn("rtx: {}", rtx_error);

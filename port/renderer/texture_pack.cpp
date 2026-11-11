@@ -23,6 +23,8 @@ struct State {
     std::mutex lock;  // levels load on another thread than the 2D layer converts on
     Io io;
     std::unordered_map<std::uint64_t, fs::path> files;  // the pack's pictures by hash
+    // Materials/<hash>/ folders holding at least one material map, by hash.
+    std::unordered_map<std::uint64_t, fs::path> materials;
     // The pack's animations by hash: a folder of frames or a GIF, and those read so far.
     std::unordered_map<std::uint64_t, fs::path> animated;
     std::unordered_map<std::uint64_t, std::shared_ptr<const Animation>> animations;
@@ -109,6 +111,32 @@ std::unordered_map<std::uint64_t, fs::path> files_under(const fs::path& root) {
         }
     }
     return files;
+}
+
+// The Materials/<hash>/ folders of a pack that hold a material map. They are read apart from the
+// recursive picture scan: their files are named by map (normal.png), never by a hash.
+std::unordered_map<std::uint64_t, fs::path> materials_under(const fs::path& root) {
+    std::unordered_map<std::uint64_t, fs::path> out;
+    std::error_code e;
+    const fs::path folder = root / "Materials";
+    if (root.empty() || !fs::is_directory(folder, e)) {
+        return out;
+    }
+    for (const auto& entry : fs::directory_iterator(folder, e)) {
+        const auto hash = parse_hash(entry.path().filename().string());
+        if (!hash || !entry.is_directory(e)) {
+            continue;
+        }
+        for (std::size_t m = 0; m < kMaterialMapCount; ++m) {
+            if (fs::is_regular_file(
+                    entry.path() / material_map_file(static_cast<MaterialMap>(m)), e
+                )) {
+                out.emplace(*hash, entry.path());
+                break;
+            }
+        }
+    }
+    return out;
 }
 
 // A planet's name as a folder name: no separators or characters Windows refuses, no trailing
@@ -369,6 +397,7 @@ void configure(const fs::path& pack, const fs::path& dump, Io io, LevelNamer lev
     s.io = io;
     s.level_name = level_name;
     s.files.clear();
+    s.materials.clear();
     s.animated.clear();
     s.animations.clear();
     s.animation_bytes = 0;
@@ -379,6 +408,7 @@ void configure(const fs::path& pack, const fs::path& dump, Io io, LevelNamer lev
     std::error_code e;
     if (!pack.empty() && fs::is_directory(pack, e)) {
         s.files = files_under(pack);
+        s.materials = materials_under(pack);
         for (auto it = fs::recursive_directory_iterator(pack, e);
              it != fs::recursive_directory_iterator();
              it.increment(e)) {
@@ -393,10 +423,11 @@ void configure(const fs::path& pack, const fs::path& dump, Io io, LevelNamer lev
             }
         }
         log::info(
-            "texture pack {}: {} texture(s), {} animated",
+            "texture pack {}: {} texture(s), {} animated, {} material sidecar set(s)",
             pack.string(),
             s.files.size(),
-            s.animated.size()
+            s.animated.size(),
+            s.materials.size()
         );
     }
     if (!dump.empty()) {
@@ -431,7 +462,9 @@ std::string file_name(std::uint64_t hash) {
 bool replace(Rgba8Image& image, const Origin& origin, Replacement* found_out) {
     State& s = state();
     const std::lock_guard guard(s.lock);
-    if ((s.files.empty() && s.animated.empty() && s.dump.empty()) || image.pixels.empty()) {
+    // A pack of material maps alone still needs the hash, to find the maps by.
+    if ((s.files.empty() && s.materials.empty() && s.animated.empty() && s.dump.empty())
+        || image.pixels.empty()) {
         return false;
     }
     const std::uint64_t hash = image_hash(image);
@@ -576,6 +609,62 @@ std::optional<std::vector<std::uint64_t>> CycleWatch::see(
         return cycle;
     }
     return std::nullopt;
+}
+
+const char* material_map_file(MaterialMap map) {
+    switch (map) {
+        case MaterialMap::Normal:
+            return "normal.png";
+        case MaterialMap::Roughness:
+            return "roughness.png";
+        case MaterialMap::Height:
+            return "height.png";
+        case MaterialMap::Ao:
+            return "ao.png";
+        case MaterialMap::Emissive:
+            return "emissive.png";
+        case MaterialMap::Specular:
+            return "specular.png";
+        case MaterialMap::Metallic:
+            return "metallic.png";
+        case MaterialMap::Cavity:
+            return "cavity.png";
+        case MaterialMap::Curvature:
+            return "curvature.png";
+        case MaterialMap::EdgeWear:
+            return "edgewear.png";
+    }
+    return "";
+}
+
+bool has_material_maps(std::uint64_t hash) {
+    State& s = state();
+    const std::lock_guard guard(s.lock);
+    return s.materials.contains(hash);
+}
+
+std::optional<Rgba8Image> load_material_map(std::uint64_t hash, MaterialMap map) {
+    fs::path file;
+    Io io;
+    {
+        State& s = state();
+        const std::lock_guard guard(s.lock);
+        const auto found = s.materials.find(hash);
+        if (found == s.materials.end()) {
+            return std::nullopt;
+        }
+        file = found->second / material_map_file(map);
+        io = s.io;
+    }
+    std::error_code e;
+    if (io.load == nullptr || !fs::is_regular_file(file, e)) {
+        return std::nullopt;
+    }
+    auto image = io.load(file);
+    if (image && image->pixels.empty()) {
+        image.reset();
+    }
+    return image;
 }
 
 unsigned replaced_count() {

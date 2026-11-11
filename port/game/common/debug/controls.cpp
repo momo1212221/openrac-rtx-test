@@ -444,7 +444,7 @@ void rtx_controls(settings::Settings& graphics, bool& changed) {
     if (combo(
             "RTX debug view##rtx",
             &rtx_view,
-            "Off\0Shadows\0Ambient occlusion\0Reflections\0Bounce GI\0BVH heatmap\0"
+            "Off\0Shadows\0Ambient occlusion\0Reflections\0Bounce GI\0BVH heatmap\0Local light shadows\0"
         )) {
         enhanced::set_rtx_debug_view(static_cast<enhanced::RtxDebugView>(rtx_view));
     }
@@ -860,7 +860,7 @@ void enhanced_settings_window() {
         if (combo(
                 "RTX debug view",
                 &rtx_view,
-                "Off\0Shadows\0Ambient occlusion\0Reflections\0Bounce GI\0BVH heatmap\0"
+                "Off\0Shadows\0Ambient occlusion\0Reflections\0Bounce GI\0BVH heatmap\0Local light shadows\0"
             )) {
             enhanced::set_rtx_debug_view(static_cast<enhanced::RtxDebugView>(rtx_view));
         }

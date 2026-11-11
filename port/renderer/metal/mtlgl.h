@@ -64,5 +64,9 @@ void* native_texture(unsigned name);
 // that what it encodes runs after the GL's commands so far and before those that follow. False,
 // without calling `record`, while no context is open.
 bool encode_native(const std::function<void(void* commands)>& record);
+// The serial of the frame whose commands are being recorded, and the last one the GPU has finished:
+// work the frame records may be read by another queue once completed_frame() reaches its serial.
+unsigned long long recording_frame();
+unsigned long long completed_frame();
 
 }  // namespace openrac::mtlgl

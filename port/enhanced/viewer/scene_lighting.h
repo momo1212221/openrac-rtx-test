@@ -24,6 +24,7 @@
 #include "enhanced/renderer/fur.h"
 #include "enhanced/renderer/local_lights.h"
 #include "enhanced/renderer/material_runtime.h"
+#include "enhanced/renderer/material_sidecars.h"
 #include "enhanced/renderer/rtx.h"
 #include "enhanced/renderer/water_float.h"
 #include "enhanced/renderer/wetness.h"
@@ -221,6 +222,9 @@ private:
     std::optional<renderer::Vec3> m_level_sun;
     renderer::Vec3 m_level_sun_colour{1.0f, 0.96f, 0.88f};
     renderer::Vec3 m_level_fill_colour{0.4f, 0.45f, 0.55f};
+    std::uint64_t m_glow_revision = 0;  // the glowing surfaces' lights LocalLights holds (0 none)
+    // A texture pack's material maps (normal, metal, emission...); the ray tracer reads the masks.
+    enhanced::MaterialSidecars m_sidecars;
     enhanced::RtxPipeline m_rtx;     // Native hardware ray-tracing pipeline (Metal / CUDA / Vulkan).
     ProbeLighting m_probes;          // The level's probe bake on the GPU.
     EarlyLighting m_early_lighting;  // The early-lit world's per-pixel lighting.

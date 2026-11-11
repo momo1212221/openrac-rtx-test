@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "enhanced/renderer/local_lights.h"
 #include "renderer/renderer.h"
 #include "renderer/rtx_settings.h"
 #include "renderer/shader.h"
@@ -31,6 +32,7 @@ enum class RtxDebugView {
     Reflections,
     GlobalIllumination,
     BvhHeatmap,
+    LocalShadows,  // how much of the local lights reaches each point (Metal traces them)
     Count
 };
 
@@ -86,6 +88,10 @@ struct RtxStatus {
     bool vulkan_ray_query_supported = false;
 };
 
+// A local light as local_lights.cpp uploads it: position (w the radius), colour (w the backlight),
+// spot axis (w the outer cosine), spot parameters (x the inner cosine, y whether a spot).
+using RtxLightRecord = std::array<std::array<float, 4>, 4>;
+
 // One frame's tracing on the GPU, with no copy through the CPU: the cells' positions and normals
 // (rtx_gbuffer.comp's two vec4 a cell) and the result (rtx_trace.comp's two RGBA8 words a cell)
 // are the renderer's own buffers, given as the backend's native objects. Metal: id<MTLBuffer>.
@@ -96,6 +102,8 @@ struct RtxFrameJob {
     std::size_t result_offset = 0;
     void* history = nullptr;  // the previous job's result, blended in through its camera
     std::size_t history_offset = 0;
+    void* history_cells = nullptr;  // where the previous job traced from: history only where it
+    std::size_t history_cells_offset = 0;  // is the same surface (no smear when turning fast)
     std::array<float, 16> prev_view_projection{};
     int width = 0, height = 0;  // cells
     std::array<float, 3> camera_pos{}, sun_dir{}, sun_colour{}, sky_colour{};
@@ -105,6 +113,8 @@ struct RtxFrameJob {
     // The mobys' world-space triangles, rebuilt into their own structure when `dynamic_key` changes.
     std::span<const RtxTriangle> dynamic_triangles;
     std::uint64_t dynamic_key = 0;
+    // The local lights to shadow (flag 16), the nearest first.
+    std::span<const RtxLightRecord> lights;
 };
 
 // Native hardware backend interface (implemented by Metal on macOS and CUDA on NVIDIA).
@@ -174,6 +184,9 @@ public:
     // Extracts static level geometry (terrain, ties, shrubs) and moby meshes, builds the SAH BVH,
     // and uploads acceleration structures to the active hardware backends.
     void upload(const scene::LevelData& level);
+    // A texture pack's material maps: their emission masks make lights of what they mark (and take
+    // it out of the occluders). Set before upload; it must outlive the pipeline's level.
+    void set_material_sidecars(const class MaterialSidecars* sidecars) { m_sidecars = sidecars; }
 
     // Uploads an explicit triangle list (used by unit/GPU tests and custom scenes) and builds the BVH.
     bool upload_triangles(std::span<const RtxTriangle> triangles, std::string& error);
@@ -215,6 +228,17 @@ public:
     bool active(const renderer::FrameInput& input, const renderer::RenderState& state) const;
     // Whether a verified probe bake lights this level (its bounce then needs no rays).
     void set_probe_coverage(bool covers) { m_probes_cover = covers; }
+    // The level's glowing surfaces as point lights (lamps, beacons, windows: the materials
+    // probe-emission.json makes emissive), so they light what is near them, characters too:
+    // the static ones once a level, the mobys' as they move (prepare_instances).
+    std::span<const LocalLight> emissive_lights() const { return m_emissive_static; }
+    std::span<const LocalLight> emissive_moby_lights() const { return m_emissive_mobys; }
+    std::uint64_t emissive_revision() const { return m_emissive_revision; }
+
+    // This frame's local lights (LocalLights' records), whose shadows Metal traces.
+    void set_local_lights(std::span<const RtxLightRecord> lights) {
+        m_local_lights.assign(lights.begin(), lights.end());
+    }
     int effect_flags(const renderer::RtxSettings& settings) const;
     unsigned output_buffer() const { return m_output_buffer; }
     unsigned output_texture() const { return m_output_texture; }
@@ -226,6 +250,7 @@ public:
     void release();
 
 private:
+    const MaterialSidecars* m_sidecars = nullptr;
     void build_bvh();
     void ensure_gpu_buffers();
     // Metal's own ray tracing on the renderer's device (Vulkan through MoltenVK): whether it runs
@@ -246,12 +271,13 @@ private:
     // that fills `cells` is queued); Submitted (Metal traces them); Done (`result` is readable).
     struct MetalSlot {
         enum class State { Free, Written, Submitted, Done } state = State::Free;
-        unsigned cells = 0, result = 0, result_texture = 0;
+        unsigned cells = 0, result = 0, result_texture = 0, cells_texture = 0;
         int width = 0, height = 0;
         std::uint64_t vk_frame = 0, job = 0, serial = 0;
         renderer::Mat4 view_projection{};
         RtxFrameJob params;  // all but the buffers, taken when the slot is written
         std::vector<RtxTriangle> mobys;
+        std::vector<RtxLightRecord> lights;
     };
     std::array<MetalSlot, 3> m_slots{};
     int m_next_slot = 0, m_latest_slot = -1, m_last_submitted = -1;
@@ -262,6 +288,7 @@ private:
     // this frame's own cells (the compute pass).
     bool m_reproject = false;
     unsigned m_metal_texture = 0;  // the newest finished slot's result (not owned)
+    unsigned m_metal_cells_texture = 0;  // and the positions it traced from (not owned)
     renderer::Mat4 m_source_view_projection{};
     std::array<int, 2> m_source_cells{};
     RtxHardwareBackend* select_hardware_backend(renderer::RtxBackend requested) const;
@@ -312,6 +339,16 @@ private:
     std::uint64_t m_frame = 0;
     bool m_ready = false;
     bool m_probes_cover = false;
+    std::vector<RtxLightRecord> m_local_lights;
+    // A model's glowing part, in its own space: where it is, its colour and its area.
+    struct EmissivePart {
+        std::array<float, 3> centre{}, normal{}, colour{};
+        float area = 0;
+    };
+    std::vector<EmissivePart> m_moby_emissive;  // by model; area 0 for none
+    std::vector<LocalLight> m_emissive_static, m_emissive_mobys;
+    std::uint64_t m_emissive_revision = 0;
+    bool m_local_traced = false;  // the result in use carries the local lights' shadows
     const char* m_logged = nullptr;  // the last state logged (render's reasons), once each
 };
 

@@ -409,12 +409,12 @@ bool enhanced_rendering_enabled();
 void set_enhanced_rendering(bool on);
 
 // Enhanced rendering is chosen at start and supported only by Vulkan. Metal has its compute now
-// (renderer/metal), but the enhanced mesh shader binds 18 samplers where Metal allows 16 a stage:
-// it waits for shared samplers before is_metal() may join here.
+// (renderer/metal) too: textures a shader only fetches take no sampler slot there
+// (shader_translate.cpp), which brings the enhanced mesh shader within Metal's 16 a stage.
 // Keep this decision at resource/pass/UI boundaries, not in every draw.
 inline bool enhanced_rendering_available() {
 #if defined(OPENRAC_ENHANCED_RENDERING) && OPENRAC_ENHANCED_RENDERING
-    return is_vulkan() && enhanced_rendering_enabled();
+    return (is_vulkan() || is_metal()) && enhanced_rendering_enabled();
 #else
     return false;
 #endif

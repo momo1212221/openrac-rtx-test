@@ -335,7 +335,7 @@ struct FrameParams {
     uint frame_index;
     uint has_dynamic;
     uint history_valid;
-    uint pad0;
+    uint light_count;    // local lights in `lights`, four float4 each (local_lights.cpp's records)
     float ray_distance;
     float ao_radius;
     float shadow_softness;
@@ -412,6 +412,8 @@ kernel void rtx_trace_frame_kernel(
     constant FrameParams& p [[buffer(5)]],
     device uint* result [[buffer(6)]],
     device const uint* history [[buffer(7)]],
+    constant float4* lights [[buffer(8)]],
+    device const float4* history_cells [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= p.width || gid.y >= p.height) {
@@ -420,8 +422,9 @@ kernel void rtx_trace_frame_kernel(
     uint cell = gid.y * p.width + gid.x;
     float4 position = cells[cell * 2u];
     if (position.w <= 0.0f) {
-        result[cell * 2u + 0u] = 0xFF000000u;
-        result[cell * 2u + 1u] = 0xFF000000u;
+        result[cell * 3u + 0u] = 0xFF000000u;
+        result[cell * 3u + 1u] = 0xFF000000u;
+        result[cell * 3u + 2u] = 0xFFFFFFFFu;
         return;
     }
     float4 normal_rough = cells[cell * 2u + 1u];
@@ -519,8 +522,50 @@ kernel void rtx_trace_frame_kernel(
         }
     }
 
+    // The local lights: what share of their unshadowed light (as the mesh shader sums it, with
+    // local_lights.glsl's falloff and cone) reaches this point past the level and the mobys.
+    float local_visible = 1.0f;
+    if ((p.flags & 16u) != 0u && p.light_count > 0u) {
+        float open_sum = 0.0f, lit_sum = 0.0f;
+        for (uint i = 0u; i < p.light_count; ++i) {
+            float4 lp = lights[i * 4u + 0u];
+            float4 lc = lights[i * 4u + 1u];
+            float radius = lp.w;
+            float3 delta = lp.xyz - position.xyz;
+            float d = length(delta);
+            if (radius <= 0.0f || d >= radius || d <= 1e-4f) {
+                continue;
+            }
+            float3 toward = delta / d;
+            float ndotl = dot(N, toward);
+            if (ndotl <= 0.0f) {
+                continue;
+            }
+            float x = d / radius, x2 = x * x;
+            float window = max(0.0f, 1.0f - x2 * x2);
+            float falloff = window * window / (1.0f + 3.03125f * x2);
+            float cone = 1.0f;
+            float4 ld = lights[i * 4u + 2u];
+            float4 lpar = lights[i * 4u + 3u];
+            if (lpar.y != 0.0f) {
+                float cosine = dot(-toward, ld.xyz);
+                cone = lpar.x == ld.w ? float(cosine >= ld.w) : smoothstep(ld.w, lpar.x, cosine);
+            }
+            float weight = dot(max(lc.rgb, float3(0.0f)), float3(0.2126f, 0.7152f, 0.0722f))
+                           * ndotl * falloff * cone;
+            if (weight <= 1e-5f) {
+                continue;
+            }
+            open_sum += weight;
+            ray lr(origin, toward, 0.025f, max(d - 0.1f, 0.03f));
+            lit_sum += frame_blocked(lr, level, mobys, mobys_on) ? 0.0f : weight;
+        }
+        local_visible = open_sum > 1e-5f ? lit_sum / open_sum : 1.0f;
+    }
+
     float4 word0 = float4(encode_early_gi(bounce), sun_visible);
     float4 word1 = float4(reflection, ambient);
+    float4 word2 = float4(local_visible, 0.0f, 0.0f, 1.0f);
     // The previous job's result at this point through its camera: several frames' rays together.
     if (p.history_valid != 0u) {
         float4 clip = p.prev_view_projection * float4(position.xyz, 1.0f);
@@ -529,13 +574,20 @@ kernel void rtx_trace_frame_kernel(
             if (all(uv >= float2(0.0f)) && all(uv < float2(1.0f))) {
                 uint2 prev = min(uint2(uv * float2(p.width, p.height)), uint2(p.width - 1u, p.height - 1u));
                 uint pi = prev.y * p.width + prev.x;
-                word0 = mix(unpack_rgba8(history[pi * 2u]), word0, p.history_blend);
-                word1 = mix(unpack_rgba8(history[pi * 2u + 1u]), word1, p.history_blend);
+                // The same surface only: what the previous job traced there must be this point.
+                float4 was = history_cells[pi * 2u];
+                float reach = max(0.3f, distance(position.xyz, p.camera_pos.xyz) * 0.02f);
+                if (was.w > 0.0f && distance(was.xyz, position.xyz) < reach) {
+                word0 = mix(unpack_rgba8(history[pi * 3u]), word0, p.history_blend);
+                word1 = mix(unpack_rgba8(history[pi * 3u + 1u]), word1, p.history_blend);
+                word2 = mix(unpack_rgba8(history[pi * 3u + 2u]), word2, p.history_blend);
+                }
             }
         }
     }
-    result[cell * 2u + 0u] = pack_rgba8(word0);
-    result[cell * 2u + 1u] = pack_rgba8(word1);
+    result[cell * 3u + 0u] = pack_rgba8(word0);
+    result[cell * 3u + 1u] = pack_rgba8(word1);
+    result[cell * 3u + 2u] = pack_rgba8(word2);
 }
 )msl";
 
@@ -565,7 +617,7 @@ struct alignas(16) MetalFrameParams {
     float sun_colour[4]{};
     float sky_colour[4]{};
     std::uint32_t width = 0, height = 0, samples = 1, flags = 0;
-    std::uint32_t frame_index = 0, has_dynamic = 0, history_valid = 0, pad0 = 0;
+    std::uint32_t frame_index = 0, has_dynamic = 0, history_valid = 0, light_count = 0;
     float ray_distance = 120.0f, ao_radius = 2.5f, shadow_softness = 0.035f, gi_strength = 1.0f;
     float roughness_cutoff = 0.65f, history_blend = 1.0f, pad1 = 0.0f, pad2 = 0.0f;
 };
@@ -918,7 +970,8 @@ public:
             p.flags = static_cast<std::uint32_t>(job.flags);
             p.frame_index = job.frame_index;
             p.has_dynamic = mobys ? 1u : 0u;
-            p.history_valid = job.history != nullptr ? 1u : 0u;
+            p.history_valid = job.history != nullptr && job.history_cells != nullptr ? 1u : 0u;
+            p.light_count = static_cast<std::uint32_t>(std::min<std::size_t>(job.lights.size(), 64));
             p.ray_distance = s.ray_distance;
             p.ao_radius = s.ao_radius;
             p.shadow_softness = s.shadow_softness;
@@ -936,6 +989,15 @@ public:
             [enc setBytes:&p length:sizeof p atIndex:5];
             [enc setBuffer:result offset:job.result_offset atIndex:6];
             [enc setBuffer:history offset:(job.history ? job.history_offset : job.result_offset) atIndex:7];
+            // The local lights (at most 64: 4 KiB, as bytes); one zeroed light without any.
+            const std::size_t light_bytes = std::min<std::size_t>(job.lights.size(), 64) * sizeof(RtxLightRecord);
+            static const RtxLightRecord kNone{};
+            [enc setBytes:(light_bytes != 0 ? static_cast<const void*>(job.lights.data()) : &kNone)
+                   length:(light_bytes != 0 ? light_bytes : sizeof kNone)
+                  atIndex:8];
+            [enc setBuffer:(job.history_cells ? (__bridge id<MTLBuffer>)job.history_cells : cells)
+                    offset:(job.history_cells ? job.history_cells_offset : job.cells_offset)
+                   atIndex:9];
             [enc dispatchThreadgroups:MTLSizeMake((p.width + 7) / 8, (p.height + 7) / 8, 1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             [enc endEncoding];

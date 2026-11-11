@@ -26,6 +26,7 @@ uniform int rtx_debug_view;
 uniform int rtx_reproject;
 uniform mat4 rtx_source_view_projection;
 uniform vec2 rtx_source_cells;
+uniform samplerBuffer rtx_source_positions;  // that frame's cells (rtx_gbuffer.comp): 2 vec4 each
 
 vec3 position_at(ivec2 pixel, float depth) {
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(textureSize(early_depth, 0)) * 2.0 - 1.0;
@@ -144,19 +145,28 @@ void main() {
         rtx_grid = ivec2(rtx_source_cells);
         rtx_cell = clamp(ivec2(floor(uv * vec2(rtx_grid))), ivec2(0), rtx_grid - 1);
         rtx_here = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+        // Only where that frame traced this same surface: after a fast turn, an edge or what was
+        // hidden then shows another surface's light, which smeared across the picture.
+        if (rtx_here) {
+            vec4 traced = texelFetch(rtx_source_positions, (rtx_cell.y * rtx_grid.x + rtx_cell.x) * 2);
+            float reach = max(0.3, -centre.z * 0.02);
+            rtx_here = traced.w > 0.0 && distance(traced.xyz, world) < reach;
+        }
     }
     int rtx_index = rtx_cell.y * rtx_grid.x + rtx_cell.x;
+    float local_visibility = 1.0;  // of the local lights, traced (bits 28-31 of the guide)
     if (rtx_here) {
         // rtx_trace.comp's two words: (bounce, sun visibility), (weighted reflection, ambient
         // visibility). The filter averages decoded values, never the log-encoded bytes.
-        vec4 s0 = texelFetch(rtx_values, rtx_index * 2);
-        vec4 s1 = texelFetch(rtx_values, rtx_index * 2 + 1);
+        vec4 s0 = texelFetch(rtx_values, rtx_index * 3);
+        vec4 s1 = texelFetch(rtx_values, rtx_index * 3 + 1);
+        float local = texelFetch(rtx_values, rtx_index * 3 + 2).r;
         vec3 gi = decode_rtx_gi(s0.rgb);
         float sun = s0.a, ambient = s1.a;
         vec3 reflection = s1.rgb;
         if (rtx_denoise != 0) {
             vec3 sum_gi = vec3(0.0), sum_refl = vec3(0.0);
-            float sum_sun = 0.0, sum_ambient = 0.0, w_sum = 0.0;
+            float sum_sun = 0.0, sum_ambient = 0.0, sum_local = 0.0, w_sum = 0.0;
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     ivec2 nc = clamp(cell + ivec2(dx, dy), ivec2(0), half_extent - 1);
@@ -169,8 +179,9 @@ void main() {
                     float w = exp(-float(dx * dx + dy * dy) * 0.5 - plane * plane / 0.01);
                     ivec2 rc = clamp(rtx_cell + ivec2(dx, dy), ivec2(0), rtx_grid - 1);
                     int nidx = rc.y * rtx_grid.x + rc.x;
-                    vec4 n0 = texelFetch(rtx_values, nidx * 2);
-                    vec4 n1 = texelFetch(rtx_values, nidx * 2 + 1);
+                    vec4 n0 = texelFetch(rtx_values, nidx * 3);
+                    vec4 n1 = texelFetch(rtx_values, nidx * 3 + 1);
+                    sum_local += texelFetch(rtx_values, nidx * 3 + 2).r * w;
                     sum_gi += decode_rtx_gi(n0.rgb) * w;
                     sum_sun += n0.a * w;
                     sum_refl += n1.rgb * w;
@@ -183,6 +194,7 @@ void main() {
                 sun = sum_sun / w_sum;
                 reflection = sum_refl / w_sum;
                 ambient = sum_ambient / w_sum;
+                local = sum_local / w_sum;
             }
         }
         if (rtx_debug_view == 1) {
@@ -202,6 +214,11 @@ void main() {
             covered = true;
         } else if (rtx_debug_view == 4) {
             irradiance = gi;
+            shadow = 1.0;
+            ao = 1.0;
+            covered = true;
+        } else if (rtx_debug_view == 6) {
+            irradiance = vec3(local);
             shadow = 1.0;
             ao = 1.0;
             covered = true;
@@ -237,6 +254,9 @@ void main() {
             if ((rtx_flags & 1) != 0) {
                 shadow = min(shadow, sun);
             }
+            if ((rtx_flags & 16) != 0) {
+                local_visibility = local;
+            }
         }
     }
     irradiance *= ao;
@@ -249,5 +269,6 @@ void main() {
     uvec2 q = uvec2(round(oct * 255.0));
     guides[index * 2] = floatBitsToUint(depth);
     guides[index * 2 + 1] = q.x | (q.y << 8u) | (selected << 16u) | (covered ? 1u << 18u : 0u)
-                            | (1u << 19u) | (hero << 20u);
+                            | (1u << 19u) | (hero << 20u)
+                            | (uint(round((1.0 - clamp(local_visibility, 0.0, 1.0)) * 15.0)) << 28u);
 }
