@@ -493,19 +493,28 @@ bool SceneLighting::render_early(
     if (input.rtx) {
         std::string rtx_error;
         // The level's own sun, as the shadow maps take it (level_shadows.cpp): its authored
-        // travel direction, then a verified bake's or the runtime's override. Without light sets,
-        // a high sun from behind the default camera.
+        // travel direction, then a verified bake's or the runtime's override.
         const renderer::Vec3 sun_dir =
             sunlight_direction(m_level_sun.value_or(renderer::Vec3{-0.57735f, -0.57735f, -0.57735f}));
-        // Its colour and the fill's, normalised to the brightest channel: the traced pass asks
-        // what tint the light has and where it reaches, the shading keeps the level's brightness.
-        const auto tint = [](const renderer::Vec3& c, const renderer::Vec3& fallback) {
-            const float peak = std::max({c[0], c[1], c[2]});
-            return peak > 1e-4f ? renderer::Vec3{c[0] / peak, c[1] / peak, c[2] / peak} : fallback;
-        };
-        const renderer::Vec3 sun_col = tint(m_level_sun_colour, {1.0f, 0.96f, 0.88f});
-        const renderer::Vec3 fill = tint(m_level_fill_colour, {0.75f, 0.82f, 1.0f});
-        const renderer::Vec3 sky_col{fill[0] * 0.6f, fill[1] * 0.6f, fill[2] * 0.6f};
+        // Its light as the mesh shader's direct sun has it (light set 0's colour A times the bake's
+        // sunlight scale, 1 in every R&C bake), and the fill (colour B) as the sky: the traced
+        // bounces then match the level's brightness instead of a tint at 1. A level without light
+        // sets, or whose main light is black, has no sun in the trace (no invented one).
+        const auto peak = [](const renderer::Vec3& c) { return std::max({c[0], c[1], c[2]}); };
+        const bool has_sun = m_level_sun.has_value() && peak(m_level_sun_colour) > 0.02f;
+        const renderer::Vec3 sun_col =
+            has_sun ? m_level_sun_colour : renderer::Vec3{0.0f, 0.0f, 0.0f};
+        const renderer::Vec3 sky_col = m_level_sun.has_value()
+                                           ? renderer::Vec3{m_level_fill_colour[0] * 0.6f,
+                                                            m_level_fill_colour[1] * 0.6f,
+                                                            m_level_fill_colour[2] * 0.6f}
+                                           : renderer::Vec3{0.08f, 0.09f, 0.11f};
+        if (static std::array<float, 6> told{}; told != std::array<float, 6>{sun_col[0], sun_col[1], sun_col[2], sky_col[0], sky_col[1], sky_col[2]}) {
+            told = {sun_col[0], sun_col[1], sun_col[2], sky_col[0], sky_col[1], sky_col[2]};
+            log::info("rtx: traced sun {:.2f} {:.2f} {:.2f}{}, sky {:.2f} {:.2f} {:.2f}", sun_col[0],
+                      sun_col[1], sun_col[2], has_sun ? "" : " (none)", sky_col[0], sky_col[1],
+                      sky_col[2]);
+        }
         m_rtx.set_probe_coverage(m_probes.active());
         m_rtx.set_local_lights(m_local_lights.records());
 

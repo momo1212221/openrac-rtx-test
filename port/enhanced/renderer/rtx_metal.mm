@@ -728,6 +728,7 @@ kernel void rtx_trace_frame_kernel(
                 float3 seen;
                 if (h.emitter) {
                     seen = h.emission;
+                    reflection = max(clamp_luminance(seen, 3.0f), float3(0.01f));
                 } else if (h.hit) {
                     float3 hn = dot(h.normal, R) > 0.0f ? -h.normal : h.normal;
                     float3 hp = origin + R * h.t + hn * 0.03f;
@@ -740,11 +741,17 @@ kernel void rtx_trace_frame_kernel(
                     seen = h.albedo * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.35f
                                        + sample_local_lights(lights, p.light_count, hp, hn, seed,
                                                              level, mobys, mobys_on));
+                    reflection = max(clamp_luminance(seen, 3.0f), float3(0.01f));
                 } else {
-                    seen = p.sky_colour.xyz * max(0.25f, 0.5f + 0.5f * R.z) * 1.5f;
+                    // Out into the open: the probes' captured environment holds the level's real
+                    // sky, so the mesh shader keeps it ("nothing traced") unless the ray meets the
+                    // sun's disk.
+                    float disk = smoothstep(0.9990f, 0.9997f, dot(R, to_sun));
+                    if (disk > 0.0f) {
+                        reflection = max(clamp_luminance(p.sun_colour.xyz * 12.0f * disk, 3.0f),
+                                         float3(0.01f));
+                    }
                 }
-                // At least 0.01: a traced reflection never reads as "nothing traced"; at most 3.
-                reflection = max(clamp_luminance(seen, 3.0f), float3(0.01f));
             }
         }
     }
