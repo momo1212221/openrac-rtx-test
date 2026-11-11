@@ -43,11 +43,11 @@ const HERO = {
 };
 const LAMP = /(light|lamp|lantern|neon|bulb|sign|beacon|torch|glow)/;
 const NOT_LAMP = /(lightning|lighter|flight|lights?_?off)/;
-// Reflective things by their names (Ratchet & Clank's machines, vehicles, robots, weapons and
-// gold are polished metal or lacquer), and glass. A model with one of the game's chrome maps
-// (a metal_* material: its shine pass) counts as reflective as well.
-const SHINY = /(metal|chrome|steel|ship|taxi|train|truck|locomotive|robot|robo|bot\b|drone|elevator|helicopter|blimp|platform|statue|gold|bolt\b|nut\b|wrench|glove|blaster|gun|missile|rocket|mine\b|bomb|claw|tesla|devastator|devestator|pyrocitor|ryno|morphoray|swingshot|visibomb|decoy|walloper|taunter|magnetizer|helipack|vendor|infobot|turret|cannon|pipe|tank|machine|vent|hatch|door)/;
-const GLASS = /(glass|window|crystal|ice\b|dome|screen|monitor|visor)/;
+// Reflective things by their names: vehicles, robots, weapons, gold and bare metal (Ratchet &
+// Clank's are polished metal or lacquer). Kept to clear names: "platform", "door", "crate" and the
+// like are as often stone, wood or painted, and on Blarg station a crate with metal bands came out
+// as a glass box.
+const SHINY = /(metal|chrome|steel|ship|taxi|train|truck|locomotive|robot|drone|helicopter|blimp|statue|gold|wrench|glove|blaster|gun\b|missile|rocket|tesla|devastator|devestator|pyrocitor|ryno|morphoray|swingshot|visibomb|decoy|walloper|taunter|magnetizer|helipack|turret|cannon)/;
 
 const lum = (r, g, b) => (54 * r + 183 * g + 19 * b) / 256 / 255;
 const sat = (r, g, b) => {
@@ -80,15 +80,11 @@ function levelTextures(level) {
   const note = (glb, hint) => {
     const path = join(level, glb);
     if (!existsSync(path)) return;
-    const json = glbJson(path);
-    // The game's chrome on this model: its textures are meant to shine.
-    const chrome = (json.materials ?? []).some((m) => (m.name ?? "").startsWith("metal_"));
-    for (const image of json.images ?? []) {
+    for (const image of glbJson(path).images ?? []) {
       if (!image.uri) continue;
       const texture = resolve(dirname(path), image.uri);
       if (!hints.has(texture)) hints.set(texture, new Set());
       hints.get(texture).add(hint);
-      if (chrome) hints.get(texture).add("chrome");
     }
   };
   for (const [kind, classes] of Object.entries(manifest.classes ?? {})) {
@@ -108,8 +104,11 @@ function kindOf(hash, hints, image) {
   const names = hints.map((h) => h.toLowerCase());
   if (names.some((n) => LAMP.test(n) && !NOT_LAMP.test(n))) return {kind: "lamp", material: "generic"};
   if (names.some((n) => n === "moby/ratchet")) return {kind: "character", material: "character"};
-  if (names.some((n) => GLASS.test(n))) return {kind: "glass", material: "generic"};
-  if (names.some((n) => n === "chrome" || SHINY.test(n))) return {kind: "shiny", material: "metal", confidence: 0.75};
+  // No glass by name: a "window" model is mostly its frame (the panes are blended and take no
+  // specular), and on Blarg its frames came out as glossy noise.
+  // The game's chrome (a metal_* material) says only that some part of the model shines, not which
+  // texture: it no longer makes all of them shiny.
+  if (names.some((n) => SHINY.test(n))) return {kind: "shiny", material: "metal", confidence: 0.75};
   const textureClass = names.every((n) => n.startsWith("sky")) && names.length ? "sky" : "diffuse";
   const found = classifyMaterial(names, image, textureClass);
   return {kind: found.material, material: found.material, confidence: found.confidence};
@@ -172,7 +171,7 @@ function derive(image, {kind, material, confidence = 1}) {
   // Polished and glass: a smooth surface (the map's variation kept), lacquer and glass with a
   // dielectric's F0 that mesh.frag and the ray tracer take as reflective (above 0.045).
   if (kind === "shiny" || kind === "glass") {
-    const scale = kind === "glass" ? 0.25 : 0.45;
+    const scale = kind === "glass" ? 0.3 : 0.6;
     const rough = maps.roughness.data;
     for (let i = 0; i < rough.length; i += 4) {
       const v = Math.max(18, Math.round(rough[i] * scale));

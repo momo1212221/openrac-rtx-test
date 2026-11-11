@@ -1273,10 +1273,12 @@ void RtxPipeline::prepare_instances(
             std::array<float, 3> centre{}, colour{};
             for (int a = 0; a < 3; ++a) {
                 centre[a] = sum.centre[a] / sum.area;
-                colour[a] = sum.colour[a] / sum.area * 1.2f;
+                colour[a] = sum.colour[a] / sum.area * 0.4f;
             }
+            // A detail's light, not a lamp's: on Blarg Clank lit Ratchet and the floor red and
+            // green like a lamp at 1.2 and reach 3.
             LocalLight light = glow_light(centre, sum.normal, colour, sum.area);
-            light.range = 3.0f;
+            light.range = 2.0f;
             m_emissive_mobys.push_back(light);
         }
     }

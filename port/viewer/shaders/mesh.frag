@@ -549,7 +549,10 @@ vec3 probe_surface(vec4 texel, vec3 original) {
 #ifdef OPENRAC_EARLY_LIGHTING
             // Where the trace reflected, what it saw replaces the probes' captured surroundings:
             // glowing surfaces, the sun's light and the level as it is now.
-            around = mix(around, traced_reflection.rgb, clamp(traced_reflection.a, 0.0, 1.0));
+            // A rough surface's own blur is the probes' (the trace's narrow lobe would look too
+            // sharp and grainy on it): all traced below 0.15 roughness, none from 0.45.
+            around = mix(around, traced_reflection.rgb,
+                         clamp(traced_reflection.a, 0.0, 1.0) * smoothstep(0.45, 0.15, roughness));
 #endif
             float grazing = pow(1.0 - clamp(dot(surface_n, eye), 0.0, 1.0), 5.0);
             vec3 fresnel = tint + (1.0 - tint) * grazing;

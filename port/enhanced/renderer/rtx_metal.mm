@@ -407,6 +407,13 @@ inline float4 unpack_rgba8(uint u) {
                   float(u >> 24u)) * (1.0f / 255.0f);
 }
 
+// At most `limit` in luminance, the colour kept: one path that meets a bright glow through a
+// gap is a firefly the few frames of history cannot average away.
+inline float3 clamp_luminance(float3 c, float limit) {
+    float l = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+    return l > limit ? c * (limit / l) : c;
+}
+
 // A path's hit: the level, the mobys, or a glowing surface (its own structure: it lights, it is
 // seen and reflected, but it never shadows, so a bulb does not darken its own light).
 struct PathHit {
@@ -545,7 +552,10 @@ kernel void rtx_trace_frame_kernel(
     }
     uint cell = gid.y * p.width + gid.x;
     float4 position = cells[cell * 2u];
-    if (position.w <= 0.0f) {
+    // Nothing traced past 70 units: the level's far backdrop (Blarg's stations and asteroids
+    // behind the windows) took the trace's shadows, AO and noise, and costs rays for nothing.
+    // early_lighting.comp fades the trace out from 40 units on, so this edge never shows.
+    if (position.w <= 0.0f || distance(position.xyz, p.camera_pos.xyz) > 70.0f) {
         result[cell * 3u + 0u] = 0xFF000000u;
         result[cell * 3u + 1u] = 0xFF000000u;
         result[cell * 3u + 2u] = 0x000000FFu;  // local lights unblocked, no glow light
@@ -612,7 +622,7 @@ kernel void rtx_trace_frame_kernel(
                     break;
                 }
                 if (h.emitter) {
-                    glow += throughput * h.emission;
+                    glow += clamp_luminance(throughput * h.emission, 1.5f);
                     break;
                 }
                 float3 hn = dot(h.normal, dir) > 0.0f ? -h.normal : h.normal;
@@ -625,9 +635,10 @@ kernel void rtx_trace_frame_kernel(
                 }
                 bounce += throughput * h.albedo
                           * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.25f);
-                glow += throughput * h.albedo
-                        * sample_local_lights(lights, p.light_count, hp, hn, seed, level, mobys,
-                                              mobys_on);
+                glow += clamp_luminance(throughput * h.albedo
+                                            * sample_local_lights(lights, p.light_count, hp, hn,
+                                                                  seed, level, mobys, mobys_on),
+                                        1.5f);
                 throughput *= h.albedo;
                 if (max(throughput.x, max(throughput.y, throughput.z)) < 0.02f) {
                     break;
@@ -663,9 +674,14 @@ kernel void rtx_trace_frame_kernel(
             metallic = float((seen_here.material >> 8u) & 0xFFu) / 255.0f;
             f0 = float((seen_here.material >> 16u) & 0xFFu) / 255.0f;
         }
-        bool glossy = metallic > 0.05f || f0 > 0.045f || roughness < 0.35f;
+        // Smooth surfaces only: a rougher one's reflection from one path a cell is noise (Blarg's
+        // window frames came out grainy white); it keeps the probes' calm environment.
+        bool glossy = (metallic > 0.05f && roughness < 0.4f) || roughness < 0.25f;
         if (glossy && roughness <= p.roughness_cutoff) {
-            float alpha = max(roughness * roughness, 0.002f);
+            // A third of the surface's lobe: one ray a cell from the full lobe of a half-rough metal
+            // left blotches the history could not smooth (Blarg's ceiling ring). The mesh shader
+            // gives a rougher surface more of the probes' blurred environment instead.
+            float alpha = max(roughness * roughness * 0.33f, 0.002f);
             float u1 = rand01(seed), u2 = rand01(seed);
             float cos_theta = sqrt((1.0f - u1) / (1.0f + (alpha * alpha - 1.0f) * u1));
             float sin_theta = sqrt(max(0.0f, 1.0f - cos_theta * cos_theta));
@@ -699,8 +715,8 @@ kernel void rtx_trace_frame_kernel(
                 } else {
                     seen = p.sky_colour.xyz * max(0.25f, 0.5f + 0.5f * R.z) * 1.5f;
                 }
-                // At least 0.01: a traced reflection never reads as "nothing traced".
-                reflection = max(seen, float3(0.01f));
+                // At least 0.01: a traced reflection never reads as "nothing traced"; at most 3.
+                reflection = max(clamp_luminance(seen, 3.0f), float3(0.01f));
             }
         }
     }
@@ -1222,7 +1238,9 @@ public:
             p.shadow_softness = s.shadow_softness;
             p.gi_strength = s.gi_strength;
             p.roughness_cutoff = s.reflection_roughness_cutoff;
-            p.history_blend = job.history != nullptr ? 0.25f : 1.0f;
+            // A sixth of each new trace: smoother than a quarter, the noise of one or two paths a
+            // cell averaged over more frames (early lighting rejects history on other surfaces).
+            p.history_blend = job.history != nullptr ? 0.16f : 1.0f;
 
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:m_trace_frame_pso];
