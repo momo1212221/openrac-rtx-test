@@ -23,6 +23,10 @@
 #include "renderer/shader.h"
 #include "scene/level.h"
 
+namespace openrac::renderer {
+class TexturePool;
+}
+
 namespace openrac::scene {
 class LevelScene;
 
@@ -213,6 +217,9 @@ public:
         const renderer::Vec3& /*travel*/, const renderer::Vec3& /*colour*/,
         const renderer::Vec3& /*fill*/
     ) {}
+
+    // The frame's texture pool, before render_early (the effects' texture hues: TexturePool).
+    virtual void set_texture_pool(const renderer::TexturePool* /*textures*/) {}
 
     // Draws the early lighting from the world's `depth`; `bind_lighting` sets the scene's own
     // lighting on its shader. Returns whether it drew, with `error` when it could not.

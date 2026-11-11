@@ -482,8 +482,10 @@ bool SceneLighting::render_early(
                 log::warn("rtx: glowing surfaces as lights: {}", set.error().message);
             }
         }
+        // The glowing mobys and the frame's added effects (explosions, fire, shots) as lights.
         const auto moving =
-            input.rtx ? m_rtx.emissive_moby_lights() : std::span<const enhanced::LocalLight>();
+            input.rtx ? m_rtx.moving_lights(input.effects, m_texture_pool)
+                      : std::span<const enhanced::LocalLight>();
         if (const auto set = m_local_lights.set_attached_lights(moving); !set) {
             log::warn("rtx: glowing mobys as lights: {}", set.error().message);
         }

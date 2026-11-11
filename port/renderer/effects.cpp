@@ -478,6 +478,8 @@ bool EffectRenderer::apply(
         const profiling::Zone resolve("Effects texture resolve");
         texture = state.textures.resolve(tex0, texa);
     }
+    // The texture's hue for the ray tracer's effect lights (an explosion's orange).
+    state.textures.note_effect_hue(TexturePool::effect_key(tex0_bits, tbp, cbp), texture);
     if (log::level() <= log::Level::Debug) {
         static std::set<std::uint64_t> seen;
         if (seen.insert(tex0_bits).second) {

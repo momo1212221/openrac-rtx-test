@@ -1117,3 +1117,43 @@ TextureHandle TexturePool::add_field(
 }
 
 }  // namespace openrac::renderer
+
+namespace openrac::renderer {
+
+std::uint64_t TexturePool::effect_key(std::uint64_t tex0, std::uint32_t tbp, std::uint32_t cbp) {
+    std::uint64_t key = 1469598103934665603ull;
+    for (const std::uint64_t part : {tex0, std::uint64_t{tbp}, std::uint64_t{cbp}}) {
+        key = (key ^ part) * 1099511628211ull;
+    }
+    return key;
+}
+
+void TexturePool::note_effect_hue(std::uint64_t key, TextureHandle texture) {
+    auto found = m_texture_hues.find(texture);
+    if (found == m_texture_hues.end()) {
+        const Rgba8Image& picture = image(texture);
+        std::array<double, 3> sum{};
+        for (std::size_t i = 0; i + 3 < picture.pixels.size(); i += 4) {
+            const double alpha = picture.pixels[i + 3];
+            for (int k = 0; k < 3; ++k) {
+                sum[k] += picture.pixels[i + k] * alpha;
+            }
+        }
+        const double peak = std::max({sum[0], sum[1], sum[2], 1e-9});
+        std::array<float, 3> hue{1.0f, 1.0f, 1.0f};
+        if (sum[0] + sum[1] + sum[2] > 0.0) {
+            for (int k = 0; k < 3; ++k) {
+                hue[k] = static_cast<float>(sum[k] / peak);
+            }
+        }
+        found = m_texture_hues.emplace(texture, hue).first;
+    }
+    m_effect_hues[key] = found->second;
+}
+
+const std::array<float, 3>* TexturePool::effect_hue(std::uint64_t key) const {
+    const auto found = m_effect_hues.find(key);
+    return found != m_effect_hues.end() ? &found->second : nullptr;
+}
+
+}  // namespace openrac::renderer

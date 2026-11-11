@@ -166,6 +166,7 @@ public:
         m_level_sun_colour = colour;
         m_level_fill_colour = fill;
     }
+    void set_texture_pool(const renderer::TexturePool* textures) override { m_texture_pool = textures; }
     bool render_early(
         unsigned depth,
         const renderer::FrameInput& input,
@@ -227,6 +228,7 @@ private:
     // A texture pack's material maps (normal, metal, emission...); the ray tracer reads the masks.
     enhanced::MaterialSidecars m_sidecars;
     enhanced::RtxPipeline m_rtx;     // Native hardware ray-tracing pipeline (Metal / CUDA / Vulkan).
+    const renderer::TexturePool* m_texture_pool = nullptr;  // set_texture_pool's, this frame
     ProbeLighting m_probes;          // The level's probe bake on the GPU.
     EarlyLighting m_early_lighting;  // The early-lit world's per-pixel lighting.
 };

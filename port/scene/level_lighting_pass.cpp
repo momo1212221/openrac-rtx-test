@@ -174,6 +174,9 @@ void LevelScene::render_early_lighting(
     }
     std::string error;
     // Drawn only where it is needed (needs_early_lighting), which takes registered lighting.
+    if (m_lighting) {
+        m_lighting->set_texture_pool(&state.textures);
+    }
     state.early_lighting =
         m_lighting
         && m_lighting->render_early(

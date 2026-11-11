@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "enhanced/renderer/local_lights.h"
@@ -244,6 +245,12 @@ public:
     // the static ones once a level, the mobys' as they move (prepare_instances).
     std::span<const LocalLight> emissive_lights() const { return m_emissive_static; }
     std::span<const LocalLight> emissive_moby_lights() const { return m_emissive_mobys; }
+    // The glowing mobys' lights and this frame's additive effects' (explosions, fire, muzzle
+    // flashes, bolts: the game's added effect quads, gathered into a few lights).
+    // `textures` gives the effects' texture hues (TexturePool::effect_hue), when known.
+    std::span<const LocalLight> moving_lights(
+        std::span<const renderer::EffectQuad> effects, const renderer::TexturePool* textures = nullptr
+    );
     std::uint64_t emissive_revision() const { return m_emissive_revision; }
 
     // This frame's local lights (LocalLights' records), whose shadows Metal traces.
@@ -337,6 +344,13 @@ private:
         std::vector<SkinTriangle> triangles;
     };
     std::vector<SkinnedMesh> m_skinned_meshes;  // by model; empty for a rigid one
+    // Each model's area-weighted colour (linear 0..1): an additive moby's (an explosion's flash, a
+    // fireball, a shot) light takes it, times its tint.
+    std::vector<std::array<float, 3>> m_model_colours;
+    std::vector<LocalLight> m_moving_lights;  // moving_lights' result this frame
+    // Frames each effect cell (3-unit cell of added quads) has shown: a lasting one (a lamp's
+    // corona, a light shaft) fades out as a light, a burst (an explosion, a shot) does not live long.
+    std::unordered_map<std::uint64_t, int> m_effect_ages;
     std::size_t m_dynamic_instance_count = 0;
 
     std::unique_ptr<RtxHardwareBackend> m_metal_backend;

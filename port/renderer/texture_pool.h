@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -162,6 +163,14 @@ public:
 
     const Rgba8Image& image(TextureHandle texture) const;
 
+    // The hue of an effect texture as the effects drew it (its texels' colour weighted by their
+    // alpha, the brightest channel 1), by effect_key: the ray tracer's effect lights take it, a
+    // frame later (the game pages its effect textures through the same blocks within a frame, so
+    // only the draw itself knows which texture a quad had).
+    static std::uint64_t effect_key(std::uint64_t tex0, std::uint32_t tbp, std::uint32_t cbp);
+    void note_effect_hue(std::uint64_t key, TextureHandle texture);
+    const std::array<float, 3>* effect_hue(std::uint64_t key) const;
+
     // Whether `texture` has an animated replacement's frames (animate()).
     bool animated(TextureHandle texture) const {
         return m_entries[texture - 1].animation != nullptr;
@@ -214,6 +223,8 @@ public:
     std::size_t size() const;
 
 private:
+    std::unordered_map<std::uint64_t, std::array<float, 3>> m_effect_hues;
+    std::unordered_map<TextureHandle, std::array<float, 3>> m_texture_hues;
     struct Key {
         std::uint32_t tbp, tbw, tw, th, cbp;
         std::uint8_t psm, cpsm;

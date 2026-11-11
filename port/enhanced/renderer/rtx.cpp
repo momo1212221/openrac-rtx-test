@@ -23,6 +23,7 @@
 #include "enhanced/renderer/compute_graph.h"
 #include "enhanced_viewer_shaders.h"
 #include "renderer/gl.h"
+#include "renderer/texture_pool.h"
 #if defined(OPENRAC_VULKAN)
 #include "renderer/vulkan/native_compute.h"
 #include "renderer/vulkan/native_metal.h"
@@ -816,6 +817,35 @@ void RtxPipeline::upload(const scene::LevelData& level) {
         extract_instance(identity_inst, scene::Layer::Mobys, m_moby_meshes[m].local_triangles);
     }
 
+    // Each model's colour, for the light of an additive moby of it (an explosion, a shot).
+    m_model_colours.assign(level.models.size(), {1.0f, 1.0f, 1.0f});
+    for (std::size_t m = 0; m < level.models.size(); ++m) {
+        std::array<double, 3> sum{};
+        double weight = 0.0;
+        for (const auto& prim : level.models[m].primitives) {
+            if (prim.material < 0 || static_cast<std::size_t>(prim.material) >= level.materials.size()) {
+                continue;
+            }
+            const auto& mat = level.materials[static_cast<std::size_t>(prim.material)];
+            const std::size_t at = static_cast<std::size_t>(prim.first_index);
+            if (prim.index_count == 0 || at >= level.indices.size()
+                || level.indices[at] >= level.vertices.size()) {
+                continue;
+            }
+            const std::uint32_t albedo =
+                sample_material_albedo(level, mat, level.vertices[level.indices[at]].colour);
+            for (int k = 0; k < 3; ++k) {
+                sum[k] += float((albedo >> (8u * k)) & 0xFFu) / 255.0f * prim.index_count;
+            }
+            weight += prim.index_count;
+        }
+        if (weight > 0.0) {
+            for (int k = 0; k < 3; ++k) {
+                m_model_colours[m][k] = static_cast<float>(sum[k] / weight);
+            }
+        }
+    }
+
     // The skinned models (characters), in bind pose with their joints, for posing each frame.
     m_skinned_meshes.assign(level.models.size(), {});
     std::size_t skinned_models = 0;
@@ -996,6 +1026,101 @@ void RtxPipeline::publish_counts() {
 // The mobys get a tree of their own, beside the level's static one: the static tree is built and
 // uploaded once a level, the mobys' (a few thousand triangles at most) only when one has moved.
 // Bind poses: animation does not reach the tree yet.
+std::span<const LocalLight> RtxPipeline::moving_lights(
+    std::span<const renderer::EffectQuad> effects, const renderer::TexturePool* textures
+) {
+    m_moving_lights.assign(m_emissive_mobys.begin(), m_emissive_mobys.end());
+    // Added quads (GS ALPHA (Cs - 0) x As + Cd: B 2, D 1) gathered in cells of 3 units: each cell's
+    // particles become one light at their weighted centre, their colours (0x80 = 1) times their
+    // alpha summed (a burst of many is brighter, its peak at most 4), reaching further the larger they are
+    // (3 to 8). The colour is the quads' vertex colour times their texture's hue.
+    struct Cell {
+        std::array<float, 3> centre{}, colour{};
+        float weight = 0, size = 0;
+    };
+    std::unordered_map<std::uint64_t, Cell> cells;
+    for (const auto& q : effects) {
+        const std::uint64_t alpha = q.alpha;
+        if (((alpha >> 2) & 3u) != 2u || ((alpha >> 6) & 3u) != 1u) {
+            continue;
+        }
+        std::array<float, 3> centre{}, colour{};
+        float a = 0.0f;
+        for (int c = 0; c < 4; ++c) {
+            for (int k = 0; k < 3; ++k) {
+                centre[k] += q.corner[c][k] * 0.25f;
+                colour[k] += float((q.rgba[c] >> (8u * k)) & 0xFFu) / 128.0f * 0.25f;
+            }
+            a += float((q.rgba[c] >> 24u) & 0xFFu) / 128.0f * 0.25f;
+        }
+        const float dx = q.corner[3][0] - q.corner[0][0], dy = q.corner[3][1] - q.corner[0][1],
+                    dz = q.corner[3][2] - q.corner[0][2];
+        const float size = std::sqrt(dx * dx + dy * dy + dz * dz);
+        // The texture's hue, as the effects drew it (a frame ago): GS MODULATE takes vertex colour
+        // times texel, and an explosion's orange is in its texture, its vertices near white.
+        if (textures != nullptr) {
+            if (const auto* hue = textures->effect_hue(
+                    renderer::TexturePool::effect_key(q.tex0, q.tbp, q.cbp))) {
+                for (int k = 0; k < 3; ++k) {
+                    colour[k] *= (*hue)[k];
+                }
+            }
+        }
+        const float weight = (colour[0] * 0.2126f + colour[1] * 0.7152f + colour[2] * 0.0722f) * a;
+        if (!(weight > 0.01f) || !std::isfinite(size)) {
+            continue;
+        }
+        std::uint64_t key = 0;
+        for (int k = 0; k < 3; ++k) {
+            key = key * 1000003u
+                  + static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(centre[k] / 3.0f)) + (1 << 20));
+        }
+        Cell& cell = cells[key];
+        for (int k = 0; k < 3; ++k) {
+            cell.centre[k] += centre[k] * weight;
+            cell.colour[k] += colour[k] * a;
+        }
+        cell.weight += weight;
+        cell.size = std::max(cell.size, size);
+    }
+    // Bursts only: a cell lit 45 frames in a row fades out over the next 30 (a lamp's corona or a
+    // light shaft is added light that lasts; as a light it brightened the whole level).
+    std::unordered_map<std::uint64_t, int> ages;
+    std::vector<LocalLight> lights;
+    for (const auto& [key, cell] : cells) {
+        const auto old = m_effect_ages.find(key);
+        const int age = old != m_effect_ages.end() ? old->second + 1 : 0;
+        ages[key] = age;
+        const float fade = age < 45 ? 1.0f : std::max(0.0f, 1.0f - float(age - 45) / 30.0f);
+        if (fade <= 0.0f) {
+            continue;
+        }
+        LocalLight light;
+        // At most 4, scaled as a whole: clamping each channel turned a burst's orange (red over
+        // the cap, green reaching it) into yellowish white.
+        const float peak = std::max({cell.colour[0], cell.colour[1], cell.colour[2]});
+        const float scale = peak > 4.0f ? 4.0f / peak : 1.0f;
+        for (int k = 0; k < 3; ++k) {
+            light.position[k] = cell.centre[k] / cell.weight;
+            light.colour[k] = cell.colour[k] * scale * fade;
+        }
+        light.range = std::clamp(3.0f + cell.size * 2.0f, 3.0f, 8.0f);
+        lights.push_back(light);
+    }
+    // The brightest 8: an explosion's 30 cells of reach 12 filled the screen's light tiles and
+    // cost ~9 ms at its worst frames.
+    const auto brightness = [](const LocalLight& l) { return l.colour[0] + l.colour[1] + l.colour[2]; };
+    if (lights.size() > 8) {
+        std::partial_sort(lights.begin(), lights.begin() + 8, lights.end(),
+                          [&](const auto& x, const auto& y) { return brightness(x) > brightness(y); });
+        lights.resize(8);
+    }
+    m_effect_ages = std::move(ages);
+    stats::gauge("rtx effect quad lights", static_cast<double>(lights.size()));
+    m_moving_lights.insert(m_moving_lights.end(), lights.begin(), lights.end());
+    return m_moving_lights;
+}
+
 void RtxPipeline::prepare_instances(
     scene::Layer layer, std::span<const scene::Instance> instances,
     std::span<const renderer::Mat4> palette
@@ -1155,6 +1280,28 @@ void RtxPipeline::prepare_instances(
             m_emissive_mobys.push_back(light);
         }
     }
+    // Additive mobys (MobyProc's added blend: explosions' flashes, fireballs, shots) light their
+    // surroundings while they show: their model's colour times their tint, as bright as the tint's
+    // alpha, reaching four times their bound (4 to 14). At most 64; Ratchet's bombs and the
+    // blaster's bolts are such mobys.
+    std::size_t effect_lights = 0;
+    for (const auto& inst : instances) {
+        if (inst.blend != 2 || inst.stand_in || inst.lighting_only || inst.moby_light[3] > 1.5f
+            || inst.tint[3] <= 0.02f || inst.model >= m_model_colours.size() || effect_lights >= 64
+            || m_emissive_mobys.size() >= 512) {
+            continue;
+        }
+        const float radius = inst.world_sphere[3];
+        LocalLight light;
+        for (int a = 0; a < 3; ++a) {
+            light.position[a] = radius > 0.0f ? inst.world_sphere[a] : inst.matrix[12 + a];
+            light.colour[a] = m_model_colours[inst.model][a] * inst.tint[a] * std::min(inst.tint[3], 2.0f) * 3.0f;
+        }
+        light.range = std::clamp(radius * 4.0f, 4.0f, 14.0f);
+        m_emissive_mobys.push_back(light);
+        ++effect_lights;
+    }
+    stats::gauge("rtx effect lights", static_cast<double>(effect_lights));
     stats::gauge("rtx glowing mobys", static_cast<double>(m_emissive_mobys.size()));
     if (m_moby_meshes.empty()) {
         publish_counts();
