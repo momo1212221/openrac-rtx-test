@@ -213,8 +213,6 @@ void Fsr3::State::draw_reactive() {
         capture_opaque({world.id(), world.width(), world.height()});
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, reactive.framebuffer());
-    fsr3_detail::let_go_colour();
     glBindVertexArray(vao);
     reactive_mask.use();
     glActiveTexture(GL_TEXTURE0);
@@ -223,11 +221,50 @@ void Fsr3::State::draw_reactive() {
     glBindTexture(GL_TEXTURE_2D, opaque.texture());
     glActiveTexture(GL_TEXTURE0 + 2);
     glBindTexture(GL_TEXTURE_2D, motion.texture());
+    // Off Vulkan the mask compares the effects' layer with the previous frame's (reactive.frag):
+    // this frame's layer first, into the image the next frame reads as the previous one.
+    const bool layered = layer[0].texture() != 0;
+    const fsr3_detail::FrameTarget& now = layer[static_cast<std::size_t>(layer_index)];
+    const fsr3_detail::FrameTarget& then = layer[static_cast<std::size_t>(layer_index ^ 1)];
+    if (layered) {
+        glBindFramebuffer(GL_FRAMEBUFFER, now.framebuffer());
+        fsr3_detail::let_go_colour();
+        glUniform1i(reactive_mask.uniform("stage"), 1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    const bool compared = layered && layer_valid && !dispatch.reset;
+    glBindFramebuffer(GL_FRAMEBUFFER, reactive.framebuffer());
+    fsr3_detail::let_go_colour();
+    glUniform1i(reactive_mask.uniform("stage"), compared ? 2 : 0);
+    if (compared) {
+        glActiveTexture(GL_TEXTURE0 + 3);
+        glBindTexture(GL_TEXTURE_2D, now.texture());
+        glActiveTexture(GL_TEXTURE0 + 4);
+        glBindTexture(GL_TEXTURE_2D, then.texture());
+        glUniform1i(reactive_mask.uniform("tex_T3"), 3);
+        glUniform1i(reactive_mask.uniform("tex_T4"), 4);
+        glUniform2f(
+            reactive_mask.uniform("history_offset"),
+            layer_jitter[0] - dispatch.jitter[0],
+            layer_jitter[1] - dispatch.jitter[1]
+        );
+    }
     const std::array inputs{world.colour_texture(), opaque.texture(), motion.texture()};
     // The mask covers every pixel, including zero reactivity on an unchanged background.
     fsr3_detail::raster_pass("temporal reactive mask", {reactive.framebuffer()}, inputs, [] {
         glDrawArrays(GL_TRIANGLES, 0, 3);
     });
+    if (compared) {
+        glActiveTexture(GL_TEXTURE0 + 4);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0 + 3);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    if (layered) {
+        layer_valid = true;
+        layer_jitter = dispatch.jitter;
+        layer_index ^= 1;
+    }
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(0);
 }

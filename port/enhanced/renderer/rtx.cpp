@@ -1954,7 +1954,9 @@ bool RtxPipeline::render_metal(
         p.sky_colour = {sky_colour[0], sky_colour[1], sky_colour[2]};
         p.settings = input.rtx_settings;
         p.flags = effect_flags(input.rtx_settings);
-        p.frame_index = static_cast<std::uint32_t>(input.frame);
+        // The job's own number, not the game's frame: the kernel's sample sequences step once a
+        // trace, also when the window draws several frames a tick or a slot was not free.
+        p.frame_index = static_cast<std::uint32_t>(next.serial);
         p.dynamic_key = m_dynamic_key;
         next.mobys = m_dynamic_triangles;
         // The local lights with a radius, nearest the camera first: the paths sample up to 512

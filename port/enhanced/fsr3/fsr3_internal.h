@@ -4,6 +4,8 @@
 // Private temporal frame state shared by setup and resolve; no frontend includes this file.
 #pragma once
 
+#include <array>
+
 #include <chrono>
 #include <vector>
 
@@ -45,6 +47,12 @@ struct Fsr3::State {
     fsr3_detail::FrameTarget depth;     // R32F copy, avoiding depth/stencil view reinterpretation.
     fsr3_detail::FrameTarget reactive;  // R channel, particle and disocclusion reactivity.
     fsr3_detail::FrameTarget opaque;    // World colour before the particle bucket.
+    // Off Vulkan: what the blended effects changed (colour minus opaque), this frame's and the
+    // previous one's in turn, which the reactive mask compares (reactive.frag).
+    std::array<fsr3_detail::FrameTarget, 2> layer;
+    int layer_index = 0;                  // The one this frame writes.
+    bool layer_valid = false;             // The other holds the previous frame's.
+    std::array<float, 2> layer_jitter{};  // The raster jitter the previous one was drawn with.
 
     renderer::Shader camera_motion;     // Static world and sky motion, or float depth copy.
     renderer::Shader object_motion;     // Rigid and skinned dynamic velocities.

@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 
+#include <array>
 #include <cstdlib>
 #include <format>
 
@@ -38,11 +39,17 @@ fragment Depth depth_fragment(Out in [[stage_in]], texture2d<float> source [[tex
 }
 )";
 
-// OPENRAC_METALFX_JITTER_SIGN=-1 hands MetalFX the opposite jitter, for checking the convention.
-float jitter_sign() {
-    static const float sign = [] {
+// OPENRAC_METALFX_JITTER_SIGN hands MetalFX another jitter, for checking the convention: -1 the
+// opposite one, x or y that axis alone turned.
+std::array<float, 2> jitter_sign() {
+    static const std::array<float, 2> sign = [] {
         const char* v = std::getenv("OPENRAC_METALFX_JITTER_SIGN");
-        return v != nullptr && v[0] == '-' ? -1.0f : 1.0f;
+        if (v == nullptr) {
+            return std::array<float, 2>{1.0f, 1.0f};
+        }
+        return std::array<float, 2>{
+            v[0] == '-' || v[0] == 'x' ? -1.0f : 1.0f, v[0] == '-' || v[0] == 'y' ? -1.0f : 1.0f
+        };
     }();
     return sign;
 }
@@ -101,6 +108,10 @@ bool MetalFxTemporal::dispatch(
         id<MTLTexture> float_depth = (__bridge id<MTLTexture>)mtlgl::native_texture(textures[1]);
         id<MTLTexture> motion = (__bridge id<MTLTexture>)mtlgl::native_texture(textures[2]);
         id<MTLTexture> reactive = (__bridge id<MTLTexture>)mtlgl::native_texture(textures[3]);
+        // OPENRAC_METALFX_REACTIVE=0: without the reactive mask, for comparison.
+        if (const char* v = std::getenv("OPENRAC_METALFX_REACTIVE"); v != nullptr && v[0] == '0') {
+            reactive = nil;
+        }
         id<MTLTexture> target = (__bridge id<MTLTexture>)mtlgl::native_texture(textures[4]);
         if (device == nil || colour == nil || float_depth == nil || motion == nil || target == nil) {
             error = "MetalFX temporal upscaling: an input is not a Metal texture";
@@ -195,7 +206,7 @@ bool MetalFxTemporal::dispatch(
         id<MTLFXTemporalScaler> scaler = m->scaler;
         id<MTLTexture> depth = m->depth, output = m->output;
         id<MTLRenderPipelineState> depth_copy = m->depth_copy;
-        const float sign = jitter_sign();
+        const std::array<float, 2> sign = jitter_sign();
         return mtlgl::encode_native([&](void* raw) {
             id<MTLCommandBuffer> commands = (__bridge id<MTLCommandBuffer>)raw;
             MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -219,8 +230,8 @@ bool MetalFxTemporal::dispatch(
             }
             scaler.inputContentWidth = static_cast<NSUInteger>(rw);
             scaler.inputContentHeight = static_cast<NSUInteger>(rh);
-            scaler.jitterOffsetX = sign * frame.jitter[0];
-            scaler.jitterOffsetY = sign * frame.jitter[1];
+            scaler.jitterOffsetX = sign[0] * frame.jitter[0];
+            scaler.jitterOffsetY = sign[1] * frame.jitter[1];
             scaler.motionVectorScaleX = 1.0f;
             scaler.motionVectorScaleY = 1.0f;
             scaler.depthReversed = YES;

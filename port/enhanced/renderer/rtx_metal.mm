@@ -414,6 +414,30 @@ inline float3 clamp_luminance(float3 c, float limit) {
     return l > limit ? c * (limit / l) : c;
 }
 
+// A point of the R2 sequence (the plastic number's lattice) for sample `n` of a cell: over the
+// frames the history averages, a cell's rays cover the sun's disc, the hemisphere and a
+// reflection's lobe evenly instead of at random, so the same few frames leave far less noise to
+// flicker. `salt` gives each use and each cell its own offset; integer steps keep the fraction
+// exact however long the game runs.
+inline float2 r2_sample(uint salt, uint n) {
+    uint a = pcg_hash(salt), b = pcg_hash(a ^ 0x9E3779B9u);
+    uint x = a + n * 3242174889u, y = b + n * 2447445414u;
+    return float2(float(x >> 8u), float(y >> 8u)) * (1.0f / 16777216.0f);
+}
+
+// encode_early_gi's inverse, a channel at a time (0 stays no light).
+inline float3 decode_early_gi(float3 e) {
+    return select(float3(0.0f), exp2(e * 12.0f - 8.0f), e > float3(0.0f));
+}
+
+// pack_rgba8 rounded at random in proportion to the remainder: a history that takes a twelfth of
+// each new frame would never move a byte by less than half a step, and stuck in visible bands.
+inline uint pack_rgba8_dithered(float4 c, thread uint& seed) {
+    float4 r = float4(rand01(seed), rand01(seed), rand01(seed), rand01(seed));
+    uint4 u = uint4(min(clamp(c, 0.0f, 1.0f) * 255.0f + r, 255.0f));
+    return u.x | (u.y << 8u) | (u.z << 16u) | (u.w << 24u);
+}
+
 // A path's hit: the level, the mobys, or a glowing surface (its own structure: it lights, it is
 // seen and reflected, but it never shadows, so a bulb does not darken its own light).
 struct PathHit {
@@ -537,7 +561,7 @@ kernel void rtx_trace_frame_kernel(
     device const RtxTriangleGpu* level_tris [[buffer(1)]],
     primitive_acceleration_structure mobys [[buffer(2)]],
     device const RtxTriangleGpu* moby_tris [[buffer(3)]],
-    device const float4* cells [[buffer(4)]],
+    device float4* cells [[buffer(4)]],
     constant FrameParams& p [[buffer(5)]],
     device uint* result [[buffer(6)]],
     device const uint* history [[buffer(7)]],
@@ -559,6 +583,7 @@ kernel void rtx_trace_frame_kernel(
         result[cell * 3u + 0u] = 0xFF000000u;
         result[cell * 3u + 1u] = 0xFF000000u;
         result[cell * 3u + 2u] = 0x000000FFu;  // local lights unblocked, no glow light
+        cells[cell * 2u + 1u].w = 0.0f;        // no frames gathered here
         return;
     }
     float4 normal_rough = cells[cell * 2u + 1u];
@@ -578,8 +603,9 @@ kernel void rtx_trace_frame_kernel(
             make_orthonormal_basis(to_sun, st, sb);
             uint lit = 0u;
             for (uint s = 0u; s < spp; ++s) {
-                float r = sqrt(rand01(seed)) * p.shadow_softness;
-                float phi = 6.28318530718f * rand01(seed);
+                float2 u = r2_sample(cell * 3u, p.frame_index * spp + s);
+                float r = sqrt(u.x) * p.shadow_softness;
+                float phi = 6.28318530718f * u.y;
                 ray sr(origin, normalize(to_sun + (st * cos(phi) + sb * sin(phi)) * r), 0.025f,
                        p.ray_distance);
                 lit += frame_blocked(sr, level, mobys, mobys_on) ? 0u : 1u;
@@ -602,7 +628,8 @@ kernel void rtx_trace_frame_kernel(
         bool gi = (p.flags & 8u) != 0u;
         uint blocked = 0u;
         for (uint s = 0u; s < spp; ++s) {
-            float3 dir = sample_cosine_hemisphere(N, rand01(seed), rand01(seed));
+            float2 u = r2_sample(cell * 3u + 1u, p.frame_index * spp + s);
+            float3 dir = sample_cosine_hemisphere(N, u.x, u.y);
             if (!gi) {
                 ray br(origin, dir, 0.025f, p.ao_radius);
                 blocked += frame_blocked(br, level, mobys, mobys_on) ? 1u : 0u;
@@ -682,7 +709,8 @@ kernel void rtx_trace_frame_kernel(
             // left blotches the history could not smooth (Blarg's ceiling ring). The mesh shader
             // gives a rougher surface more of the probes' blurred environment instead.
             float alpha = max(roughness * roughness * 0.33f, 0.002f);
-            float u1 = rand01(seed), u2 = rand01(seed);
+            float2 lobe = r2_sample(cell * 3u + 2u, p.frame_index);
+            float u1 = lobe.x, u2 = lobe.y;
             float cos_theta = sqrt((1.0f - u1) / (1.0f + (alpha * alpha - 1.0f) * u1));
             float sin_theta = sqrt(max(0.0f, 1.0f - cos_theta * cos_theta));
             float phi = 6.28318530718f * u2;
@@ -762,33 +790,76 @@ kernel void rtx_trace_frame_kernel(
         local_visible = open_sum > 1e-5f ? lit_sum / open_sum : 1.0f;
     }
 
-    float4 word0 = float4(encode_early_gi(bounce), sun_visible);
-    // Word 1: the reflection (log encoded as the bounce); word 2: the local lights' visibility,
-    // then the glow light (log encoded).
-    float4 word1 = float4(encode_early_gi(reflection), ambient);
-    float4 word2 = float4(local_visible, encode_early_gi(glow));
-    // The previous job's result at this point through its camera: several frames' rays together.
+    // The previous job's result at this point through its camera: many frames' rays together.
+    // Its four cells around the point, each only where it traced this same surface (near this
+    // point's plane and not far along it: a plain distance threw the ground's history away while
+    // walking, where a cell seen at a grazing angle spans far more than the camera's step, and
+    // what was left was each frame's raw rays, flickering). The light is averaged as light, not
+    // as its log encoding. `frames` counts what a cell has gathered: a fresh cell takes the new
+    // rays whole, then a half, a third, and so on down to history_blend, so nothing stays on its
+    // first noisy sample.
+    float frames = 1.0f;
     if (p.history_valid != 0u) {
         float4 clip = p.prev_view_projection * float4(position.xyz, 1.0f);
-        if (clip.w > 1e-4f) {
-            float2 uv = clip.xy / clip.w * 0.5f + 0.5f;
-            if (all(uv >= float2(0.0f)) && all(uv < float2(1.0f))) {
-                uint2 prev = min(uint2(uv * float2(p.width, p.height)), uint2(p.width - 1u, p.height - 1u));
-                uint pi = prev.y * p.width + prev.x;
-                // The same surface only: what the previous job traced there must be this point.
+        float2 uv = clip.w > 1e-4f ? clip.xy / clip.w * 0.5f + 0.5f : float2(-1.0f);
+        if (all(uv >= float2(0.0f)) && all(uv < float2(1.0f))) {
+            float2 at = uv * float2(p.width, p.height) - 0.5f;
+            int2 base = int2(floor(at));
+            float2 f = at - float2(base);
+            float reach = max(0.3f, distance(position.xyz, p.camera_pos.xyz) * 0.02f);
+            float weight = 0.0f, reflected_weight = 0.0f, was_frames = 0.0f;
+            float3 was_visible = float3(0.0f), was_bounce = float3(0.0f);
+            float3 was_glow = float3(0.0f), was_reflection = float3(0.0f);
+            for (uint i = 0u; i < 4u; ++i) {
+                int2 c = base + int2(int(i & 1u), int(i >> 1u));
+                if (c.x < 0 || c.y < 0 || c.x >= int(p.width) || c.y >= int(p.height)) {
+                    continue;
+                }
+                uint pi = uint(c.y) * p.width + uint(c.x);
                 float4 was = history_cells[pi * 2u];
-                float reach = max(0.3f, distance(position.xyz, p.camera_pos.xyz) * 0.02f);
-                if (was.w > 0.0f && distance(was.xyz, position.xyz) < reach) {
-                word0 = mix(unpack_rgba8(history[pi * 3u]), word0, p.history_blend);
-                word1 = mix(unpack_rgba8(history[pi * 3u + 1u]), word1, p.history_blend);
-                word2 = mix(unpack_rgba8(history[pi * 3u + 2u]), word2, p.history_blend);
+                float3 offset = was.xyz - position.xyz;
+                if (was.w <= 0.0f || abs(dot(offset, N)) > reach || length(offset) > reach * 8.0f) {
+                    continue;
+                }
+                float w = max(((i & 1u) != 0u ? f.x : 1.0f - f.x)
+                                  * ((i >> 1u) != 0u ? f.y : 1.0f - f.y),
+                              0.001f);
+                float4 h0 = unpack_rgba8(history[pi * 3u]);
+                float4 h1 = unpack_rgba8(history[pi * 3u + 1u]);
+                float4 h2 = unpack_rgba8(history[pi * 3u + 2u]);
+                was_visible += w * float3(h0.w, h1.w, h2.x);
+                was_bounce += w * decode_early_gi(h0.xyz);
+                was_glow += w * decode_early_gi(h2.yzw);
+                if (max(h1.x, max(h1.y, h1.z)) > 0.05f) {  // a traced reflection is at least 0.01
+                    was_reflection += w * decode_early_gi(h1.xyz);
+                    reflected_weight += w;
+                }
+                was_frames += w * history_cells[pi * 2u + 1u].w;
+                weight += w;
+            }
+            if (weight > 0.05f) {
+                float inv = 1.0f / weight;
+                frames = min(was_frames * inv, 64.0f) + 1.0f;
+                float blend = max(1.0f / frames, p.history_blend);
+                sun_visible = mix(was_visible.x * inv, sun_visible, blend);
+                ambient = mix(was_visible.y * inv, ambient, blend);
+                // The local lights' shadows are exact each frame: half, to follow a moving light.
+                local_visible = mix(was_visible.z * inv, local_visible, max(blend, 0.5f));
+                bounce = mix(was_bounce * inv, bounce, blend);
+                glow = mix(was_glow * inv, glow, blend);
+                if (reflected_weight > 0.0f && max(reflection.x, max(reflection.y, reflection.z)) > 0.0f) {
+                    reflection = mix(was_reflection / reflected_weight, reflection, blend);
                 }
             }
         }
     }
-    result[cell * 3u + 0u] = pack_rgba8(word0);
-    result[cell * 3u + 1u] = pack_rgba8(word1);
-    result[cell * 3u + 2u] = pack_rgba8(word2);
+    // Word 0: the bounce (log encoded) and the sun's visibility; word 1: the reflection (log
+    // encoded) and the ambient visibility; word 2: the local lights' visibility, then the glow
+    // light (log encoded). The cell's normal slot keeps its frame count for the next job.
+    result[cell * 3u + 0u] = pack_rgba8_dithered(float4(encode_early_gi(bounce), sun_visible), seed);
+    result[cell * 3u + 1u] = pack_rgba8_dithered(float4(encode_early_gi(reflection), ambient), seed);
+    result[cell * 3u + 2u] = pack_rgba8_dithered(float4(local_visible, encode_early_gi(glow)), seed);
+    cells[cell * 2u + 1u].w = frames;
 }
 )msl";
 
@@ -1238,9 +1309,10 @@ public:
             p.shadow_softness = s.shadow_softness;
             p.gi_strength = s.gi_strength;
             p.roughness_cutoff = s.reflection_roughness_cutoff;
-            // A sixth of each new trace: smoother than a quarter, the noise of one or two paths a
-            // cell averaged over more frames (early lighting rejects history on other surfaces).
-            p.history_blend = job.history != nullptr ? 0.16f : 1.0f;
+            // A twelfth of each new trace once a cell has gathered that many frames (the kernel
+            // counts them, and takes a fresh cell's rays whole): at a sixth the one or two paths
+            // a cell still flickered where it stood.
+            p.history_blend = job.history != nullptr ? 0.08f : 1.0f;
 
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:m_trace_frame_pso];

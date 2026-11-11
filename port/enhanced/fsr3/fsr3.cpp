@@ -215,6 +215,14 @@ bool Fsr3::State::configure(
             || !opaque.create(size[0], size[1], GL_RGBA8, 0, error)) {
             return false;
         }
+        // The effects' layer and its history, signed (RGBA16F). The Vulkan graph keeps the mask
+        // of one frame alone.
+        layer_valid = false;
+        if (!is_vulkan()
+            && (!layer[0].create(size[0], size[1], 0x881A, 0, error)
+                || !layer[1].create(size[0], size[1], 0x881A, 0, error))) {
+            return false;
+        }
     }
 
     // MetalFX writes its own image and copies it into the output: any GL texture will do.
@@ -411,6 +419,9 @@ void Fsr3::release() {
     state.depth.release();
     state.reactive.release();
     state.opaque.release();
+    state.layer[0].release();
+    state.layer[1].release();
+    state.layer_valid = false;
     state.world.release();
     state.camera_motion.release();
     state.object_motion.release();
