@@ -58,6 +58,11 @@ Fsr3::~Fsr3() {
 }
 
 bool Fsr3::available() {
+    // The Metal GL upscales with MetalFX (metalfx_temporal.h); its world, depth and motion are
+    // the same GL passes.
+    if (is_metal()) {
+        return enhanced_rendering_available() && fsr3_detail::MetalFxTemporal::supported();
+    }
     vkgl::NativeDevice device;
     return enhanced_rendering_available() && vkgl::native_device(device) && device.storage_formats;
 }
@@ -79,6 +84,14 @@ bool Fsr3::State::asr_possible() const {
 bool Fsr3::State::configure_upscaler(
     std::array<int, 2> size, std::array<int, 2> display_size, std::string& error
 ) {
+    if (is_metal() && !plain_wanted) {
+        plain = false;
+        if (!metalfx.configure(size, display_size, error)) {
+            return false;
+        }
+        g_active_upscaler = "MetalFX";
+        return true;
+    }
     plain = plain_wanted || (!kFsrAllowed && !(asr_possible() && asr_detail::supports(size)));
     if (plain) {
         sdk.release();
@@ -130,6 +143,9 @@ bool Fsr3::State::configure_upscaler(
 }
 
 bool Fsr3::State::dispatch_upscaler(std::array<unsigned, 5> inputs, std::string& error) {
+    if (is_metal()) {
+        return metalfx.dispatch(inputs, dispatch, error);
+    }
     if (!use_asr) {
         return sdk.dispatch(inputs, dispatch, error);
     }
@@ -201,6 +217,14 @@ bool Fsr3::State::configure(
         }
     }
 
+    // MetalFX writes its own image and copies it into the output: any GL texture will do.
+    if (is_metal()) {
+        if (output_texture != output.colour_texture() || display.width != output.width()
+            || display.height != output.height()) {
+            valid = false;
+            output_texture = output.colour_texture();
+        }
+    } else
     // The final colour target alone needs storage usage; the original renderer's images remain ordinary attachments.
     if (!vkgl::storage_texture(output.colour_texture()) || output_texture != output.colour_texture()
         || display.width != output.width() || display.height != output.height()) {
@@ -302,7 +326,8 @@ void Fsr3::State::attach_frame(TemporalFrame frame, std::array<int, 2> size) {
     frame.input.on_resolve_world = [this](auto& target) {
         resolve(target);
     };
-    frame.input.prepares_temporal_chain = display.framebuffer != 0;
+    // The deferred world tail is the Vulkan graph's; the Metal GL records in order.
+    frame.input.prepares_temporal_chain = display.framebuffer != 0 && is_vulkan();
     auto before_hud = std::move(frame.input.before_hud);
     frame.input.before_hud = [this, before_hud = std::move(before_hud)] {
         // The renderer clears the display depth immediately after temporal resolve.
@@ -318,6 +343,10 @@ bool Fsr3::begin(
     TemporalFrame frame, renderer::TemporalQuality quality, float sharpness, std::string& error
 ) {
     State& state = *m_state;
+    // Motion blur's images are Vulkan storage images: none on the Metal GL yet.
+    if (is_metal()) {
+        frame.motion_blur = false;
+    }
 
     // Motion blur with temporal upscaling off: its motion is drawn, no upscaler runs.
     const bool blur_only = quality == renderer::TemporalQuality::Off && frame.motion_blur
@@ -375,6 +404,7 @@ void Fsr3::release() {
     state.finish_colour = {};
     state.sdk.release();
     state.asr.release();
+    state.metalfx.release();
     state.use_asr = false;
     state.blur.release();
     state.motion.release();

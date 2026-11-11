@@ -19,6 +19,28 @@
 namespace openrac::enhanced {
 using namespace openrac::gl;
 
+namespace {
+// Whether a world sphere lies wholly outside the clip transform's frustum (planes from its rows).
+bool outside_frustum(const renderer::Mat4& clip, const std::array<float, 4>& sphere) {
+    const auto row = [&](int i) {
+        return std::array<float, 4>{clip[i], clip[4 + i], clip[8 + i], clip[12 + i]};
+    };
+    const auto w = row(3);
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto r = row(axis);
+        for (const float side : {1.0f, -1.0f}) {
+            const float a = w[0] + side * r[0], b = w[1] + side * r[1], c = w[2] + side * r[2],
+                        d = w[3] + side * r[3];
+            const float length = std::sqrt(a * a + b * b + c * c);
+            if (a * sphere[0] + b * sphere[1] + c * sphere[2] + d < -sphere[3] * length) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+}  // namespace
+
 void Fsr3::State::build_velocities() {
     const stats::Scope timing("FSR velocity setup");
     velocities.clear();
@@ -27,6 +49,10 @@ void Fsr3::State::build_velocities() {
     for (const auto& instance : instances) {
         // Blended mobys have no opaque depth and belong in the reactive colour difference.
         if (instance.blend || instance.lighting_only) {
+            continue;
+        }
+        // Wholly off screen: no pixel of the motion image is its (a zero radius is unknown).
+        if (instance.world_sphere[3] > 0 && outside_frustum(view.current, instance.world_sphere)) {
             continue;
         }
 
@@ -45,6 +71,14 @@ void Fsr3::State::build_velocities() {
             }
 
             matched = movement < 64 && (instance.palette < 0) == (old->palette < 0);
+        }
+
+        // A rigid object that did not move has the camera's motion, which the depth-derived camera
+        // pass already wrote under it: drawing it again changes nothing. Kerwan's lamps, props and
+        // parked ships were most of the motion pass's ~1000 draws a frame.
+        if (matched && instance.palette < 0 && !instance.floats_on_water && !old->floats_on_water
+            && instance.matrix == old->matrix) {
+            continue;
         }
 
         const auto& from = matched ? *old : instance;
@@ -337,7 +371,7 @@ void Fsr3::State::resolve(renderer::RenderTarget& target) {
         resolved = resolve_images();
     };
     // Window-directed copies retain the native acquired-image presentation boundary.
-    if (display.framebuffer != 0) {
+    if (display.framebuffer != 0 && is_vulkan()) {
         const auto result = vkgl::temporal_chain(prepare);
         // Structural failure cannot advance pose, palette or camera history.
         if (!result) {

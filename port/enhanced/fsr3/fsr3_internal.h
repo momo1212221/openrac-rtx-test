@@ -9,6 +9,7 @@
 
 #include "enhanced/asr/asr_context.h"
 #include "enhanced/fsr3/frame_target.h"
+#include "enhanced/fsr3/metalfx_temporal.h"
 #include "enhanced/fsr3/fsr3.h"
 #include "enhanced/fsr3/motion_blur.h"
 #include "enhanced/fsr3/object_history.h"
@@ -33,6 +34,7 @@ struct Fsr3::State {
     bool use_asr = false;              // Whether asr, not sdk, holds the live history.
     bool asr_refused = false;          // ASR could not start on this device; FSR 3.1 stays.
     bool asr_dispatch_failed = false;  // This frame's ASR dispatch failed; FSR 3.1 takes over.
+    fsr3_detail::MetalFxTemporal metalfx;  // The upscaler on the Metal GL, instead of both.
     // No upscaler: the world is copied to the picture unjittered, for motion blur alone (temporal
     // upscaling off) or on Android when ASR cannot run (FSR 3.1 is never used there).
     bool plain_wanted = false;

@@ -73,6 +73,16 @@ openrac_embed_shaders(openrac_fsr3 fsr3 openrac::enhanced
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/fsr3/shaders/blur_jump.frag"
   "${CMAKE_CURRENT_SOURCE_DIR}/enhanced/fsr3/shaders/blur_resolve.frag")
 target_include_directories(openrac_fsr3 SYSTEM PRIVATE ${sdk_includes})
+# The temporal upscaler on the Metal GL: MetalFX (enhanced/fsr3/metalfx_temporal.h).
+if(APPLE AND OPENRAC_METAL)
+  enable_language(OBJCXX)
+  target_sources(openrac_fsr3 PRIVATE enhanced/fsr3/metalfx_temporal.mm)
+  target_compile_options(openrac_fsr3 PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+  target_link_libraries(openrac_fsr3 PRIVATE openrac_renderer_metal "-framework Metal" "-framework MetalFX"
+    "-framework Foundation")
+else()
+  target_sources(openrac_fsr3 PRIVATE enhanced/fsr3/metalfx_temporal_stub.cpp)
+endif()
 openrac_warnings(openrac_fsr3)
 
 openrac_add_test(fsr3_shaders SOURCES enhanced/tests/fsr3_shaders_test.cpp

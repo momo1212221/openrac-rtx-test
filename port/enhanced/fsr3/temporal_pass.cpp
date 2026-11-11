@@ -7,6 +7,8 @@
 
 #include <stdexcept>
 
+#include "renderer/gl.h"
+
 namespace openrac::enhanced::fsr3_detail {
 void raster_pass(
     std::string_view name,
@@ -14,6 +16,11 @@ void raster_pass(
     std::span<const unsigned> inputs,
     const std::function<void()>& record
 ) {
+    // Off Vulkan the draws go in order; the Metal GL tracks their hazards itself.
+    if (!gl::is_vulkan()) {
+        record();
+        return;
+    }
     const auto result = vkgl::temporal_raster(name, target, inputs, record);
 
     // Recording failure stops the current frame before partially produced history can be retained.
@@ -29,6 +36,10 @@ void blit_pass(
     vkgl::TemporalConsumer consumer,
     const std::function<void()>& record
 ) {
+    if (!gl::is_vulkan()) {
+        record();
+        return;
+    }
     const auto result = vkgl::temporal_blit(name, source, destination, consumer, record);
 
     // Invalid or aliased copies cannot supply a complete reconstructed image to later consumers.

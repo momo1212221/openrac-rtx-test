@@ -1016,6 +1016,15 @@ bool active() {
 }
 
 Proc get_proc(const char* name) {
+    // OPENRAC_MTLGL_TIMERS=0 offers no timer queries: a capture then times frames, not passes,
+    // without the split command buffers the queries cost.
+    static const bool no_timers = [] {
+        const char* v = std::getenv("OPENRAC_MTLGL_TIMERS");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (no_timers && std::strstr(name, "Quer") != nullptr) {
+        return nullptr;
+    }
     for (const Entry& e : kEntries) {
         if (std::strcmp(e.name, name) == 0) {
             return e.proc;
