@@ -317,7 +317,8 @@ pub fn set_setting(data_home: &Path, game: &str, version: &str, key: &str, value
 pub type PlayAdditions = (Vec<(String, String)>, Vec<String>);
 
 /// What Play adds when the version's settings switch enhanced rendering on: the Vulkan renderer
-/// and the probe bakes' folder. `settings` is the version's settings file's text.
+/// and the probe bakes' folder. `settings` is the version's settings file's text. Settings'
+/// Metal on a Mac keeps Metal over this Vulkan (actions.rs): Enhanced runs on the Metal GL too.
 pub fn play_additions(settings: &str, data: &Path, version: &str) -> Option<PlayAdditions> {
     if !read_switch(settings, SWITCH).unwrap_or(false) {
         return None;

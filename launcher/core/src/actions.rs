@@ -627,7 +627,13 @@ impl Action {
                     {
                         for (key, value) in more_env {
                             if key == "OPENRAC_GL_API" {
-                                // Enhanced graphics is Vulkan only: it wins over Settings' Metal.
+                                // Enhanced graphics needs Vulkan or the Metal GL (renderer/gl.h
+                                // enhanced_rendering_available): Settings' Metal on a Mac stays
+                                // (its RTX traces with Metal RT, no MoltenVK needed); OpenGL
+                                // becomes Vulkan.
+                                if env.iter().any(|(k, v)| *k == key && v == "metal") {
+                                    continue;
+                                }
                                 env.retain(|(k, _)| *k != key);
                                 env.push((key, value));
                             } else if !env.iter().any(|(k, _)| *k == key) {
@@ -1141,10 +1147,15 @@ mod tests {
         assert!(plan.env.contains(&("OPENRAC_GL_API".to_string(), "vulkan".to_string())), "{:?}", plan.env);
         let probes = crate::enhanced::probes_dir(&data, "pal").display().to_string();
         assert!(plan.args.ends_with(&["--probes".to_string(), probes]), "{:?}", plan.args);
-        // Enhanced graphics is Vulkan only, so it wins over Settings' Metal on a Mac.
+        // Enhanced graphics runs on the Metal GL too, so Settings' Metal on a Mac stays Metal;
+        // OpenGL, which has no Enhanced path, becomes Vulkan.
+        let apis = |plan: &Plan| -> Vec<(String, String)> {
+            plan.env.iter().filter(|(k, _)| k == "OPENRAC_GL_API").cloned().collect()
+        };
         let plan = play.plan(&Context { platform: Platform::Macos, ..ctx(&metal) }).unwrap();
-        let apis: Vec<_> = plan.env.iter().filter(|(k, _)| k == "OPENRAC_GL_API").collect();
-        assert_eq!(apis, [&("OPENRAC_GL_API".to_string(), "vulkan".to_string())], "{:?}", plan.env);
+        assert_eq!(apis(&plan), [("OPENRAC_GL_API".to_string(), "metal".to_string())], "{:?}", plan.env);
+        let plan = play.plan(&Context { platform: Platform::Macos, ..ctx(&opengl) }).unwrap();
+        assert_eq!(apis(&plan), [("OPENRAC_GL_API".to_string(), "vulkan".to_string())], "{:?}", plan.env);
         std::fs::remove_file(&file).unwrap();
     }
 
