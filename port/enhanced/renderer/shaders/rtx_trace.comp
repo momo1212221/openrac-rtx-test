@@ -446,7 +446,8 @@ void main() {
     //   word 1: rgb the reflection already weighted by its confidence, a the ambient visibility.
     // Shadow and AO stay apart so that the sun's shadow darkens only the sun's light.
     vec3 encoded_gi = encode_early_gi(gi_radiance);
-    vec3 reflection = clamp(refl_radiance * refl_confidence, 0.0, 1.0);
+    // Log encoded as the bounce (the Metal tracer's reflections are HDR: glowing surfaces).
+    vec3 reflection = encode_early_gi(refl_radiance * refl_confidence);
     if (rtx_debug_view == 5) {
         encoded_gi = heatmap_colour(float(total_steps) / float(max(rtx_step_budget, 1)));
     }
@@ -471,6 +472,7 @@ void main() {
     }
     rtx_pairs[cell * 3 + 0] = packUnorm4x8(word0);
     rtx_pairs[cell * 3 + 1] = packUnorm4x8(word1);
-    // Word 2: the local lights' visibility (r). This pass traces only the sun: unblocked.
-    rtx_pairs[cell * 3 + 2] = 0xFFFFFFFFu;
+    // Word 2: the local lights' visibility (r), then the glow light (gba, log encoded). This pass
+    // traces only the sun: unblocked, and no glow.
+    rtx_pairs[cell * 3 + 2] = 0x000000FFu;
 }

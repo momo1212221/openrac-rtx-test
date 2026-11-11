@@ -63,7 +63,8 @@ bool EarlyLighting::render(
     for (unsigned i = 0; i < 2; ++i) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_buffers[i]);
         if (width != m_width || height != m_height) {
-            glBufferData(GL_SHADER_STORAGE_BUFFER, cells * (i ? 8 : 4), nullptr, GL_DYNAMIC_DRAW);
+            // Light, traced reflection and traced glow light (4 bytes each a cell); guide words.
+            glBufferData(GL_SHADER_STORAGE_BUFFER, cells * (i ? 8 : 12), nullptr, GL_DYNAMIC_DRAW);
         }
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9 + i, m_buffers[i]);
         glActiveTexture(GL_TEXTURE0 + 16 + i);
@@ -87,7 +88,7 @@ bool EarlyLighting::render(
     );
     glUniformMatrix4fv(m_compute.uniform("early_view"), 1, GL_FALSE, input.camera.view.data());
     const std::array<enhanced::ComputeOutput, 2> outputs{
-        {{m_buffers[0], cells * 4}, {m_buffers[1], cells * 8}}
+        {{m_buffers[0], cells * 12}, {m_buffers[1], cells * 8}}
     };
     // Input capture follows lighting binding so probes, AO, tile masks and shadow maps match the dispatch.
     if (!enhanced::run_compute_graph(
@@ -108,7 +109,7 @@ bool EarlyLighting::render(
     m_target = target.framebuffer;
     m_ready = true;
     glBindTexture(GL_TEXTURE_2D, 0);
-    stats::gauge("early lighting bytes", double(cells * 12));
+    stats::gauge("early lighting bytes", double(cells * 20));
     stats::gauge("early lighting texels", double(cells));
     return true;
 }

@@ -43,6 +43,11 @@ const HERO = {
 };
 const LAMP = /(light|lamp|lantern|neon|bulb|sign|beacon|torch|glow)/;
 const NOT_LAMP = /(lightning|lighter|flight|lights?_?off)/;
+// Reflective things by their names (Ratchet & Clank's machines, vehicles, robots, weapons and
+// gold are polished metal or lacquer), and glass. A model with one of the game's chrome maps
+// (a metal_* material: its shine pass) counts as reflective as well.
+const SHINY = /(metal|chrome|steel|ship|taxi|train|truck|locomotive|robot|robo|bot\b|drone|elevator|helicopter|blimp|platform|statue|gold|bolt\b|nut\b|wrench|glove|blaster|gun|missile|rocket|mine\b|bomb|claw|tesla|devastator|devestator|pyrocitor|ryno|morphoray|swingshot|visibomb|decoy|walloper|taunter|magnetizer|helipack|vendor|infobot|turret|cannon|pipe|tank|machine|vent|hatch|door)/;
+const GLASS = /(glass|window|crystal|ice\b|dome|screen|monitor|visor)/;
 
 const lum = (r, g, b) => (54 * r + 183 * g + 19 * b) / 256 / 255;
 const sat = (r, g, b) => {
@@ -75,11 +80,15 @@ function levelTextures(level) {
   const note = (glb, hint) => {
     const path = join(level, glb);
     if (!existsSync(path)) return;
-    for (const image of glbJson(path).images ?? []) {
+    const json = glbJson(path);
+    // The game's chrome on this model: its textures are meant to shine.
+    const chrome = (json.materials ?? []).some((m) => (m.name ?? "").startsWith("metal_"));
+    for (const image of json.images ?? []) {
       if (!image.uri) continue;
       const texture = resolve(dirname(path), image.uri);
       if (!hints.has(texture)) hints.set(texture, new Set());
       hints.get(texture).add(hint);
+      if (chrome) hints.get(texture).add("chrome");
     }
   };
   for (const [kind, classes] of Object.entries(manifest.classes ?? {})) {
@@ -99,6 +108,8 @@ function kindOf(hash, hints, image) {
   const names = hints.map((h) => h.toLowerCase());
   if (names.some((n) => LAMP.test(n) && !NOT_LAMP.test(n))) return {kind: "lamp", material: "generic"};
   if (names.some((n) => n === "moby/ratchet")) return {kind: "character", material: "character"};
+  if (names.some((n) => GLASS.test(n))) return {kind: "glass", material: "generic"};
+  if (names.some((n) => n === "chrome" || SHINY.test(n))) return {kind: "shiny", material: "metal", confidence: 0.75};
   const textureClass = names.every((n) => n.startsWith("sky")) && names.length ? "sky" : "diffuse";
   const found = classifyMaterial(names, image, textureClass);
   return {kind: found.material, material: found.material, confidence: found.confidence};
@@ -114,6 +125,7 @@ function derive(image, {kind, material, confidence = 1}) {
     // Paint is no metal: a saturated texel stays dielectric whatever the surface is.
     const bare = 1 - smooth(0.3, 0.55, sat(r, g, b));
     if (kind === "clank") return 242 * bare;
+    if (kind === "shiny") return 255 * 0.75 * bare;
     if (material === "metal") return 255 * (confidence >= 0.9 ? 0.9 : 0.55) * bare;
     if (material === "weapon") return 255 * 0.6 * bare;
     return 0;
@@ -157,10 +169,22 @@ function derive(image, {kind, material, confidence = 1}) {
     edgewear: maps.edgewear,
   };
   if (glowing > 0) result.emissive = emissive;
+  // Polished and glass: a smooth surface (the map's variation kept), lacquer and glass with a
+  // dielectric's F0 that mesh.frag and the ray tracer take as reflective (above 0.045).
+  if (kind === "shiny" || kind === "glass") {
+    const scale = kind === "glass" ? 0.25 : 0.45;
+    const rough = maps.roughness.data;
+    for (let i = 0; i < rough.length; i += 4) {
+      const v = Math.max(18, Math.round(rough[i] * scale));
+      rough[i] = rough[i + 1] = rough[i + 2] = v;
+    }
+    result.specular = grey(image, () => (kind === "glass" ? 16 : 14));
+  }
   if (metallic.data.some((v, i) => i % 4 === 0 && v > 8)) {
     result.metallic = metallic;
     // Metal's F0 is its colour (mesh.frag); the map marks it as reflective at all.
-    result.specular = grey(image, (i) => (metallic.data[i] > 8 ? 230 : 10));
+    const painted = kind === "shiny" ? 14 : 10;
+    result.specular = grey(image, (i) => (metallic.data[i] > 8 ? 230 : painted));
   }
   return result;
 }
@@ -169,7 +193,7 @@ const levels = readdirSync(levelsRoot)
   .filter((name) => name.startsWith("level_") && (only.length === 0 || only.includes(name)))
   .sort();
 const done = new Map();
-let written = 0, lamps = 0, metals = 0, glows = 0;
+let written = 0, lamps = 0, metals = 0, glows = 0, shiny = 0;
 for (const name of levels) {
   const level = join(levelsRoot, name);
   if (!existsSync(join(level, "manifest.json"))) continue;
@@ -186,7 +210,9 @@ for (const name of levels) {
     const known = done.get(hash);
     // A texture several levels share: the most telling names win (a lamp anywhere is a lamp).
     const kind = kindOf(hash, hints, image);
-    if (known && !(kind.kind === "lamp" && known.kind !== "lamp")) continue;
+    // Ranked: a lamp anywhere is a lamp, else reflective anywhere is reflective.
+    const rank = (k) => (k.kind === "lamp" ? 3 : k.kind === "shiny" || k.kind === "glass" ? 2 : 1);
+    if (known && rank(kind) <= rank(known)) continue;
     done.set(hash, kind);
     const folder = join(out, "Materials", hash);
     if (!force && existsSync(join(folder, "normal.png")) && known === undefined
@@ -200,9 +226,10 @@ for (const name of levels) {
     writeFileSync(join(folder, ".kind"), kind.kind);
     written++;
     lamps += kind.kind === "lamp" ? 1 : 0;
+    shiny += kind.kind === "shiny" || kind.kind === "glass" ? 1 : 0;
     metals += maps.metallic ? 1 : 0;
     glows += maps.emissive ? 1 : 0;
   }
   console.log(`${name}: ${done.size} textures so far`);
 }
-console.log(`${written} material set(s) written to ${join(out, "Materials")}: ${lamps} lamp texture(s), ${glows} glow, ${metals} metal`);
+console.log(`${written} material set(s) written to ${join(out, "Materials")}: ${lamps} lamp texture(s), ${glows} glow, ${metals} metal, ${shiny} polished or glass`);

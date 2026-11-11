@@ -81,12 +81,13 @@ public:
     std::string motion_fragment(std::string source) const override;
 
     void prepare_instances(
-        scene::Layer layer, std::span<const scene::Instance> instances
+        scene::Layer layer, std::span<const scene::Instance> instances,
+        std::span<const renderer::Mat4> palette
     ) override {
 #ifdef OPENRAC_LIGHT_AUTHORING
         m_object_lights.instances(layer, instances);
 #endif
-        m_rtx.prepare_instances(layer, instances);
+        m_rtx.prepare_instances(layer, instances, palette);
     }
 
     void prepare_deformation(

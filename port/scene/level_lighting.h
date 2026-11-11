@@ -69,8 +69,11 @@ public:
     // Temporal coverage must use the same optional surface mask as colour rendering.
     virtual std::string motion_fragment(std::string source) const { return source; }
 
-    // Optional class-bound effects receive complete instances, including offscreen light-only captures.
-    virtual void prepare_instances(Layer, std::span<const Instance>) {}
+    // Optional class-bound effects receive complete instances, including offscreen light-only captures,
+    // and the joint palette their Instance::palette indexes (the mobys', set just before).
+    virtual void prepare_instances(
+        Layer, std::span<const Instance>, std::span<const renderer::Mat4> /*palette*/
+    ) {}
 
     // Update optional surface deformation before any depth, shadow or colour consumers.
     virtual void prepare_deformation(const renderer::FrameInput&, const LevelScene&) {}

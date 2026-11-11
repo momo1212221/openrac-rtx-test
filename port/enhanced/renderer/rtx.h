@@ -33,6 +33,7 @@ enum class RtxDebugView {
     GlobalIllumination,
     BvhHeatmap,
     LocalShadows,  // how much of the local lights reaches each point (Metal traces them)
+    GlowLight,     // the path-traced light of local lights and glowing surfaces alone (x8)
     Count
 };
 
@@ -126,6 +127,12 @@ public:
     }
     // Whether the job numbered `job` is done (its result may be read); never blocks.
     virtual bool finished(std::uint64_t /*job*/) const { return true; }
+    // The level's glowing surfaces, traced apart from the occluders: a path that meets one takes
+    // its light (RtxTriangle::normal_albedo.w its colour, e2_flags.w its strength), a shadow ray
+    // passes it. Backends without paths ignore them.
+    virtual bool upload_emitters(std::span<const RtxTriangle> /*triangles*/, std::string& /*error*/) {
+        return true;
+    }
     // The native device it runs on (Metal: id<MTLDevice>), to match the renderer's.
     virtual void* native_device() const { return nullptr; }
 
@@ -191,8 +198,12 @@ public:
     // Uploads an explicit triangle list (used by unit/GPU tests and custom scenes) and builds the BVH.
     bool upload_triangles(std::span<const RtxTriangle> triangles, std::string& error);
 
-    // Captures live moby instances for dynamic TLAS/BVH refit.
-    void prepare_instances(scene::Layer layer, std::span<const scene::Instance> instances);
+    // Captures live moby instances for dynamic TLAS/BVH refit; skinned ones (characters) are posed
+    // with `palette` (Instance::palette its first joint), as mesh.vert poses them.
+    void prepare_instances(
+        scene::Layer layer, std::span<const scene::Instance> instances,
+        std::span<const renderer::Mat4> palette = {}
+    );
 
     // Executes the per-frame RTX ray-tracing pass before EarlyLighting.
     bool render(
@@ -298,6 +309,7 @@ private:
 
     // The level's static tree (terrain, ties, shrubs), built and uploaded once a level.
     std::vector<RtxTriangle> m_triangles;
+    std::vector<RtxTriangle> m_emitter_triangles;  // the level's glowing surfaces (paths' lights)
     std::vector<RtxBvhNode> m_nodes;
     // The mobys' tree, rebuilt when one moves (m_dynamic_key: their models and matrices).
     std::vector<RtxTriangle> m_dynamic_triangles;
@@ -307,6 +319,24 @@ private:
         std::vector<RtxTriangle> local_triangles;
     };
     std::vector<MobyMeshSlice> m_moby_meshes;
+    // Skinned models (characters) in bind pose, posed on the CPU each frame. A triangle's
+    // `material` is pack_material's; a glowing one (Clank's antenna bulb and eyes) has its glow's
+    // strength x16 in the top byte and its colour as `albedo`.
+    struct SkinVertex {
+        std::array<float, 3> position{};
+        std::array<std::uint8_t, 4> joints{};
+        std::array<float, 4> weights{};
+    };
+    struct SkinTriangle {
+        std::array<std::uint32_t, 3> vertices{};
+        std::uint32_t albedo = 0;
+        std::uint32_t material = 0;
+    };
+    struct SkinnedMesh {
+        std::vector<SkinVertex> vertices;
+        std::vector<SkinTriangle> triangles;
+    };
+    std::vector<SkinnedMesh> m_skinned_meshes;  // by model; empty for a rigid one
     std::size_t m_dynamic_instance_count = 0;
 
     std::unique_ptr<RtxHardwareBackend> m_metal_backend;

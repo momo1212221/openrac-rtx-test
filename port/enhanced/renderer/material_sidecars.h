@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +48,9 @@ public:
     bool glows(std::uint64_t hash) const;
     // Its emission at a texture coordinate (repeating), 0..1; 0 without a mask.
     float emission(std::uint64_t hash, float u, float v) const;
+    // Its response at a texture coordinate (repeating): roughness, metallic and specular F0
+    // (0: none), 0..1 each. False without maps.
+    bool response(std::uint64_t hash, float u, float v, std::array<float, 3>& out) const;
 
     std::size_t size() const { return m_sets.size(); }
 
@@ -56,6 +60,9 @@ private:
         // The emission mask at a reduced size (at most 64 x 64), for the ray tracer's lights.
         int mask_width = 0, mask_height = 0;
         std::vector<std::uint8_t> mask;
+        // Roughness, metallic and F0 averaged to 16 x 16, for the ray tracer's materials.
+        int response_width = 0, response_height = 0;
+        std::vector<std::uint8_t> response;
     };
     void ensure_neutral() const;
 

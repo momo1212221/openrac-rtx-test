@@ -342,8 +342,8 @@ struct FrameParams {
     float gi_strength;
     float roughness_cutoff;
     float history_blend;
-    float pad1;
-    float pad2;
+    uint has_emitters;   // the glowing surfaces' own structure (buffers 10 and 11)
+    uint local_count;    // lights the local-light visibility walks (the first ones, at most 64)
 };
 
 struct FrameHit {
@@ -351,6 +351,7 @@ struct FrameHit {
     float t;
     float3 normal;
     float3 albedo;
+    uint material;  // e2_flags.w's bits: roughness, metallic, F0 (rtx.cpp pack_material)
 };
 
 // The nearer hit of the level's structure and the mobys'.
@@ -365,6 +366,7 @@ inline FrameHit frame_closest(ray r, primitive_acceleration_structure level,
     h.t = r.max_distance;
     h.normal = float3(0.0f, 0.0f, 1.0f);
     h.albedo = float3(0.5f);
+    h.material = 140u;  // roughness 0.55
     auto a = it.intersect(r, level);
     if (a.type == intersection_type::triangle) {
         RtxTriangleGpu tri = level_tris[a.primitive_id];
@@ -372,6 +374,7 @@ inline FrameHit frame_closest(ray r, primitive_acceleration_structure level,
         h.t = a.distance;
         h.normal = tri.normal_albedo.xyz;
         h.albedo = unpack_rgb8(as_type<uint>(tri.normal_albedo.w));
+        h.material = as_type<uint>(tri.e2_flags.w);
         r.max_distance = a.distance;
     }
     if (has_mobys) {
@@ -382,6 +385,7 @@ inline FrameHit frame_closest(ray r, primitive_acceleration_structure level,
             h.t = b.distance;
             h.normal = tri.normal_albedo.xyz;
             h.albedo = unpack_rgb8(as_type<uint>(tri.normal_albedo.w));
+            h.material = as_type<uint>(tri.e2_flags.w);
         }
     }
     return h;
@@ -403,6 +407,124 @@ inline float4 unpack_rgba8(uint u) {
                   float(u >> 24u)) * (1.0f / 255.0f);
 }
 
+// A path's hit: the level, the mobys, or a glowing surface (its own structure: it lights, it is
+// seen and reflected, but it never shadows, so a bulb does not darken its own light).
+struct PathHit {
+    bool hit;
+    bool emitter;
+    float t;
+    float3 normal;
+    float3 albedo;
+    float3 emission;
+};
+
+inline PathHit path_closest(ray r, primitive_acceleration_structure level,
+                            device const RtxTriangleGpu* level_tris,
+                            primitive_acceleration_structure mobys,
+                            device const RtxTriangleGpu* moby_tris, bool has_mobys,
+                            primitive_acceleration_structure emitters,
+                            device const RtxTriangleGpu* emitter_tris, bool has_emitters) {
+    FrameHit h = frame_closest(r, level, level_tris, mobys, moby_tris, has_mobys);
+    PathHit o;
+    o.hit = h.hit;
+    o.emitter = false;
+    o.t = h.t;
+    o.normal = h.normal;
+    o.albedo = h.albedo;
+    o.emission = float3(0.0f);
+    // A posed character's glowing part (Clank's antenna bulb, his eyes) is in the mobys'
+    // structure: its strength x16 in the material's top byte, its colour as the albedo.
+    if (h.hit && (h.material >> 24u) != 0u) {
+        o.emitter = true;
+        o.emission = h.albedo * (float(h.material >> 24u) / 16.0f);
+    }
+    if (has_emitters) {
+        r.max_distance = h.hit ? h.t : r.max_distance;
+        intersector<triangle_data> it;
+        it.assume_geometry_type(geometry_type::triangle);
+        auto e = it.intersect(r, emitters);
+        if (e.type == intersection_type::triangle) {
+            RtxTriangleGpu tri = emitter_tris[e.primitive_id];
+            o.hit = true;
+            o.emitter = true;
+            o.t = e.distance;
+            o.normal = tri.normal_albedo.xyz;
+            // The glow's colour (peak 1) and its strength (e2_flags.w).
+            o.emission = unpack_rgb8(as_type<uint>(tri.normal_albedo.w)) * tri.e2_flags.w;
+        }
+    }
+    return o;
+}
+
+// One local light's light at a point, as the mesh shader sums it (local_lights.glsl's falloff
+// and cone), unshadowed.
+inline float3 local_light_at(device const float4* lights, uint i, float3 pos, float3 n,
+                             thread float3& toward, thread float& d) {
+    float4 lp = lights[i * 4u + 0u];
+    float4 lc = lights[i * 4u + 1u];
+    float radius = lp.w;
+    float3 delta = lp.xyz - pos;
+    d = length(delta);
+    if (radius <= 0.0f || d >= radius || d <= 1e-4f) {
+        return float3(0.0f);
+    }
+    toward = delta / d;
+    float ndotl = dot(n, toward);
+    if (ndotl <= 0.0f) {
+        return float3(0.0f);
+    }
+    float x = d / radius, x2 = x * x;
+    float window = max(0.0f, 1.0f - x2 * x2);
+    float falloff = window * window / (1.0f + 3.03125f * x2);
+    float cone = 1.0f;
+    float4 ld = lights[i * 4u + 2u];
+    float4 lpar = lights[i * 4u + 3u];
+    if (lpar.y != 0.0f) {
+        float cosine = dot(-toward, ld.xyz);
+        cone = lpar.x == ld.w ? float(cosine >= ld.w) : smoothstep(ld.w, lpar.x, cosine);
+    }
+    return max(lc.rgb, float3(0.0f)) * ndotl * falloff * cone;
+}
+
+// Next-event estimation of the local lights at a path vertex: eight lights drawn at random, one
+// of them kept in proportion to its unshadowed light (resampled importance sampling), then one
+// shadow ray to it. Unbiased for all `count` lights, with one ray instead of `count`.
+inline float3 sample_local_lights(device const float4* lights, uint count, float3 pos, float3 n,
+                                  thread uint& seed, primitive_acceleration_structure level,
+                                  primitive_acceleration_structure mobys, bool has_mobys) {
+    if (count == 0u) {
+        return float3(0.0f);
+    }
+    constexpr uint kCandidates = 8u;
+    float total = 0.0f, kept_weight = 0.0f, kept_distance = 0.0f;
+    float3 kept = float3(0.0f), kept_toward = float3(0.0f, 0.0f, 1.0f);
+    for (uint k = 0u; k < kCandidates; ++k) {
+        uint i = min(uint(rand01(seed) * float(count)), count - 1u);
+        float3 toward;
+        float d;
+        float3 c = local_light_at(lights, i, pos, n, toward, d);
+        float w = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+        if (w <= 0.0f) {
+            continue;
+        }
+        total += w;
+        if (rand01(seed) * total < w) {
+            kept = c;
+            kept_weight = w;
+            kept_toward = toward;
+            kept_distance = d;
+        }
+    }
+    if (total <= 0.0f || kept_weight <= 0.0f) {
+        return float3(0.0f);
+    }
+    ray lr(pos, kept_toward, 0.025f, max(kept_distance - 0.1f, 0.03f));
+    if (frame_blocked(lr, level, mobys, has_mobys)) {
+        return float3(0.0f);
+    }
+    return kept / kept_weight * (total / float(kCandidates)) * float(count);
+}
+
 kernel void rtx_trace_frame_kernel(
     primitive_acceleration_structure level [[buffer(0)]],
     device const RtxTriangleGpu* level_tris [[buffer(1)]],
@@ -412,8 +534,10 @@ kernel void rtx_trace_frame_kernel(
     constant FrameParams& p [[buffer(5)]],
     device uint* result [[buffer(6)]],
     device const uint* history [[buffer(7)]],
-    constant float4* lights [[buffer(8)]],
+    device const float4* lights [[buffer(8)]],
     device const float4* history_cells [[buffer(9)]],
+    primitive_acceleration_structure emitters [[buffer(10)]],
+    device const RtxTriangleGpu* emitter_tris [[buffer(11)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= p.width || gid.y >= p.height) {
@@ -424,7 +548,7 @@ kernel void rtx_trace_frame_kernel(
     if (position.w <= 0.0f) {
         result[cell * 3u + 0u] = 0xFF000000u;
         result[cell * 3u + 1u] = 0xFF000000u;
-        result[cell * 3u + 2u] = 0xFFFFFFFFu;
+        result[cell * 3u + 2u] = 0x000000FFu;  // local lights unblocked, no glow light
         return;
     }
     float4 normal_rough = cells[cell * 2u + 1u];
@@ -433,6 +557,7 @@ kernel void rtx_trace_frame_kernel(
     uint seed = pcg_hash(cell ^ (p.frame_index * 1664525u + 1013904223u));
     uint spp = clamp(p.samples, 1u, 8u);
     bool mobys_on = p.has_dynamic != 0u;
+    bool glow_on = p.has_emitters != 0u;
     float3 to_sun = normalize(-p.sun_dir.xyz);
 
     // Sun: soft shadow rays toward a cone around the sun.
@@ -455,79 +580,137 @@ kernel void rtx_trace_frame_kernel(
         }
     }
 
-    // Ambient occlusion, and the bounce where no probe bake lights the level.
+    // Ambient occlusion, and path-traced indirect light: two bounces from cosine-weighted
+    // directions, at each vertex the sun and the local lights sampled (next-event estimation),
+    // glowing surfaces met on the way as light. `bounce` is the sun and the sky (it fills only
+    // where no probe bake lights the level); `glow` is what the local lights and the glowing
+    // surfaces send around, which the bake does not hold and which is added everywhere.
     float ambient = 1.0f;
     float3 bounce = float3(0.0f);
+    float3 glow = float3(0.0f);
     if ((p.flags & 10u) != 0u) {
         bool gi = (p.flags & 8u) != 0u;
         uint blocked = 0u;
         for (uint s = 0u; s < spp; ++s) {
             float3 dir = sample_cosine_hemisphere(N, rand01(seed), rand01(seed));
-            ray br(origin, dir, 0.025f, gi ? p.ray_distance : p.ao_radius);
             if (!gi) {
+                ray br(origin, dir, 0.025f, p.ao_radius);
                 blocked += frame_blocked(br, level, mobys, mobys_on) ? 1u : 0u;
                 continue;
             }
-            FrameHit h = frame_closest(br, level, level_tris, mobys, moby_tris, mobys_on);
-            if (h.hit) {
-                blocked += h.t <= p.ao_radius ? 1u : 0u;
+            float3 at = origin;
+            float3 throughput = float3(1.0f);
+            for (uint b = 0u; b < 2u; ++b) {
+                ray pr(at, dir, 0.025f, p.ray_distance);
+                PathHit h = path_closest(pr, level, level_tris, mobys, moby_tris, mobys_on,
+                                         emitters, emitter_tris, glow_on);
+                if (b == 0u && h.hit && h.t <= p.ao_radius && !h.emitter) {
+                    ++blocked;
+                }
+                if (!h.hit) {
+                    bounce += throughput * p.sky_colour.xyz * max(0.2f, 0.5f + 0.5f * dir.z);
+                    break;
+                }
+                if (h.emitter) {
+                    glow += throughput * h.emission;
+                    break;
+                }
                 float3 hn = dot(h.normal, dir) > 0.0f ? -h.normal : h.normal;
+                float3 hp = at + dir * h.t + hn * 0.03f;
                 float ndotl = max(0.0f, dot(hn, to_sun));
                 float sun_at_hit = 0.0f;
                 if (ndotl > 0.0f) {
-                    ray sr(origin + dir * h.t + hn * 0.03f, to_sun, 0.025f, p.ray_distance);
+                    ray sr(hp, to_sun, 0.025f, p.ray_distance);
                     sun_at_hit = frame_blocked(sr, level, mobys, mobys_on) ? 0.0f : ndotl;
                 }
-                bounce += h.albedo * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.25f);
-            } else {
-                bounce += p.sky_colour.xyz * max(0.2f, 0.5f + 0.5f * dir.z);
+                bounce += throughput * h.albedo
+                          * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.25f);
+                glow += throughput * h.albedo
+                        * sample_local_lights(lights, p.light_count, hp, hn, seed, level, mobys,
+                                              mobys_on);
+                throughput *= h.albedo;
+                if (max(throughput.x, max(throughput.y, throughput.z)) < 0.02f) {
+                    break;
+                }
+                at = hp;
+                dir = sample_cosine_hemisphere(hn, rand01(seed), rand01(seed));
             }
         }
         if ((p.flags & 2u) != 0u) {
             ambient = 1.0f - float(blocked) / float(spp);
         }
         bounce = gi ? bounce / float(spp) * p.gi_strength : float3(0.0f);
+        glow = gi ? glow / float(spp) * p.gi_strength : float3(0.0f);
     }
 
-    // A reflection, weighted by its confidence.
+    // A reflection where the surface is glossy. Its material is the triangle the camera sees at
+    // this point (roughness, metallic, F0 from the texture pack's maps, or the game's chrome);
+    // the ray leaves along a GGX-sampled half vector of that roughness. What it meets is lit by
+    // the sun, the sky and a sampled local light, or is a glowing surface's own light: radiance,
+    // not weighted (the mesh shader applies its own Fresnel). Nothing traced stays 0, which the
+    // early lighting reads as "use the probes' environment".
     float3 reflection = float3(0.0f);
     if ((p.flags & 4u) != 0u && p.roughness_cutoff > 0.05f) {
-        float3 V = normalize(position.xyz - p.camera_pos.xyz);
-        float3 R = reflect(V, N);
-        float cone = clamp((1.0f - p.roughness_cutoff) * 0.12f, 0.0f, 0.12f);
-        if (cone > 0.001f) {
-            R = normalize(mix(R, sample_cosine_hemisphere(R, rand01(seed) * cone, rand01(seed)), cone));
+        float3 to_point = position.xyz - p.camera_pos.xyz;
+        float distance_to_point = length(to_point);
+        float3 V = to_point / max(distance_to_point, 1e-4f);
+        float roughness = 0.55f, metallic = 0.0f, f0 = 0.0f;
+        ray cr(p.camera_pos.xyz, V, 0.0f, distance_to_point + 0.5f);
+        FrameHit seen_here = frame_closest(cr, level, level_tris, mobys, moby_tris, mobys_on);
+        if (seen_here.hit
+            && abs(seen_here.t - distance_to_point) < max(0.3f, distance_to_point * 0.03f)) {
+            roughness = float(seen_here.material & 0xFFu) / 255.0f;
+            metallic = float((seen_here.material >> 8u) & 0xFFu) / 255.0f;
+            f0 = float((seen_here.material >> 16u) & 0xFFu) / 255.0f;
         }
-        if (dot(R, N) > 0.01f) {
-            ray rr(origin, R, 0.03f, p.ray_distance);
-            FrameHit h = frame_closest(rr, level, level_tris, mobys, moby_tris, mobys_on);
-            float confidence;
-            float3 seen;
-            if (h.hit) {
-                float3 hn = dot(h.normal, R) > 0.0f ? -h.normal : h.normal;
-                float ndotl = max(0.0f, dot(hn, to_sun));
-                float sun_at_hit = 0.0f;
-                if (ndotl > 0.0f) {
-                    ray sr(origin + R * h.t + hn * 0.03f, to_sun, 0.025f, p.ray_distance);
-                    sun_at_hit = frame_blocked(sr, level, mobys, mobys_on) ? 0.0f : ndotl;
-                }
-                seen = h.albedo * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.35f);
-                confidence = clamp(1.0f - h.t / p.ray_distance, 0.15f, 1.0f)
-                             * clamp(p.roughness_cutoff, 0.1f, 1.0f);
-            } else {
-                seen = p.sky_colour.xyz * max(0.25f, 0.5f + 0.5f * R.z);
-                confidence = 0.5f * clamp(p.roughness_cutoff, 0.1f, 1.0f);
+        bool glossy = metallic > 0.05f || f0 > 0.045f || roughness < 0.35f;
+        if (glossy && roughness <= p.roughness_cutoff) {
+            float alpha = max(roughness * roughness, 0.002f);
+            float u1 = rand01(seed), u2 = rand01(seed);
+            float cos_theta = sqrt((1.0f - u1) / (1.0f + (alpha * alpha - 1.0f) * u1));
+            float sin_theta = sqrt(max(0.0f, 1.0f - cos_theta * cos_theta));
+            float phi = 6.28318530718f * u2;
+            float3 t, b;
+            make_orthonormal_basis(N, t, b);
+            float3 H = normalize(t * (sin_theta * cos(phi)) + b * (sin_theta * sin(phi)) + N * cos_theta);
+            float3 R = reflect(V, H);
+            if (dot(R, N) <= 0.01f) {
+                R = reflect(V, N);
             }
-            reflection = clamp(seen * confidence, 0.0f, 1.0f);
+            if (dot(R, N) > 0.01f) {
+                ray rr(origin, R, 0.03f, p.ray_distance);
+                PathHit h = path_closest(rr, level, level_tris, mobys, moby_tris, mobys_on, emitters,
+                                         emitter_tris, glow_on);
+                float3 seen;
+                if (h.emitter) {
+                    seen = h.emission;
+                } else if (h.hit) {
+                    float3 hn = dot(h.normal, R) > 0.0f ? -h.normal : h.normal;
+                    float3 hp = origin + R * h.t + hn * 0.03f;
+                    float ndotl = max(0.0f, dot(hn, to_sun));
+                    float sun_at_hit = 0.0f;
+                    if (ndotl > 0.0f) {
+                        ray sr(hp, to_sun, 0.025f, p.ray_distance);
+                        sun_at_hit = frame_blocked(sr, level, mobys, mobys_on) ? 0.0f : ndotl;
+                    }
+                    seen = h.albedo * (p.sun_colour.xyz * sun_at_hit + p.sky_colour.xyz * 0.35f
+                                       + sample_local_lights(lights, p.light_count, hp, hn, seed,
+                                                             level, mobys, mobys_on));
+                } else {
+                    seen = p.sky_colour.xyz * max(0.25f, 0.5f + 0.5f * R.z) * 1.5f;
+                }
+                // At least 0.01: a traced reflection never reads as "nothing traced".
+                reflection = max(seen, float3(0.01f));
+            }
         }
     }
 
     // The local lights: what share of their unshadowed light (as the mesh shader sums it, with
     // local_lights.glsl's falloff and cone) reaches this point past the level and the mobys.
     float local_visible = 1.0f;
-    if ((p.flags & 16u) != 0u && p.light_count > 0u) {
+    if ((p.flags & 16u) != 0u && p.local_count > 0u) {
         float open_sum = 0.0f, lit_sum = 0.0f;
-        for (uint i = 0u; i < p.light_count; ++i) {
+        for (uint i = 0u; i < p.local_count; ++i) {
             float4 lp = lights[i * 4u + 0u];
             float4 lc = lights[i * 4u + 1u];
             float radius = lp.w;
@@ -564,8 +747,10 @@ kernel void rtx_trace_frame_kernel(
     }
 
     float4 word0 = float4(encode_early_gi(bounce), sun_visible);
-    float4 word1 = float4(reflection, ambient);
-    float4 word2 = float4(local_visible, 0.0f, 0.0f, 1.0f);
+    // Word 1: the reflection (log encoded as the bounce); word 2: the local lights' visibility,
+    // then the glow light (log encoded).
+    float4 word1 = float4(encode_early_gi(reflection), ambient);
+    float4 word2 = float4(local_visible, encode_early_gi(glow));
     // The previous job's result at this point through its camera: several frames' rays together.
     if (p.history_valid != 0u) {
         float4 clip = p.prev_view_projection * float4(position.xyz, 1.0f);
@@ -619,7 +804,8 @@ struct alignas(16) MetalFrameParams {
     std::uint32_t width = 0, height = 0, samples = 1, flags = 0;
     std::uint32_t frame_index = 0, has_dynamic = 0, history_valid = 0, light_count = 0;
     float ray_distance = 120.0f, ao_radius = 2.5f, shadow_softness = 0.035f, gi_strength = 1.0f;
-    float roughness_cutoff = 0.65f, history_blend = 1.0f, pad1 = 0.0f, pad2 = 0.0f;
+    float roughness_cutoff = 0.65f, history_blend = 1.0f;
+    std::uint32_t has_emitters = 0, local_count = 0;
 };
 static_assert(sizeof(MetalFrameParams) == 192);  // FrameParams: 64 + 4 x 16 + 8 x 4 + 8 x 4
 
@@ -938,6 +1124,61 @@ public:
         return true;
     }
 
+    bool upload_emitters(std::span<const RtxTriangle> tris, std::string& error) override {
+        @autoreleasepool {
+            std::lock_guard lock(m_mutex);
+            m_emitter_accel = nil;
+            m_emitter_triangles = nil;
+            if (tris.empty()) {
+                return true;
+            }
+            std::vector<float> vertices(tris.size() * 9);
+            for (std::size_t i = 0; i < tris.size(); ++i) {
+                const auto& t = tris[i];
+                for (int a = 0; a < 3; ++a) {
+                    vertices[i * 9 + a] = t.v0_mat[a];
+                    vertices[i * 9 + 3 + a] = t.v0_mat[a] + t.e1_layer[a];
+                    vertices[i * 9 + 6 + a] = t.v0_mat[a] + t.e2_flags[a];
+                }
+            }
+            id<MTLBuffer> vertex = [m_device newBufferWithBytes:vertices.data()
+                                                         length:vertices.size() * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+            id<MTLBuffer> triangles = [m_device newBufferWithBytes:tris.data()
+                                                            length:tris.size() * sizeof(RtxTriangle)
+                                                           options:MTLResourceStorageModeShared];
+            MTLAccelerationStructureTriangleGeometryDescriptor* geom =
+                [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+            geom.vertexBuffer = vertex;
+            geom.vertexStride = sizeof(float) * 3;
+            geom.triangleCount = tris.size();
+            geom.opaque = YES;
+            MTLPrimitiveAccelerationStructureDescriptor* desc =
+                [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+            desc.geometryDescriptors = @[ geom ];
+            const MTLAccelerationStructureSizes sizes =
+                [m_device accelerationStructureSizesWithDescriptor:desc];
+            id<MTLAccelerationStructure> accel =
+                [m_device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+            id<MTLBuffer> scratch =
+                [m_device newBufferWithLength:std::max<NSUInteger>(sizes.buildScratchBufferSize, 256)
+                                      options:MTLResourceStorageModePrivate];
+            if (accel == nil || scratch == nil || vertex == nil || triangles == nil) {
+                error = "cannot allocate the glowing surfaces' acceleration structure";
+                return false;
+            }
+            id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cmd accelerationStructureCommandEncoder];
+            [enc buildAccelerationStructure:accel descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            m_emitter_accel = accel;
+            m_emitter_triangles = triangles;
+            return true;
+        }
+    }
+
     std::uint64_t submit_frame(const RtxFrameJob& job, std::string& error) override {
         @autoreleasepool {
             std::lock_guard lock(m_mutex);
@@ -971,7 +1212,11 @@ public:
             p.frame_index = job.frame_index;
             p.has_dynamic = mobys ? 1u : 0u;
             p.history_valid = job.history != nullptr && job.history_cells != nullptr ? 1u : 0u;
-            p.light_count = static_cast<std::uint32_t>(std::min<std::size_t>(job.lights.size(), 64));
+            // All lights for the paths' sampling (at most 512); the first 64 for the visibility.
+            const std::size_t light_total = std::min<std::size_t>(job.lights.size(), 512);
+            p.light_count = static_cast<std::uint32_t>(light_total);
+            p.local_count = static_cast<std::uint32_t>(std::min<std::size_t>(light_total, 64));
+            p.has_emitters = m_emitter_accel != nil ? 1u : 0u;
             p.ray_distance = s.ray_distance;
             p.ao_radius = s.ao_radius;
             p.shadow_softness = s.shadow_softness;
@@ -989,12 +1234,22 @@ public:
             [enc setBytes:&p length:sizeof p atIndex:5];
             [enc setBuffer:result offset:job.result_offset atIndex:6];
             [enc setBuffer:history offset:(job.history ? job.history_offset : job.result_offset) atIndex:7];
-            // The local lights (at most 64: 4 KiB, as bytes); one zeroed light without any.
-            const std::size_t light_bytes = std::min<std::size_t>(job.lights.size(), 64) * sizeof(RtxLightRecord);
+            // The local lights, a buffer of their own this frame (one zeroed light without any).
             static const RtxLightRecord kNone{};
-            [enc setBytes:(light_bytes != 0 ? static_cast<const void*>(job.lights.data()) : &kNone)
-                   length:(light_bytes != 0 ? light_bytes : sizeof kNone)
-                  atIndex:8];
+            id<MTLBuffer> light_buffer =
+                [m_device newBufferWithBytes:(light_total != 0 ? static_cast<const void*>(job.lights.data()) : &kNone)
+                                      length:(light_total != 0 ? light_total * sizeof(RtxLightRecord) : sizeof kNone)
+                                     options:MTLResourceStorageModeShared];
+            [enc setBuffer:light_buffer offset:0 atIndex:8];
+            // The glowing surfaces' structure, or the level's in its place (has_emitters 0).
+            [enc setAccelerationStructure:(m_emitter_accel ? m_emitter_accel : m_accel) atBufferIndex:10];
+            [enc setBuffer:(m_emitter_accel ? m_emitter_triangles : m_triangle_buffer) offset:0 atIndex:11];
+            if (mobys) {
+                [enc useResource:m_moby_accel usage:MTLResourceUsageRead];
+            }
+            if (m_emitter_accel) {
+                [enc useResource:m_emitter_accel usage:MTLResourceUsageRead];
+            }
             [enc setBuffer:(job.history_cells ? (__bridge id<MTLBuffer>)job.history_cells : cells)
                     offset:(job.history_cells ? job.history_cells_offset : job.cells_offset)
                    atIndex:9];
@@ -1028,6 +1283,8 @@ private:
     id<MTLComputePipelineState> m_trace_frame_pso = nil;
     id<MTLAccelerationStructure> m_moby_accel = nil;
     id<MTLBuffer> m_moby_triangles = nil;
+    id<MTLAccelerationStructure> m_emitter_accel = nil;  // the level's glowing surfaces
+    id<MTLBuffer> m_emitter_triangles = nil;
     std::uint64_t m_moby_key = 0;
     std::mutex m_mutex;
     id<MTLDevice> m_device = nil;

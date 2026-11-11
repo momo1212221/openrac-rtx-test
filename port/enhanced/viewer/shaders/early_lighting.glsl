@@ -44,14 +44,21 @@ vec3 early_decode_normal(uint bits) {
 // A single reconstruction path for every opaque receiver. Relative plane and
 // normal agreement chooses the represented surface even when depth quantization
 // shifts every candidate slightly; no pixel evaluates probes or cascades again.
-bool early_surface(
+// early_surface, and the traced reflection there (rgb radiance, a the share of the candidates
+// that reflected; 0: no trace here, use the probes' environment) and the traced glow light
+// (irradiance from local lights and glowing surfaces, apart from `result`).
+bool early_surface_reflected(
     vec3 eye_position,
     vec3 normal_view,
     out vec4 result,
     out bool covered,
-    out float hero_visibility
+    out float hero_visibility,
+    out vec4 reflection,
+    out vec3 glow
 ) {
     result = vec4(0, 0, 0, 1);
+    reflection = vec4(0.0);
+    glow = vec3(0.0);
     covered = false;
     hero_visibility = 1.0;
     if (early_lighting_enabled == 0 || translucent_pass != 0 || effect_pass != 0) {
@@ -62,6 +69,8 @@ bool early_surface(
     ivec2 begin = ivec2(floor(coordinate));
     vec2 fraction = fract(coordinate);
     vec4 samples[4];
+    int indices[4];
+    int cell_count = half_extent.x * half_extent.y;
     float scores[4], spatial[4], hero[4], local[4];
     int coverage[4];
     float best = 1e30;
@@ -80,6 +89,7 @@ bool early_surface(
         spatial[i] = 0.0;
         coverage[i] = 0;
         samples[i] = vec4(0);
+        indices[i] = -1;
         hero[i] = 1.0;
         local[i] = 1.0;
         if ((bits & (1u << 19u)) == 0u) {
@@ -111,6 +121,7 @@ bool early_surface(
         // Bits 28-31: how much of the local lights the ray tracing found blocked (0 none).
         local[i] = 1.0 - float(bits >> 28u) / 15.0;
         samples[i].rgb = (exp2(samples[i].rgb * 20.0) - 1.0) / 16.0;
+        indices[i] = index;
         if (scores[i] < best) {
             best = scores[i];
             best_coverage = coverage[i];
@@ -130,8 +141,35 @@ bool early_surface(
         total += weight;
     }
     result = total > 0.0 ? result / total : vec4(0, 0, 0, 1);
+    // The traced reflection and glow light of the best candidate alone: early_lighting.comp
+    // filtered both already, and reading all four cost every pixel eight more fetches.
+    int chosen = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (indices[i] >= 0 && scores[i] == best) {
+            chosen = indices[i];
+        }
+    }
+    if (chosen >= 0) {
+        reflection = texelFetch(early_values, cell_count + chosen);
+        reflection.rgb = (exp2(reflection.rgb * 20.0) - 1.0) / 16.0;
+        glow = (exp2(texelFetch(early_values, 2 * cell_count + chosen).rgb * 20.0) - 1.0) / 16.0;
+    }
     hero_visibility = total > 0.0 ? hero_visibility / total : 1.0;
     forward_shadow = total > 0.0 ? local_visibility / total : 1.0;
     covered = best_coverage != 0;
     return true;
+}
+
+bool early_surface(
+    vec3 eye_position,
+    vec3 normal_view,
+    out vec4 result,
+    out bool covered,
+    out float hero_visibility
+) {
+    vec4 reflection;
+    vec3 glow;
+    return early_surface_reflected(
+        eye_position, normal_view, result, covered, hero_visibility, reflection, glow
+    );
 }

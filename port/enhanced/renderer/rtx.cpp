@@ -15,6 +15,8 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
+#include <unordered_map>
 
 #include "common/log.h"
 #include "common/stats.h"
@@ -480,6 +482,73 @@ LocalLight glow_light(const std::array<float, 3>& centre, const std::array<float
     return light;
 }
 
+// A triangle's material for the paths, in e2_flags.w's bits: roughness, metallic, specular F0
+// (0: none), a byte each from the low one.
+std::uint32_t pack_material(const std::array<float, 3>& response) {
+    std::uint32_t packed = 0;
+    for (int k = 0; k < 3; ++k) {
+        packed |= static_cast<std::uint32_t>(std::lround(std::clamp(response[k], 0.0f, 1.0f) * 255.0f))
+                  << (8u * k);
+    }
+    return packed;
+}
+
+// A glowing triangle for the emitter structure, under `matrix`: its glow's colour (peak 1,
+// packed) and strength, as sum_glow finds them. OPENRAC_RTX_GLOW scales the strength (default 2).
+std::optional<RtxTriangle> emitter_triangle(
+    const scene::LevelData& level, const scene::Material& mat, const renderer::Mat4& matrix,
+    const scene::Vertex& a, const scene::Vertex& b, const scene::Vertex& c, bool emissive,
+    float mask
+) {
+    static const float strength = [] {
+        const char* v = std::getenv("OPENRAC_RTX_GLOW");
+        const float f = v != nullptr ? std::strtof(v, nullptr) : 0.0f;
+        return f > 0.0f ? f : 2.0f;
+    }();
+    const auto p0 = transform_point(matrix, a.position);
+    const auto p1 = transform_point(matrix, b.position);
+    const auto p2 = transform_point(matrix, c.position);
+    const std::array<float, 3> e1{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+    const std::array<float, 3> e2{p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+    std::array<float, 3> n{
+        e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]
+    };
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len < 1e-6f) {
+        return std::nullopt;
+    }
+    std::array<float, 3> rgb{};
+    if (mask > 0.0f) {
+        // The glowing texels' own colour (a white bulb on a dark shade glows white).
+        const auto texel = texel_at(level, mat, (a.uv[0] + b.uv[0] + c.uv[0]) / 3.0f,
+                                    (a.uv[1] + b.uv[1] + c.uv[1]) / 3.0f);
+        const float peak = std::max({texel[0], texel[1], texel[2], 1.0f / 255.0f});
+        for (int k = 0; k < 3; ++k) {
+            rgb[k] = texel[k] / peak * mask;
+        }
+    } else {
+        const std::uint32_t albedo = sample_material_albedo(level, mat, a.colour);
+        for (int k = 0; k < 3; ++k) {
+            rgb[k] = float((albedo >> (8u * k)) & 0xFFu) / 255.0f * (emissive ? mat.emission[k] : 1.0f);
+        }
+    }
+    const float peak = std::max({rgb[0], rgb[1], rgb[2]});
+    if (peak <= 1e-3f) {
+        return std::nullopt;
+    }
+    std::uint32_t packed = 0xFF000000u;
+    for (int k = 0; k < 3; ++k) {
+        packed |= static_cast<std::uint32_t>(std::lround(std::clamp(rgb[k] / peak, 0.0f, 1.0f) * 255.0f))
+                  << (8u * k);
+    }
+    RtxTriangle tri{};
+    tri.v0_mat = {p0[0], p0[1], p0[2], 0.0f};
+    tri.e1_layer = {e1[0], e1[1], e1[2], 0.0f};
+    tri.e2_flags = {e2[0], e2[1], e2[2], peak * strength};
+    tri.normal_albedo = {n[0] / len, n[1] / len, n[2] / len, uint_bits_to_float(packed)};
+    return tri;
+}
+
 // Builds the SAH tree of `tris` into `nodes` and reorders `tris` to its leaves' order.
 void build_tree(std::vector<RtxTriangle>& tris, std::vector<RtxBvhNode>& nodes) {
     nodes.clear();
@@ -619,13 +688,17 @@ RtxHardwareBackend* RtxPipeline::select_hardware_backend(renderer::RtxBackend re
 
 void RtxPipeline::upload(const scene::LevelData& level) {
     m_triangles.clear();
+    m_emitter_triangles.clear();
     m_nodes.clear();
     m_moby_meshes.clear();
     m_dynamic_instance_count = 0;
 
+    // `glowing`, when given, takes the glowing triangles (the emitter structure); else they are
+    // left out as before.
     auto extract_instance = [&](const scene::Instance& inst,
                                 scene::Layer layer,
-                                std::vector<RtxTriangle>& out) {
+                                std::vector<RtxTriangle>& out,
+                                std::vector<RtxTriangle>* glowing = nullptr) {
         if (inst.stand_in || inst.lighting_only || inst.model >= level.models.size()) {
             return;
         }
@@ -638,9 +711,9 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                 // texture to test, so a leaf card or a vine's quad would block as a solid wall,
                 // blackening the ambient and casting square shadows. The shadow maps keep their
                 // alpha-tested shadows (early_lighting.comp takes the darker of both).
-                // Glowing surfaces are light sources (emissive_lights), not occluders: a lamp's
-                // bulb would shadow its own light.
-                if (mat.blend || mat.cutout || glows(mat)) {
+                // Glowing surfaces are light sources (emissive_lights and the emitter structure), not
+                // occluders: a lamp's bulb would shadow its own light. A glow is often blended.
+                if (glows(mat) ? glowing == nullptr : (mat.blend || mat.cutout)) {
                     continue;
                 }
             }
@@ -650,7 +723,9 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                  && static_cast<std::size_t>(prim.material) < level.materials.size())
                     ? level.materials[static_cast<std::size_t>(prim.material)]
                     : default_mat;
-            const float roughness = mat.metal ? 0.12f : 0.55f;
+            // The game's chrome and glass maps (metal_*) are mirrors; else the pack's maps say,
+            // per triangle (below); else a rough dielectric.
+            const bool chrome = mat.metal;
 
             for (std::uint32_t i = 0; i + 2 < prim.index_count; i += 3) {
                 const std::size_t idx_base = static_cast<std::size_t>(prim.first_index + i);
@@ -668,9 +743,19 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                 const auto& v1 = level.vertices[i1];
                 const auto& v2 = level.vertices[i2];
                 // A glow packet is a light (emissive_lights), not an occluder, nor is what a
-                // texture pack's emission mask marks.
-                if (v0.light_slot == -2 || v1.light_slot == -2 || v2.light_slot == -2
-                    || sidecar_glow(m_sidecars, mat, v0, v1, v2) > 0.0f) {
+                // texture pack's emission mask marks. With `glowing` they go there instead.
+                const bool emissive = glows(mat);
+                const bool packet =
+                    v0.light_slot == -2 || v1.light_slot == -2 || v2.light_slot == -2;
+                const float mask =
+                    emissive || packet ? 0.0f : sidecar_glow(m_sidecars, mat, v0, v1, v2);
+                if (emissive || packet || mask > 0.0f) {
+                    if (glowing != nullptr) {
+                        if (auto tri = emitter_triangle(level, mat, inst.matrix, v0, v1, v2,
+                                                        emissive, mask)) {
+                            glowing->push_back(*tri);
+                        }
+                    }
                     continue;
                 }
                 const auto p0 = transform_point(inst.matrix, v0.position);
@@ -692,6 +777,11 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                 n[2] /= len;
 
                 const std::uint32_t albedo = sample_material_albedo(level, mat, v0.colour);
+                std::array<float, 3> response{chrome ? 0.12f : 0.55f, chrome ? 1.0f : 0.0f, 0.0f};
+                if (!chrome && m_sidecars != nullptr) {
+                    m_sidecars->response(mat.texture_pack_hash, (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0f,
+                                         (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0f, response);
+                }
                 RtxTriangle tri{};
                 tri.v0_mat = {
                     p0[0], p0[1], p0[2], int_bits_to_float(static_cast<std::int32_t>(prim.material))
@@ -702,7 +792,7 @@ void RtxPipeline::upload(const scene::LevelData& level) {
                     e1[2],
                     int_bits_to_float(static_cast<std::int32_t>(layer))
                 };
-                tri.e2_flags = {e2[0], e2[1], e2[2], roughness};
+                tri.e2_flags = {e2[0], e2[1], e2[2], uint_bits_to_float(pack_material(response))};
                 tri.normal_albedo = {n[0], n[1], n[2], uint_bits_to_float(albedo)};
                 out.push_back(tri);
             }
@@ -713,7 +803,7 @@ void RtxPipeline::upload(const scene::LevelData& level) {
          {scene::Layer::Terrain, scene::Layer::Ties, scene::Layer::Shrubs}) {
         const auto& list = level.instances[static_cast<std::size_t>(layer)];
         for (const auto& inst : list) {
-            extract_instance(inst, layer, m_triangles);
+            extract_instance(inst, layer, m_triangles, &m_emitter_triangles);
         }
     }
 
@@ -724,6 +814,94 @@ void RtxPipeline::upload(const scene::LevelData& level) {
         identity_inst.model = static_cast<std::uint32_t>(m);
         identity_inst.matrix = renderer::identity();
         extract_instance(identity_inst, scene::Layer::Mobys, m_moby_meshes[m].local_triangles);
+    }
+
+    // The skinned models (characters), in bind pose with their joints, for posing each frame.
+    m_skinned_meshes.assign(level.models.size(), {});
+    std::size_t skinned_models = 0;
+    for (std::size_t m = 0; m < level.models.size(); ++m) {
+        const auto& model = level.models[m];
+        auto& mesh = m_skinned_meshes[m];
+        std::unordered_map<std::uint32_t, std::uint32_t> local;  // level vertex -> mesh vertex
+        bool skinned = false;
+        for (const auto& prim : model.primitives) {
+            for (std::uint32_t i = 0; i < prim.index_count && !skinned; ++i) {
+                const std::size_t at = static_cast<std::size_t>(prim.first_index + i);
+                if (at < level.indices.size() && level.indices[at] < level.vertices.size()) {
+                    const auto& w = level.vertices[level.indices[at]].weights;
+                    skinned = w[0] + w[1] + w[2] + w[3] > 0.0f;
+                }
+            }
+        }
+        if (!skinned) {
+            continue;
+        }
+        for (const auto& prim : model.primitives) {
+            if (prim.material < 0 || static_cast<std::size_t>(prim.material) >= level.materials.size()) {
+                continue;
+            }
+            const auto& mat = level.materials[static_cast<std::size_t>(prim.material)];
+            const bool emissive = glows(mat);
+            // Blended and alpha-tested parts are left out, as for the level (no texture test).
+            if (!emissive && (mat.blend || mat.cutout)) {
+                continue;
+            }
+            for (std::uint32_t i = 0; i + 2 < prim.index_count; i += 3) {
+                const std::size_t at = static_cast<std::size_t>(prim.first_index + i);
+                if (at + 2 >= level.indices.size()) {
+                    break;
+                }
+                const std::uint32_t idx[3]{level.indices[at], level.indices[at + 1], level.indices[at + 2]};
+                if (idx[0] >= level.vertices.size() || idx[1] >= level.vertices.size()
+                    || idx[2] >= level.vertices.size()) {
+                    continue;
+                }
+                const auto& v0 = level.vertices[idx[0]];
+                const auto& v1 = level.vertices[idx[1]];
+                const auto& v2 = level.vertices[idx[2]];
+                SkinTriangle tri;
+                const bool packet = v0.light_slot == -2 || v1.light_slot == -2 || v2.light_slot == -2;
+                const float mask = emissive || packet ? 0.0f : sidecar_glow(m_sidecars, mat, v0, v1, v2);
+                if (emissive || packet || mask > 0.0f) {
+                    // A glowing part (Clank's antenna bulb, his eyes): seen and reflected as light.
+                    const auto glow = emitter_triangle(level, mat, renderer::identity(), v0, v1, v2,
+                                                       emissive, mask);
+                    if (!glow) {
+                        continue;
+                    }
+                    std::uint32_t bits = 0;
+                    std::memcpy(&bits, &glow->normal_albedo[3], sizeof bits);
+                    tri.albedo = bits;
+                    const auto strength = static_cast<std::uint32_t>(
+                        std::clamp(std::lround(glow->e2_flags[3] * 16.0f), 1L, 255L)
+                    );
+                    tri.material = pack_material({0.5f, 0.0f, 0.0f}) | (strength << 24u);
+                } else {
+                    tri.albedo = sample_material_albedo(level, mat, v0.colour);
+                    std::array<float, 3> response{mat.metal ? 0.12f : 0.55f, mat.metal ? 1.0f : 0.0f, 0.0f};
+                    if (!mat.metal && m_sidecars != nullptr) {
+                        m_sidecars->response(mat.texture_pack_hash, (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0f,
+                                             (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0f, response);
+                    }
+                    tri.material = pack_material(response);
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const auto [found, added] =
+                        local.try_emplace(idx[k], static_cast<std::uint32_t>(mesh.vertices.size()));
+                    if (added) {
+                        const auto& v = level.vertices[idx[k]];
+                        SkinVertex sv;
+                        sv.position = {v.position[0], v.position[1], v.position[2]};
+                        sv.joints = {v.joints[0], v.joints[1], v.joints[2], v.joints[3]};
+                        sv.weights = {v.weights[0], v.weights[1], v.weights[2], v.weights[3]};
+                        mesh.vertices.push_back(sv);
+                    }
+                    tri.vertices[k] = found->second;
+                }
+                mesh.triangles.push_back(tri);
+            }
+        }
+        skinned_models += mesh.triangles.empty() ? 0 : 1;
     }
 
     // The glowing parts: a light per static instance, and per model for the mobys.
@@ -777,8 +955,9 @@ void RtxPipeline::upload(const scene::LevelData& level) {
     const auto glowing_models = std::count_if(
         m_moby_emissive.begin(), m_moby_emissive.end(), [](const auto& p) { return p.area > 1e-4f; }
     );
-    log::info("rtx: {} glowing surfaces become lights; {} models glow when placed as mobys",
-              m_emissive_static.size(), glowing_models);
+    log::info("rtx: {} glowing surfaces become lights; {} models glow when placed as mobys; "
+              "{} glowing triangles traced; {} skinned models posed for the trace",
+              m_emissive_static.size(), glowing_models, m_emitter_triangles.size(), skinned_models);
 
     build_bvh();
 }
@@ -818,10 +997,85 @@ void RtxPipeline::publish_counts() {
 // uploaded once a level, the mobys' (a few thousand triangles at most) only when one has moved.
 // Bind poses: animation does not reach the tree yet.
 void RtxPipeline::prepare_instances(
-    scene::Layer layer, std::span<const scene::Instance> instances
+    scene::Layer layer, std::span<const scene::Instance> instances,
+    std::span<const renderer::Mat4> palette
 ) {
     if (layer != scene::Layer::Mobys) {
         return;
+    }
+    // A skinned instance's vertex in world space: its joints' matrices weighted (mesh.vert), then
+    // the instance's matrix. Joints out of the palette leave the bind pose.
+    const auto skinned_mesh = [&](const scene::Instance& inst) -> const SkinnedMesh* {
+        if (inst.stand_in || inst.lighting_only || inst.palette < 0
+            || inst.model >= m_skinned_meshes.size() || m_skinned_meshes[inst.model].triangles.empty()) {
+            return nullptr;
+        }
+        return &m_skinned_meshes[inst.model];
+    };
+    const auto pose = [&](const scene::Instance& inst, const SkinVertex& v) {
+        float p[3]{v.position[0], v.position[1], v.position[2]};
+        const float total = v.weights[0] + v.weights[1] + v.weights[2] + v.weights[3];
+        if (total > 0.0f) {
+            float out[3]{0.0f, 0.0f, 0.0f};
+            float used = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                const std::size_t joint = static_cast<std::size_t>(inst.palette) + v.joints[k];
+                if (v.weights[k] <= 0.0f || joint >= palette.size()) {
+                    continue;
+                }
+                const auto j = transform_point(palette[joint], v.position.data());
+                for (int a = 0; a < 3; ++a) {
+                    out[a] += v.weights[k] * j[a];
+                }
+                used += v.weights[k];
+            }
+            if (used > 0.0f) {
+                for (int a = 0; a < 3; ++a) {
+                    p[a] = out[a] / used;
+                }
+            }
+        }
+        return transform_point(inst.matrix, p);
+    };
+    // Which characters are traced: the hero and what he carries first, then the others nearest him
+    // within 30 units, at most 12000 triangles. A level holds a hundred skinned models; posing and
+    // rebuilding them all each frame cost more than the frame had.
+    std::vector<const scene::Instance*> characters;
+    {
+        std::array<float, 3> hero{};
+        bool hero_known = false;
+        for (const auto& inst : instances) {
+            if (inst.hero_shadow_anchor) {
+                hero = {inst.matrix[12], inst.matrix[13], inst.matrix[14]};
+                hero_known = true;
+                break;
+            }
+        }
+        std::vector<std::pair<float, const scene::Instance*>> ranked;
+        for (const auto& inst : instances) {
+            if (skinned_mesh(inst) == nullptr) {
+                continue;
+            }
+            const float dx = inst.matrix[12] - hero[0], dy = inst.matrix[13] - hero[1],
+                        dz = inst.matrix[14] - hero[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            const bool carried = inst.hero_shadow_caster || inst.hero_shadow_anchor;
+            if (!carried && (!hero_known || d2 > 30.0f * 30.0f)) {
+                continue;
+            }
+            ranked.emplace_back(carried ? -1.0f : d2, &inst);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::size_t budget = 12000;
+        for (const auto& [d2, inst] : ranked) {
+            const std::size_t count = m_skinned_meshes[inst->model].triangles.size();
+            if (count > budget) {
+                continue;
+            }
+            budget -= count;
+            characters.push_back(inst);
+        }
     }
     m_dynamic_instance_count = instances.size();
     // The glowing mobys' lights follow them. Only rigid ones (lamps, beacons, machines): a
@@ -846,6 +1100,61 @@ void RtxPipeline::prepare_instances(
         };
         m_emissive_mobys.push_back(glow_light(centre, normal, part.colour, part.area));
     }
+    // A character's glowing parts (Clank's antenna bulb and eyes): small lights that follow the
+    // pose, one per hue (the red bulb and the green eyes stay apart instead of mixing to a
+    // yellowish white), short reach, so that they colour what is close.
+    for (const scene::Instance* character : characters) {
+        const auto& inst = *character;
+        const SkinnedMesh* mesh = skinned_mesh(inst);
+        if (mesh == nullptr) {
+            continue;
+        }
+        std::array<GlowSum, 3> sums{};  // by the glow's strongest channel
+        for (const auto& tri : mesh->triangles) {
+            if ((tri.material >> 24u) == 0u) {
+                continue;
+            }
+            const auto p0 = pose(inst, mesh->vertices[tri.vertices[0]]);
+            const auto p1 = pose(inst, mesh->vertices[tri.vertices[1]]);
+            const auto p2 = pose(inst, mesh->vertices[tri.vertices[2]]);
+            const std::array<float, 3> e1{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+            const std::array<float, 3> e2{p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+            const std::array<float, 3> n{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                                         e1[0] * e2[1] - e1[1] * e2[0]};
+            const float area = 0.5f * std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (area < 1e-7f) {
+                continue;
+            }
+            const float strength = float(tri.material >> 24u) / 16.0f;
+            std::array<float, 3> rgb{};
+            for (int a = 0; a < 3; ++a) {
+                rgb[a] = float((tri.albedo >> (8u * a)) & 0xFFu) / 255.0f;
+            }
+            const auto hue = static_cast<std::size_t>(
+                std::max_element(rgb.begin(), rgb.end()) - rgb.begin()
+            );
+            auto& sum = sums[hue];
+            for (int a = 0; a < 3; ++a) {
+                sum.centre[a] += (p0[a] + p1[a] + p2[a]) / 3.0f * area;
+                sum.normal[a] += n[a] * 0.5f;
+                sum.colour[a] += rgb[a] * strength * area;
+            }
+            sum.area += area;
+        }
+        for (const auto& sum : sums) {
+            if (sum.area <= 1e-6f || m_emissive_mobys.size() >= 256) {
+                continue;
+            }
+            std::array<float, 3> centre{}, colour{};
+            for (int a = 0; a < 3; ++a) {
+                centre[a] = sum.centre[a] / sum.area;
+                colour[a] = sum.colour[a] / sum.area * 1.2f;
+            }
+            LocalLight light = glow_light(centre, sum.normal, colour, sum.area);
+            light.range = 3.0f;
+            m_emissive_mobys.push_back(light);
+        }
+    }
     stats::gauge("rtx glowing mobys", static_cast<double>(m_emissive_mobys.size()));
     if (m_moby_meshes.empty()) {
         publish_counts();
@@ -867,6 +1176,12 @@ void RtxPipeline::prepare_instances(
         return !inst.stand_in && !inst.lighting_only && inst.palette < 0
                && inst.model < m_moby_meshes.size();
     };
+    const bool any_skinned = !characters.empty();
+    for (const scene::Instance* character : characters) {
+        mix(&character->model, sizeof character->model);
+        mix(&character->palette, sizeof character->palette);
+        mix(character->matrix.data(), sizeof(float) * 16);
+    }
     for (const auto& inst : instances) {
         if (!traced(inst)) {
             continue;
@@ -874,13 +1189,17 @@ void RtxPipeline::prepare_instances(
         mix(&inst.model, sizeof inst.model);
         mix(inst.matrix.data(), sizeof(float) * 16);
     }
+    if (any_skinned && !palette.empty()) {
+        mix(palette.data(), palette.size_bytes());
+    }
     if (key == m_dynamic_key && (m_dynamic_key != 0 || m_dynamic_triangles.empty())) {
         publish_counts();
         return;
     }
     m_dynamic_key = key;
 
-    constexpr std::size_t kMaxDynamicMobyTriangles = 8192;
+    // Rigid mobys and the posed characters (at most 12000 of them, chosen above).
+    constexpr std::size_t kMaxDynamicMobyTriangles = 20480;
     std::vector<RtxTriangle> dyn_tris;
     dyn_tris.reserve(std::min<std::size_t>(kMaxDynamicMobyTriangles, instances.size() * 64));
     for (const auto& inst : instances) {
@@ -924,6 +1243,37 @@ void RtxPipeline::prepare_instances(
             dyn_tris.push_back(wt);
         }
     }
+    // The characters, posed: their glowing parts carry the glow (material's top byte).
+    for (const scene::Instance* character : characters) {
+        const auto& inst = *character;
+        const SkinnedMesh* mesh = skinned_mesh(inst);
+        if (mesh == nullptr || dyn_tris.size() + mesh->triangles.size() > kMaxDynamicMobyTriangles) {
+            continue;
+        }
+        std::vector<std::array<float, 3>> posed(mesh->vertices.size());
+        for (std::size_t v = 0; v < posed.size(); ++v) {
+            posed[v] = pose(inst, mesh->vertices[v]);
+        }
+        for (const auto& tri : mesh->triangles) {
+            const auto& p0 = posed[tri.vertices[0]];
+            const auto& p1 = posed[tri.vertices[1]];
+            const auto& p2 = posed[tri.vertices[2]];
+            const std::array<float, 3> e1{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+            const std::array<float, 3> e2{p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+            std::array<float, 3> n{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                                   e1[0] * e2[1] - e1[1] * e2[0]};
+            const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (len < 1e-7f) {
+                continue;
+            }
+            RtxTriangle wt{};
+            wt.v0_mat = {p0[0], p0[1], p0[2], 0.0f};
+            wt.e1_layer = {e1[0], e1[1], e1[2], int_bits_to_float(static_cast<std::int32_t>(scene::Layer::Mobys))};
+            wt.e2_flags = {e2[0], e2[1], e2[2], uint_bits_to_float(tri.material)};
+            wt.normal_albedo = {n[0] / len, n[1] / len, n[2] / len, uint_bits_to_float(tri.albedo)};
+            dyn_tris.push_back(wt);
+        }
+    }
     m_dynamic_triangles = std::move(dyn_tris);
     build_tree(m_dynamic_triangles, m_dynamic_nodes);
     m_dynamic_dirty = true;
@@ -935,7 +1285,8 @@ void RtxPipeline::build_bvh() {
     build_tree(m_triangles, m_nodes);
     std::string backend_error;
     if (auto* hw = select_hardware_backend(renderer::RtxBackend::Auto)) {
-        if (!hw->upload_scene(m_triangles, m_nodes, backend_error)) {
+        if (!hw->upload_scene(m_triangles, m_nodes, backend_error)
+            || !hw->upload_emitters(m_emitter_triangles, backend_error)) {
             log::warn("rtx: {}: {}", hw->device_name(), backend_error);
         }
     }
@@ -1251,7 +1602,8 @@ bool RtxPipeline::metal_frames(const renderer::FrameInput& input) {
             return false;
         }
         std::string error;
-        if (!m_metal_backend->upload_scene(m_triangles, m_nodes, error)) {
+        if (!m_metal_backend->upload_scene(m_triangles, m_nodes, error)
+            || !m_metal_backend->upload_emitters(m_emitter_triangles, error)) {
             log::warn("rtx: Metal: {}", error);
             m_metal_backend.reset();
             return false;
@@ -1456,7 +1808,8 @@ bool RtxPipeline::render_metal(
         p.frame_index = static_cast<std::uint32_t>(input.frame);
         p.dynamic_key = m_dynamic_key;
         next.mobys = m_dynamic_triangles;
-        // The 64 local lights nearest the camera, with a radius, have their shadows traced.
+        // The local lights with a radius, nearest the camera first: the paths sample up to 512
+        // of them (next-event estimation), the 64 nearest also have their shadows traced.
         next.lights.clear();
         const auto& eye = input.camera.position;
         for (const auto& light : m_local_lights) {
@@ -1468,13 +1821,13 @@ bool RtxPipeline::render_metal(
             const float dx = l[0][0] - eye[0], dy = l[0][1] - eye[1], dz = l[0][2] - eye[2];
             return dx * dx + dy * dy + dz * dz;
         };
-        if (next.lights.size() > 64) {
-            std::partial_sort(
-                next.lights.begin(), next.lights.begin() + 64, next.lights.end(),
-                [&](const auto& a, const auto& b) { return distance(a) < distance(b); }
-            );
-            next.lights.resize(64);
-        }
+        constexpr std::size_t kTracedLights = 512;
+        const std::size_t kept = std::min(next.lights.size(), kTracedLights);
+        std::partial_sort(
+            next.lights.begin(), next.lights.begin() + static_cast<std::ptrdiff_t>(kept),
+            next.lights.end(), [&](const auto& a, const auto& b) { return distance(a) < distance(b); }
+        );
+        next.lights.resize(kept);
         if (input.rtx_settings.shadows && !next.lights.empty()) {
             p.flags |= 16;
         }

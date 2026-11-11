@@ -37,12 +37,14 @@ vec4 chrome_surface(vec3 original) {
     vec3 eye=probe_unit(transpose(mat3(view))*(-eye_position));
     float sun_visibility=1.,hero_visibility=1.;
     vec3 indirect=vec3(0);bool covered=false;
+    vec4 traced=vec4(0);  // the path-traced reflection here (a: its share; 0 none)
+    vec3 traced_glow=vec3(0);
     // An authored fallback uses the retail reflection and reads no probe resources.
     if (!authored_fallback) {
 #ifdef OPENRAC_EARLY_LIGHTING
     vec4 cached;
     // Match diffuse meshes: reuse the early pass's resolved shadows rather than filtering again.
-    early_surface(eye_position,normal_view,cached,covered,hero_visibility);
+    early_surface_reflected(eye_position,normal_view,cached,covered,hero_visibility,traced,traced_glow);
     sun_visibility=cached.a;
     indirect=cached.rgb;
 #else
@@ -60,6 +62,8 @@ vec4 chrome_surface(vec3 original) {
                             dot(n,eye),object_reflection_material.y) : probe_linear(original);
     vec3 reflection=environment_specular(v_world_position,n,eye,object_reflection_material.x,
                         object_reflection_material.y,fallback);
+    // The game's chrome as a traced mirror where the trace reached it.
+    reflection=mix(reflection,traced.rgb,clamp(traced.a,0.,1.));
     reflection+=chrome_direct(v_world_position,n,eye,v_probe_selector,visibility);
     reflection*=object_reflection_material.z*object_reflection_tint.rgb;
     return vec4(probe_display(reflection),object_reflection_tint.a);

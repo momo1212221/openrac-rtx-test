@@ -165,6 +165,33 @@ void MaterialSidecars::load(const scene::LevelData& level) {
         }
         Set set;
         set.texture = upload(packed, kUnit);
+        {
+            constexpr int kResponseSize = 16;
+            set.response_width = std::min(width, kResponseSize);
+            set.response_height = std::min(height, kResponseSize);
+            const std::size_t cells =
+                static_cast<std::size_t>(set.response_width) * set.response_height;
+            std::vector<std::uint32_t> sums(cells * 4, 0);
+            for (int y = 0; y < height; ++y) {
+                const int ry = y * set.response_height / height;
+                for (int x = 0; x < width; ++x) {
+                    const int rx = x * set.response_width / width;
+                    const std::size_t at = static_cast<std::size_t>(ry) * set.response_width + rx;
+                    const std::size_t i = (static_cast<std::size_t>(y) * width + x) * 4;
+                    for (int c = 0; c < 3; ++c) {
+                        sums[at * 4 + c] += response.pixels[i + c];
+                    }
+                    ++sums[at * 4 + 3];
+                }
+            }
+            set.response.resize(cells * 3);
+            for (std::size_t at = 0; at < cells; ++at) {
+                const std::uint32_t n = std::max<std::uint32_t>(sums[at * 4 + 3], 1);
+                for (int c = 0; c < 3; ++c) {
+                    set.response[at * 3 + c] = static_cast<std::uint8_t>(sums[at * 4 + c] / n);
+                }
+            }
+        }
         if (lights) {
             set.mask_width = std::min(width, kMaskSize);
             set.mask_height = std::min(height, kMaskSize);
@@ -238,6 +265,24 @@ float MaterialSidecars::emission(std::uint64_t hash, float u, float v) const {
     const int y = std::clamp(static_cast<int>(fv * set.mask_height), 0, set.mask_height - 1);
     const std::uint8_t value = set.mask[static_cast<std::size_t>(y) * set.mask_width + x];
     return value >= kGlowFloor ? value / 255.0f : 0.0f;
+}
+
+bool MaterialSidecars::response(
+    std::uint64_t hash, float u, float v, std::array<float, 3>& out
+) const {
+    const auto found = hash != 0 ? m_sets.find(hash) : m_sets.end();
+    if (found == m_sets.end() || found->second.response.empty()) {
+        return false;
+    }
+    const Set& set = found->second;
+    const float fu = u - std::floor(u), fv = v - std::floor(v);
+    const int x = std::clamp(static_cast<int>(fu * set.response_width), 0, set.response_width - 1);
+    const int y = std::clamp(static_cast<int>(fv * set.response_height), 0, set.response_height - 1);
+    const std::size_t at = (static_cast<std::size_t>(y) * set.response_width + x) * 3;
+    for (int c = 0; c < 3; ++c) {
+        out[c] = set.response[at + c] / 255.0f;
+    }
+    return true;
 }
 
 }  // namespace openrac::enhanced

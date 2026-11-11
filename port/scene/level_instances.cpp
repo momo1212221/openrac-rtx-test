@@ -440,7 +440,7 @@ void LevelScene::set_instances(Layer layer, const std::vector<Instance>& source)
     // The registered lighting sees every layer's instances: ray tracing needs the mobys' places
     // in every build, object lights only with light authoring.
     if (m_lighting) {
-        m_lighting->prepare_instances(layer, source);
+        m_lighting->prepare_instances(layer, source, joint_palette());
     }
 #ifdef OPENRAC_LIGHT_AUTHORING
     std::vector<Instance> drawable;

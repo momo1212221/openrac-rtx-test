@@ -192,6 +192,15 @@ bool early_surface(
     out bool covered,
     out float hero_visibility
 );
+bool early_surface_reflected(
+    vec3 eye_position,
+    vec3 normal_view,
+    out vec4 result,
+    out bool covered,
+    out float hero_visibility,
+    out vec4 reflection,
+    out vec3 glow
+);
 #endif
 // This replaces RGB only. Alpha tests, fading and blend equations stay in
 // the existing path, as do explicitly unlit, additive, metal and glow passes.
@@ -324,13 +333,21 @@ vec3 probe_surface(vec4 texel, vec3 original) {
     bool cached_coverage;
     vec4 cached_lighting;
     float hero_visibility;
-    bool cached_surface = early_surface(
-        eye_position, mat3(view) * n, cached_lighting, cached_coverage, hero_visibility
+    // The path-traced reflection here (rgb radiance, a its share; 0 where nothing was traced).
+    vec4 traced_reflection;
+    // The path-traced light of local lights and glowing surfaces here (irradiance), added after
+    // the anchored terrain's ratio below.
+    vec3 traced_glow;
+    bool cached_surface = early_surface_reflected(
+        eye_position, mat3(view) * n, cached_lighting, cached_coverage, hero_visibility,
+        traced_reflection, traced_glow
     );
 #ifdef OPENRAC_HERO_FUR
     // Coat slices lie above the body prepass and require lighting at their displaced position.
     if (hero_fur_shell > 0.) {
         cached_surface = false;
+        traced_reflection = vec4(0.0);
+        traced_glow = vec3(0.0);
         cached_coverage = sample_probe_irradiance(v_world_position, n,
             probe_surface_bias(n, transpose(mat3(view)) * (-eye_position)), cached_lighting.rgb);
         cached_lighting.a = sun_shadow_visibility(v_world_position, n, n);
@@ -457,6 +474,12 @@ vec3 probe_surface(vec4 texel, vec3 original) {
                       + indirect / 3.14159265359;
         illumination = (shaded + 0.02) / (open + 0.02);
     }
+#ifdef OPENRAC_EARLY_LIGHTING
+    // The traced glow light, outside the anchored ratio (it is in neither bake nor vertex colour).
+    if (probe_mode == 1) {
+        illumination += traced_glow / 3.14159265359;
+    }
+#endif
     if (probe_mode != 2) {
         illumination *= hero_cue;
     }
@@ -499,7 +522,15 @@ vec3 probe_surface(vec4 texel, vec3 original) {
                 * probe_sunlight_scale;
             vec3 shine = radiance * ggx_specular(surface_n, eye, probe_unit(-travel), roughness, 1.0)
                 * visibility;
+            // The local lights' highlights: on smooth surfaces only (a rough one's is a faint
+            // wash the diffuse light already has), from the tile's first eight lights in index
+            // order (the game's own lights first, the ray tracer's glow lights last). With the
+            // tracer's hundreds of glow lights the full loop cost ~1.5 ms a frame; the traced
+            // reflection shows the glowing surfaces themselves.
+            int highlights = roughness < 0.6 ? 8 : 0;
+            if (highlights > 0) {
             LOCAL_LIGHT_LOOP(i) {
+                if (--highlights < 0) break;
                 vec4 position = LOCAL_POSITION(i);
                 vec3 delta = position.xyz - v_world_position;
                 float distance = length(delta);
@@ -508,11 +539,17 @@ vec3 probe_surface(vec4 texel, vec3 original) {
                     * LOCAL_ATTENUATION(distance, position.w) * LOCAL_CONE(i, delta / distance)
                     * ggx_specular(surface_n, eye, delta / distance, roughness, 1.0);
             }
+            }
             // The surroundings: the captured environment where this variant has it, else the
             // irradiance around as a blurred reflection.
             vec3 around = indirect / 3.14159265359;
 #if (!defined(OPENRAC_SOLID) && (!defined(OPENRAC_COLOUR_SPECIALISED) || (defined(OPENRAC_HERO_WETNESS) && !defined(OPENRAC_STATIC_COLOUR)))) || defined(OPENRAC_HERO_FUR)
             around = environment_specular(v_world_position, surface_n, eye, roughness, 1.0, around);
+#endif
+#ifdef OPENRAC_EARLY_LIGHTING
+            // Where the trace reflected, what it saw replaces the probes' captured surroundings:
+            // glowing surfaces, the sun's light and the level as it is now.
+            around = mix(around, traced_reflection.rgb, clamp(traced_reflection.a, 0.0, 1.0));
 #endif
             float grazing = pow(1.0 - clamp(dot(surface_n, eye), 0.0, 1.0), 5.0);
             vec3 fresnel = tint + (1.0 - tint) * grazing;
