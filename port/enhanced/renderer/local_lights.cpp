@@ -177,7 +177,8 @@ void LocalLights::prepare(
     bool enabled,
     std::span<const renderer::PointEmitter> emitters
 ) {
-    if (!is_vulkan() || !enhanced_rendering_available()) {
+    // Vulkan and the Metal GL draw Enhanced; the Metal GL had no local lights at all before.
+    if (!(is_vulkan() || is_metal()) || !enhanced_rendering_available()) {
         return;
     }
 

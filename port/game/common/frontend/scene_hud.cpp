@@ -235,11 +235,14 @@ void set_packets(SceneFrame& frame) {
     const bool has_camera = frame.has_camera;
     const auto started = frame.output.started;
     input.gtao_settings = graphics.gtao_settings;
-    // Honor the user's GTAO setting alongside probe GI and modern shadows.
-    // Mesh shaders apply AO to indirect lighting before direct light is added.
-    input.gtao = enhanced && graphics.gtao && has_camera && (scene.draws & 0x1Fu) != 0;
     input.rtx_settings = graphics.rtx_settings;
     input.rtx = enhanced && graphics.rtx && has_camera && (scene.draws & 0x1Fu) != 0;
+    // Honor the user's GTAO setting alongside probe GI and modern shadows.
+    // Mesh shaders apply AO to indirect lighting before direct light is added.
+    // Traced AO replaces the screen-space one in early lighting (early_lighting.comp), so GTAO
+    // is not drawn under it: its result was thrown away wherever the trace reached.
+    input.gtao = enhanced && graphics.gtao && has_camera && (scene.draws & 0x1Fu) != 0
+                 && !(input.rtx && graphics.rtx_settings.ambient_occlusion);
     input.frame = scene.frame;
     input.enhanced_water = enhanced;
     input.lily_momentum = graphics.lily_momentum;

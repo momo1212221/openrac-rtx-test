@@ -54,5 +54,8 @@ private:
     std::unordered_map<unsigned, Entry> m_cache;
     std::size_t m_cache_bytes = 0;
     std::uint64_t m_cache_builds = 0;
+    // A failed build (no buffer-to-texture copy on this renderer, a shader that does not build) is
+    // not tried again: each try is a dispatch and a texture, every frame, for every texture drawn.
+    bool m_failed = false;
 };
 }  // namespace openrac::enhanced

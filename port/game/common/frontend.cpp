@@ -378,6 +378,7 @@ bool open(const std::string& game_id, const std::filesystem::path& levels, std::
         return false;
     }
     platform::WindowConfig config;
+    config.fast_shader_math = true;  // the Metal renderer's (WindowConfig)
     config.title = OPENRAC_GAME_TITLE;
 
     if (openrac_game_map != nullptr) {

@@ -12,8 +12,8 @@
 namespace openrac::platform {
 namespace {
 
-bool open(SDL_Window* window, int width, int height, bool vsync, std::string& error) {
-    if (!mtlgl::open({window, width, height, vsync}, error)) {
+bool open(SDL_Window* window, int width, int height, bool vsync, bool fast_math, std::string& error) {
+    if (!mtlgl::open({window, width, height, vsync, fast_math}, error)) {
         return false;
     }
     // The caller's gl::load fails on one missing function, after the window is open and cannot

@@ -69,7 +69,7 @@ bool TextureUpscaler::reserve(std::size_t bytes, std::uint64_t frame) {
 unsigned TextureUpscaler::prepare(
     unsigned source, int width, int height, unsigned wrap, std::uint64_t frame
 ) {
-    if (!enhanced_rendering_available() || width <= 1 || height <= 1) {
+    if (m_failed || !enhanced_rendering_available() || width <= 1 || height <= 1) {
         return 0;
     }
 
@@ -95,6 +95,7 @@ unsigned TextureUpscaler::prepare(
         m_cache_bytes += bytes;
         ++m_cache_builds;
     } else {
+        m_failed = true;
         static log::Capped told(1);
 
         if (told()) {

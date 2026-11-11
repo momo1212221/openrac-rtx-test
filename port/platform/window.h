@@ -145,6 +145,10 @@ struct WindowConfig {
     GlApi gl_api = default_gl_api();
     // HDR output may be asked for later (set_hdr); off, a Vulkan window is made as it always was.
     bool hdr = false;
+    // The Metal renderer compiles shaders with Metal's fast math instead of OpenGL's exact
+    // rounding: a third less GPU time for Enhanced on Apple's GPUs. The game's windows ask for it;
+    // the tests' keep exact rounding, which compares Metal with OpenGL byte for byte.
+    bool fast_shader_math = false;
 };
 
 // The context's function loader, in SDL_GL_GetProcAddress's shape: what
@@ -157,7 +161,8 @@ using GlLoader = GlProc (*)(const char* name);
 // OPENRAC_METAL. open presents to `window`, or to no screen when it is null, and fails when Metal
 // cannot open or lacks a function of renderer/gl.h.
 struct MetalBackend {
-    bool (*open)(SDL_Window* window, int width, int height, bool vsync, std::string& error);
+    bool (*open)(SDL_Window* window, int width, int height, bool vsync, bool fast_math,
+                 std::string& error);
     void (*close)();
     bool (*active)();
     GlLoader get_proc;

@@ -26,6 +26,9 @@ struct Config {
     int width = 0;  // the default framebuffer without a window
     int height = 0;
     bool vsync = true;
+    // Shaders compiled with Metal's fast math, not OpenGL's exact rounding (WindowConfig's
+    // fast_shader_math). OPENRAC_MTLGL_FAST_MATH=0 or 1 overrides it.
+    bool fast_math = false;
 };
 
 // Opens the device and the context. False, with why in `error`, when Metal cannot be used: the

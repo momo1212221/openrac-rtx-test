@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -203,6 +204,23 @@ struct State {
     GLuint draw_framebuffer = 0, read_framebuffer = 0, renderbuffer = 0;
 };
 
+// A GL_TIME_ELAPSED query: the GPU time of the command buffers committed while it ran (each query
+// splits the frame's command buffer at its begin and end, so they hold its work only).
+struct TimeQuery {
+    std::atomic<int> pending{0};          // its command buffers not yet completed
+    std::atomic<std::uint64_t> ns{0};     // their GPU time so far
+    bool ended = false;
+};
+
+// MetalFX's spatial scaler for the frame's scaled-up blit to the window (mtlgl_resources.mm).
+struct MetalFx {
+    id scaler;                // id<MTLFXSpatialScaler>
+    id<MTLTexture> output;    // its output, copied into the window's image
+    int in_width = 0, in_height = 0, out_width = 0, out_height = 0;
+    NSUInteger format = 0;
+    bool failed = false;      // no MetalFX on this device: bilinear from then on
+};
+
 struct Context {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -221,6 +239,12 @@ struct Context {
     id<MTLComputeCommandEncoder> compute;  // open for dispatches
     std::uint64_t serial = 1;  // the frame's commands'; those before it have smaller ones
     std::atomic<std::uint64_t> completed{0};  // the last serial the GPU has finished
+    std::unordered_map<GLuint, std::shared_ptr<TimeQuery>> queries;
+    GLuint next_query = 1;
+    std::shared_ptr<TimeQuery> timing;  // the running GL_TIME_ELAPSED query
+    MetalFx metalfx;
+    bool fast_math = false;  // Config::fast_math, after OPENRAC_MTLGL_FAST_MATH
+    std::atomic<double> gpu_end{0.0};  // the latest GPUEndTime of a completed frame buffer
 
     State state;
     Names<Buffer> buffers;

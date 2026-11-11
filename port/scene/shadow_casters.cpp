@@ -104,7 +104,9 @@ void LevelScene::draw_shadow_map(
     glActiveTexture(GL_TEXTURE0);
     const auto sides =
         frustum_sides(region ? shadow_region_clip(matrix, *region, resolution) : matrix);
-    const auto* volume = gl::is_vulkan() && !hero && cascade < kSunCascades
+    // The caster volume is CPU geometry from the camera's frustum, the same on every backend
+    // that draws Enhanced; on the Metal GL it took the far cascade from ~660k to its casters.
+    const auto* volume = (gl::is_vulkan() || gl::is_metal()) && !hero && cascade < kSunCascades
                                  && m_sun_cascades.casters[cascade].plane_count
                              ? &m_sun_cascades.casters[cascade]
                              : nullptr;

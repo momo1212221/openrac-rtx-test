@@ -8,9 +8,11 @@
 #include <SDL3/SDL_video.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -140,7 +142,21 @@ void submit(bool wait) {
     id<MTLCommandBuffer> frame = commands();
     Context* context = g;
     const std::uint64_t serial = g->serial++;
-    [frame addCompletedHandler:^(id<MTLCommandBuffer>) {
+    std::shared_ptr<TimeQuery> timing = g->timing;
+    if (timing) {
+        timing->pending.fetch_add(1, std::memory_order_relaxed);
+    }
+    [frame addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      if (timing) {
+          // Apple's GPUs overlap a buffer with the one before it: only the time past the earlier
+          // buffers' end is this one's, so that the sections' times add up to the frame's.
+          const double start = std::max(done.GPUStartTime, context->gpu_end.load(std::memory_order_relaxed));
+          const double seconds = std::max(done.GPUEndTime - start, 0.0);
+          timing->ns.fetch_add(static_cast<std::uint64_t>(seconds * 1.0e9), std::memory_order_relaxed);
+          timing->pending.fetch_sub(1, std::memory_order_release);
+      }
+      context->gpu_end.store(std::max(context->gpu_end.load(std::memory_order_relaxed), done.GPUEndTime),
+                             std::memory_order_relaxed);
       context->completed.store(serial, std::memory_order_release);
     }];
     [frame commit];
@@ -661,6 +677,92 @@ void MTLGL finish() {
     submit(true);
 }
 
+// ---- GL_TIME_ELAPSED queries (the capture's GPU timers, renderer/gl_stats.cpp) ----
+// Metal times command buffers, not commands: a query commits the frame's commands at its begin
+// and at its end, and adds up the GPU time of the buffers committed in between. Only a capture or
+// the overlay's timers begin queries, so a frame is split only while it is being measured.
+
+constexpr GLenum kGlTimeElapsed = 0x88BF;
+constexpr GLenum kGlQueryResult = 0x8866;
+constexpr GLenum kGlQueryResultAvailable = 0x8867;
+
+void MTLGL gen_queries(GLsizei n, GLuint* ids) {
+    for (GLsizei i = 0; i < n; ++i) {
+        const GLuint id = g->next_query++;
+        g->queries[id] = std::make_shared<TimeQuery>();
+        ids[i] = id;
+    }
+}
+
+void MTLGL delete_queries(GLsizei n, const GLuint* ids) {
+    for (GLsizei i = 0; i < n; ++i) {
+        g->queries.erase(ids[i]);
+    }
+}
+
+void MTLGL begin_query(GLenum target, GLuint id) {
+    auto it = g->queries.find(id);
+    if (target != kGlTimeElapsed || it == g->queries.end() || g->timing) {
+        fail(kGlInvalidOperation);
+        return;
+    }
+    if (g->commands != nil) {
+        submit(false);  // what came before is not this query's
+    }
+    TimeQuery& q = *it->second;
+    q.ns.store(0, std::memory_order_relaxed);
+    q.ended = false;
+    g->timing = it->second;
+}
+
+void MTLGL end_query(GLenum target) {
+    if (target != kGlTimeElapsed || !g->timing) {
+        fail(kGlInvalidOperation);
+        return;
+    }
+    if (g->commands != nil) {
+        submit(false);
+    }
+    g->timing->ended = true;
+    g->timing = nullptr;
+}
+
+bool query_available(const TimeQuery& q) {
+    return q.ended && q.pending.load(std::memory_order_acquire) == 0;
+}
+
+std::uint64_t query_result(GLuint id, GLenum name) {
+    auto it = g->queries.find(id);
+    if (it == g->queries.end()) {
+        fail(kGlInvalidOperation);
+        return 0;
+    }
+    const TimeQuery& q = *it->second;
+    if (name == kGlQueryResultAvailable) {
+        return query_available(q) ? 1 : 0;
+    }
+    if (name != kGlQueryResult) {
+        fail(kGlInvalidEnum);
+        return 0;
+    }
+    while (!query_available(q)) {  // GL waits for a result asked before it is there
+        if (!q.ended) {
+            fail(kGlInvalidOperation);
+            return 0;
+        }
+        std::this_thread::yield();
+    }
+    return q.ns.load(std::memory_order_relaxed);
+}
+
+void MTLGL get_query_object_uiv(GLuint id, GLenum name, GLuint* params) {
+    *params = static_cast<GLuint>(std::min<std::uint64_t>(query_result(id, name), 0xFFFFFFFFu));
+}
+
+void MTLGL get_query_object_ui64v(GLuint id, GLenum name, std::uint64_t* params) {
+    *params = query_result(id, name);
+}
+
 #undef MTLGL
 
 struct Entry {
@@ -698,6 +800,12 @@ const Entry kEntries[] = {
     MTLGL_ENTRY(glStencilMask, stencil_mask),
     MTLGL_ENTRY(glPixelStorei, pixel_store),
     MTLGL_ENTRY(glFinish, finish),
+    MTLGL_ENTRY(glGenQueries, gen_queries),
+    MTLGL_ENTRY(glDeleteQueries, delete_queries),
+    MTLGL_ENTRY(glBeginQuery, begin_query),
+    MTLGL_ENTRY(glEndQuery, end_query),
+    MTLGL_ENTRY(glGetQueryObjectuiv, get_query_object_uiv),
+    MTLGL_ENTRY(glGetQueryObjectui64v, get_query_object_ui64v),
     MTLGL_ENTRY(glReadPixels, read_pixels),
     MTLGL_ENTRY(glCopyTexSubImage2D, copy_tex_sub_image),
     MTLGL_ENTRY(glGenTextures, gen_textures),
@@ -864,6 +972,10 @@ bool open(const Config& config, std::string& error) {
 
     context = std::make_unique<Context>();
     g = context.get();
+    g->fast_math = config.fast_math;
+    if (const char* v = std::getenv("OPENRAC_MTLGL_FAST_MATH"); v != nullptr && (v[0] == '0' || v[0] == '1')) {
+        g->fast_math = v[0] == '1';
+    }
     g->device = device;
     g->queue = [device newCommandQueue];
     g->flip = pipeline;

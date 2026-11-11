@@ -531,7 +531,7 @@ bool Window::open_metal(const WindowConfig& config, std::string& error) {
     int width = 0, height = 0;
     SDL_GetWindowSizeInPixels(m_window, &width, &height);
     SDL_Window* screen = config.hidden ? nullptr : m_window;
-    if (!metal_backend().open(screen, width, height, config.vsync, error)) {
+    if (!metal_backend().open(screen, width, height, config.vsync, config.fast_shader_math, error)) {
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
         return false;

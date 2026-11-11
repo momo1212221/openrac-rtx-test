@@ -7,10 +7,14 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
+#import <MetalFX/MetalFX.h>
+
 #include "common/float_encoding.h"
+#include "common/log.h"
 #include "renderer/metal/mtlgl_internal.h"
 
 namespace openrac::mtlgl::detail {
@@ -875,6 +879,93 @@ void draw_blit(id<MTLTexture> src, id<MTLTexture> dst, GLint sx0, GLint sy0, GLi
 // Copies of one size and format and resolves; other blits drawn. A scaled, flipped or converting
 // blit of stencil, a resolve of part of depth and part of one multisampled image copied into
 // another are GL_INVALID_OPERATION (README.md).
+namespace {
+
+// The frame drawn at a lower render scale reaches the window by one scaled-up colour blit
+// (renderer::FrameBuffer::blit_to). MetalFX's spatial scaler does it instead of a bilinear
+// stretch: much sharper, so the world can be drawn at fewer pixels. Only that blit (whole source,
+// to the window's image, at least 1.25x each way); OPENRAC_METALFX=0 keeps the bilinear one.
+bool metalfx_upscale(id<MTLTexture> src, id<MTLTexture> dst, GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                     GLint dx0, GLint dy0, GLint dx1, GLint dy1) {
+    static const bool off = [] {
+        const char* v = std::getenv("OPENRAC_METALFX");
+        return v != nullptr && std::strcmp(v, "0") == 0;
+    }();
+    MetalFx& m = g->metalfx;
+    if (off || m.failed || dst != g->colour || src.sampleCount != 1 || dst.sampleCount != 1
+        || is_depth(src.pixelFormat) || is_integer(src.pixelFormat)) {
+        return false;
+    }
+    const int w = sx1 - sx0, h = sy1 - sy0, dw = dx1 - dx0, dh = dy1 - dy0;
+    if (sx0 != 0 || sy0 != 0 || w != static_cast<int>(src.width) || h != static_cast<int>(src.height)
+        || dw <= 0 || dh <= 0 || dw * 4 < w * 5 || dh * 4 < h * 5 || dx0 < 0 || dy0 < 0
+        || dx1 > static_cast<int>(dst.width) || dy1 > static_cast<int>(dst.height)) {
+        return false;
+    }
+    if (@available(macOS 13.0, *)) {
+        if (m.scaler == nil || m.in_width != w || m.in_height != h || m.out_width != dw
+            || m.out_height != dh || m.format != src.pixelFormat) {
+            m.scaler = nil;
+            m.output = nil;
+            if (![MTLFXSpatialScalerDescriptor supportsDevice:g->device]) {
+                m.failed = true;
+                return false;
+            }
+            MTLFXSpatialScalerDescriptor* d = [MTLFXSpatialScalerDescriptor new];
+            d.inputWidth = static_cast<NSUInteger>(w);
+            d.inputHeight = static_cast<NSUInteger>(h);
+            d.outputWidth = static_cast<NSUInteger>(dw);
+            d.outputHeight = static_cast<NSUInteger>(dh);
+            d.colorTextureFormat = src.pixelFormat;
+            d.outputTextureFormat = dst.pixelFormat;
+            // The frame is tone mapped already (AgX): perceptual values.
+            d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+            id<MTLFXSpatialScaler> scaler = [d newSpatialScalerWithDevice:g->device];
+            if (scaler == nil) {
+                m.failed = true;
+                return false;
+            }
+            MTLTextureDescriptor* t = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat
+                                                                                         width:static_cast<NSUInteger>(dw)
+                                                                                        height:static_cast<NSUInteger>(dh)
+                                                                                     mipmapped:NO];
+            t.storageMode = MTLStorageModePrivate;
+            t.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+            m.output = [g->device newTextureWithDescriptor:t];
+            m.scaler = scaler;
+            m.in_width = w;
+            m.in_height = h;
+            m.out_width = dw;
+            m.out_height = dh;
+            m.format = src.pixelFormat;
+            log::info("graphics: MetalFX spatial upscaling, {}x{} to {}x{}", w, h, dw, dh);
+        }
+        id<MTLFXSpatialScaler> scaler = m.scaler;
+        if ((src.usage & scaler.colorTextureUsage) != scaler.colorTextureUsage) {
+            return false;
+        }
+        end_encoders();
+        scaler.colorTexture = src;
+        scaler.outputTexture = m.output;
+        scaler.inputContentWidth = static_cast<NSUInteger>(w);
+        scaler.inputContentHeight = static_cast<NSUInteger>(h);
+        [scaler encodeToCommandBuffer:commands()];
+        [blit() copyFromTexture:m.output
+                    sourceSlice:0
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(static_cast<NSUInteger>(dw), static_cast<NSUInteger>(dh), 1)
+                      toTexture:dst
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(static_cast<NSUInteger>(dx0), static_cast<NSUInteger>(dy0), 0)];
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 void MTLGL blit_framebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0,
                             GLint dx1, GLint dy1, GLbitfield mask, GLenum filter) {
     const Target from = target_of(g->state.read_framebuffer);
@@ -901,6 +992,10 @@ void MTLGL blit_framebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx
         if (!same_size || src.pixelFormat != dst.pixelFormat || src.sampleCount < dst.sampleCount) {
             if (stencil) {
                 fail(kGlInvalidOperation);
+                return;
+            }
+            if (filter == GL_LINEAR && (mask & GL_COLOR_BUFFER_BIT) != 0
+                && metalfx_upscale(src, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1)) {
                 return;
             }
             draw_blit(src, dst, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, filter);
