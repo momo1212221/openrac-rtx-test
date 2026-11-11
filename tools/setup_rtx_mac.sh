@@ -60,6 +60,14 @@ cd "$ROOT/launcher"
 corepack enable >/dev/null 2>&1 || npm install -g corepack
 yarn install
 
+# Glowing lamps and metal (Clank) need the material maps: made here when the game is already
+# set up (its levels exported, its data in the install), else after the launcher's setup.
+MAPS=0
+if [[ -n "$(ls -A "$ROOT/assets/port/rac1/pal" 2>/dev/null)" ]]; then
+    say "Material maps"
+    "$ROOT/tools/rtx_material_maps.sh" && MAPS=1 || echo "warning: no material maps made (see above)" >&2
+fi
+
 cat <<EOF
 
 Set up. In the launcher:
@@ -67,11 +75,13 @@ Set up. In the launcher:
   2. Add the game (rac1 PAL) with your disc image; the launcher builds it.
   3. Mods: Enhanced graphics on, and bake the probes when it asks (they go to probes-rtx/).
   4. Settings: renderer Vulkan (faster today) or Metal; in the game, RTX on.
-Glowing lamps and metal (Clank) need the material maps once the game is set up:
-  git clone https://github.com/momo1212221/openrac-graphics-preparation.git port/build/graphics-preparation
-  node port/enhanced/tools/sidecars/generate_sidecars.mjs --prep port/build/graphics-preparation \\
-      --levels assets/port/rac1/pal --out <install>/active/rac1/data/texture_packs/rac1-pal
 EOF
+if ((!MAPS)); then
+    cat <<EOF
+  5. Then the material maps (glowing lamps, metal like Clank's), once:
+       tools/rtx_material_maps.sh [<install folder>]
+EOF
+fi
 
 if ((RUN)); then
     say "Starting the launcher"
